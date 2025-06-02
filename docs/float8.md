@@ -1,4 +1,8 @@
-## Enable Float8 Training on H100s
+## Float8 Training on H100s
+
+Float8 training can provide substantial training speedups for models where the majority of GEMMs are sufficiently large enough that the speedup from using float8 tensorcores outweighs the overhead of dynamic quantization. See [here](https://github.com/pytorch/ao/tree/main/torchao/float8#performance) for microbenchmarks detailing the observed speedups for the forward + backward pass of a simple "layer norm => linear => sigmoid" model for different M,N,K sizes, which can help you determine if your model can benefit from float8 training. Note you can also use float8 training for only the subset of layers which will benefit from it by using the [filter_fqns](https://github.com/pytorch/torchtitan/blob/3b85aa31fffc46ecbf785a57ee314a01614f572f/torchtitan/config_manager.py#L448) argument.
+
+### Usage steps
 
 Please install latest [TorchAO](https://github.com/pytorch/ao/tree/main/torchao/float8) to support float8 dtype
 ```
@@ -7,7 +11,7 @@ USE_CPP=0 python -m pip install git+https://github.com/pytorch/ao.git
 
 For float8 with tensorwise scaling, launch training job with the following command (or alternatively set configs in toml files)
 ```
-CONFIG_FILE="./train_configs/llama3_8b.toml" ./run_train.sh --model.converters="float8" --float8.enable_fsdp_float8_all_gather --float8.precompute_float8_dynamic_scale_for_fsdp --float8.force_recompute_fp8_weight_in_bwd --training.compile
+CONFIG_FILE="./torchtitan/models/llama3/train_configs/llama3_8b.toml" ./run_train.sh --model.converters="float8" --float8.enable_fsdp_float8_all_gather --float8.precompute_float8_dynamic_scale_for_fsdp --float8.force_recompute_fp8_weight_in_bwd --training.compile
 ```
 * `--model.converters="float8"`: swap `nn.Linear` with `Float8Linear` to perform float8 matmul.
 * `--float8.enable_fsdp_float8_all_gather`: cast `Float8Linear.weight` from high precision to float8 before FSDP all-gather so we can communicate in float8 to save bandwidth.
@@ -17,7 +21,7 @@ CONFIG_FILE="./train_configs/llama3_8b.toml" ./run_train.sh --model.converters="
 
 For float8 with rowwise scaling, launch training job with the following command (or alternatively set configs in toml files)
 ```
-CONFIG_FILE="./train_configs/llama3_8b.toml" ./run_train.sh --model.converters="float8" --float8.recipe_name rowwise --training.compile
+CONFIG_FILE="./torchtitan/models/llama3/train_configs/llama3_8b.toml" ./run_train.sh --model.converters="float8" --float8.recipe_name rowwise --training.compile
 ```
 * `--model.converters="float8"`: swap `nn.Linear` with `Float8Linear` to perform float8 matmul.
 * `--float8.recipe_name="rowwise"`: use the rowwise scaling recipe for higher accuracy compared to tensorwise scaling

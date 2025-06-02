@@ -15,13 +15,12 @@ from torch.distributed.elastic.multiprocessing.errors import record
 
 import torchtitan.components.ft as ft
 import torchtitan.protocols.train_spec as train_spec_module
-
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.metrics import (
     build_metrics_processor,
     ensure_pp_loss_visible,
 )
-from torchtitan.config_manager import JobConfig
+from torchtitan.config_manager import ConfigManager, JobConfig
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.protocols.model_converter import build_model_converters
 from torchtitan.tools import utils
@@ -71,39 +70,23 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if job_config.job.print_args:
             logger.info(f"Running with args: {job_config.to_dict()}")
 
-        # take control of garbage collection to avoid stragglers
-        self.gc_handler = utils.GarbageCollection(gc_freq=job_config.training.gc_freq)
-
         device_module, device_type = utils.device_module, utils.device_type
         self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
         # Device has to be set before creating TorchFT manager.
         device_module.set_device(self.device)
-        ft_manager = ft.init_ft_manager(job_config)
 
         # init distributed
         world_size = int(os.environ["WORLD_SIZE"])
         parallelism_config = job_config.parallelism
-        if not ft_manager.enabled:
-            self.parallel_dims = parallel_dims = ParallelDims(
-                dp_shard=parallelism_config.data_parallel_shard_degree,
-                dp_replicate=parallelism_config.data_parallel_replicate_degree,
-                cp=parallelism_config.context_parallel_degree,
-                tp=parallelism_config.tensor_parallel_degree,
-                pp=parallelism_config.pipeline_parallel_degree,
-                world_size=world_size,
-                enable_loss_parallel=not parallelism_config.disable_loss_parallel,
-            )
-        else:
-            self.parallel_dims = parallel_dims = ft.FTParallelDims(
-                dp_shard=parallelism_config.data_parallel_shard_degree,
-                dp_replicate=parallelism_config.data_parallel_replicate_degree,
-                cp=parallelism_config.context_parallel_degree,
-                tp=parallelism_config.tensor_parallel_degree,
-                pp=parallelism_config.pipeline_parallel_degree,
-                world_size=world_size,
-                enable_loss_parallel=not parallelism_config.disable_loss_parallel,
-                ft_manager=ft_manager,
-            )
+        self.parallel_dims = parallel_dims = ParallelDims(
+            dp_shard=parallelism_config.data_parallel_shard_degree,
+            dp_replicate=parallelism_config.data_parallel_replicate_degree,
+            cp=parallelism_config.context_parallel_degree,
+            tp=parallelism_config.tensor_parallel_degree,
+            pp=parallelism_config.pipeline_parallel_degree,
+            world_size=world_size,
+            enable_loss_parallel=not parallelism_config.disable_loss_parallel,
+        )
         dist_utils.init_distributed(job_config)
 
         # build meshes
@@ -113,6 +96,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             dp_degree, dp_rank = dp_mesh.size(), dp_mesh.get_local_rank()
         else:
             dp_degree, dp_rank = 1, 0
+
+        self.ft_manager = ft.init_ft_manager(job_config)
+        # If TorchFT is enabled, the dp_rank and dp_degree, which are used for
+        # dataloader must be changed.
+        if self.ft_manager.enabled:
+            dp_degree, dp_rank = self.ft_manager.get_dp_info(dp_degree, dp_rank)
+
+        # take control of garbage collection to avoid stragglers
+        self.gc_handler = utils.GarbageCollection(
+            gc_freq=job_config.training.gc_freq, debug=job_config.training.gc_debug
+        )
 
         # Set random seed, and maybe enable deterministic mode
         # (mainly for debugging, expect perf loss).
@@ -130,11 +124,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             if self.train_spec.build_tokenizer_fn is not None
             else None
         )
-
-        # If TorchFT is enabled, the dp_rank and dp_degree, which are used for
-        # dataloader must be changed.
-        if ft_manager.enabled:
-            dp_degree, dp_rank = ft_manager.get_dp_info(dp_degree, dp_rank)
 
         self.dataloader = self.train_spec.build_dataloader_fn(
             dp_world_size=dp_degree,
@@ -165,7 +154,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             if self.train_spec.build_metrics_processor_fn is None
             else self.train_spec.build_metrics_processor_fn
         )
-        self.metrics_processor = build_metrics_processor_fn(job_config, parallel_dims)
+        self.metrics_processor = build_metrics_processor_fn(
+            job_config, parallel_dims, model_args
+        )
         color = self.metrics_processor.color
 
         # calculate model size and flops per token
@@ -241,6 +232,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
             self.model_parts = [model]
 
+        if (
+            self.ft_manager.enabled
+            and job_config.fault_tolerance.semi_sync_method is None
+        ):
+            self.ft_manager.set_all_reduce_hook(self.model_parts)
+
         # initialize device memory monitor and get peak flops for MFU calculation
         device_memory_monitor = self.metrics_processor.device_memory_monitor
         gpu_peak_flops = utils.get_peak_flops(device_memory_monitor.device_name)
@@ -254,7 +251,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         # build optimizer after applying parallelisms to the model
         self.optimizers = self.train_spec.build_optimizers_fn(
-            self.model_parts, job_config, ft_manager
+            self.model_parts, job_config, self.ft_manager
         )
         self.lr_schedulers = self.train_spec.build_lr_schedulers_fn(
             self.optimizers, job_config
@@ -280,7 +277,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             lr_schedulers=self.lr_schedulers,
             states={"train_state": self},
             job_config=job_config,
-            ft_manager=ft_manager,
+            ft_manager=self.ft_manager,
         )
 
         self.train_context = dist_utils.get_train_context(
@@ -297,22 +294,27 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             f"(warmup {job_config.lr_scheduler.warmup_steps})."
         )
 
-    def next_batch(
-        self, data_iterator: Iterable
-    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
-        data_load_start = time.perf_counter()
-        batch = next(data_iterator)
-        input_dict, labels = batch
-        self.metrics_processor.ntokens_since_last_log += labels.numel()
-        self.metrics_processor.data_loading_times.append(
-            time.perf_counter() - data_load_start
-        )
-
+    def batch_generator(
+        self, data_iterable: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
+    ) -> Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]:
+        """Returns an iterator that processes batches from the data iterator."""
         device_type = utils.device_type
-        for k, _ in input_dict.items():
-            input_dict[k] = input_dict[k].to(device_type)
-        labels = labels.to(device_type)
-        return input_dict, labels
+
+        for batch in iter(data_iterable):
+            data_load_start = time.perf_counter()
+            input_dict, labels = batch
+            self.metrics_processor.ntokens_since_last_log += labels.numel()
+            self.metrics_processor.data_loading_times.append(
+                time.perf_counter() - data_load_start
+            )
+
+            # Move tensors to the appropriate device
+            for k, v in input_dict.items():
+                if isinstance(v, torch.Tensor):
+                    input_dict[k] = v.to(device_type)
+            labels = labels.to(device_type)
+
+            yield input_dict, labels
 
     def train_step(self, input_dict: dict[str, torch.Tensor], labels: torch.Tensor):
         self.optimizers.zero_grad()
@@ -345,9 +347,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     (labels, []) if self.pp_has_last_stage else (None, None)
                 )
                 if self.pp_has_first_stage:
-                    self.pp_schedule.step(inputs, target=targets, losses=losses)
+                    self.pp_schedule.step(
+                        inputs, target=targets, losses=losses, input_batch=inputs
+                    )
                 else:
-                    self.pp_schedule.step(target=targets, losses=losses)
+                    self.pp_schedule.step(
+                        target=targets, losses=losses, input_batch=inputs
+                    )
 
             # accumulate losses across pipeline microbatches
             # TODO: PP+FSDP unexpectedly puts the loss back to the CPU
@@ -384,11 +390,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             parallel_dims.dp_replicate_enabled
             or parallel_dims.dp_shard_enabled
             or parallel_dims.cp_enabled
+            or self.ft_manager.enabled
         ):
             loss = loss.detach()
+            # Skip ft manager communication when using semi sync training
+            use_ft_pg = (
+                self.ft_manager.enabled
+                and self.job_config.fault_tolerance.semi_sync_method is None
+            )
+            ft_pg = self.ft_manager.replicate_pg if use_ft_pg else None
             global_avg_loss, global_max_loss = (
-                dist_utils.dist_mean(loss, world_mesh["dp_cp"]),
-                dist_utils.dist_max(loss, world_mesh["dp_cp"]),
+                dist_utils.dist_mean(loss, world_mesh["dp_cp"], ft_pg),
+                dist_utils.dist_max(loss, world_mesh["dp_cp"], ft_pg),
             )
         else:
             global_avg_loss = global_max_loss = loss.detach().item()
@@ -402,16 +415,24 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.checkpointer.load(step=job_config.checkpoint.load_step)
         logger.info(f"Training starts at step {self.step + 1}.")
 
-        with maybe_enable_profiling(
-            job_config, global_step=self.step
-        ) as torch_profiler, maybe_enable_memory_snapshot(
-            job_config, global_step=self.step
-        ) as memory_profiler:
-            data_iterator = iter(self.dataloader)
-            while self.step < job_config.training.steps:
+        with (
+            maybe_enable_profiling(job_config, global_step=self.step) as torch_profiler,
+            maybe_enable_memory_snapshot(
+                job_config, global_step=self.step
+            ) as memory_profiler,
+            ft.maybe_semi_sync_training(
+                job_config,
+                ft_manager=self.ft_manager,
+                model=self.model_parts[0],
+                optimizer=self.optimizers,
+                sync_every=job_config.fault_tolerance.sync_steps,
+            ),
+        ):
+            for inputs, labels in self.batch_generator(self.dataloader):
+                if self.step >= job_config.training.steps:
+                    break
                 self.step += 1
                 self.gc_handler.run(self.step)
-                inputs, labels = self.next_batch(data_iterator)
                 self.train_step(inputs, labels)
                 self.checkpointer.save(
                     self.step, force=(self.step == job_config.training.steps)
@@ -453,17 +474,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
 if __name__ == "__main__":
     init_logger()
-    config = JobConfig()
-    config.maybe_add_custom_args()
-    config.parse_args()
+    config_manager = ConfigManager()
+    config = config_manager.parse_args()
     trainer: Optional[Trainer] = None
 
     try:
         trainer = Trainer(config)
 
         if config.checkpoint.create_seed_checkpoint:
-            assert int(
-                os.environ["WORLD_SIZE"]
+            assert (
+                int(os.environ["WORLD_SIZE"]) == 1
             ), "Must create seed checkpoint using a single device, to disable sharding."
             assert (
                 config.checkpoint.enable_checkpoint

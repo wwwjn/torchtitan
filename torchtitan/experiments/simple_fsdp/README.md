@@ -1,14 +1,16 @@
 ## SimpleFSDP
 
+[![integration tests](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_8gpu_simple_fsdp.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_8gpu_simple_fsdp.yaml?query=branch%3Amain)
+[![arXiv](https://img.shields.io/badge/arXiv-2411.00284-b31b1b.svg)](https://arxiv.org/abs/2411.00284)
+
+
 This folder includes an experimental frontend implementation for [SimpleFSDP: Simpler Fully Sharded Data Parallel with torch.compile](https://arxiv.org/abs/2411.00284). SimpleFSDP is a compiler-based Fully Sharded Data Parallel (FSDP) framework, which has a simple implementation for maintenance and composability, allows full computation-communication graph tracing, and brings performance enhancement via compiler backend optimizations.
 
 ### Enable SimpleFSDP Training
 
 ```bash
-CONFIG_FILE="./torchtitan/models/llama/train_configs/llama3_8b.toml" ./run_train.sh --model.name llama3_simple_fsdp --training.compile --training.mixed_precision_param float32
+CONFIG_FILE="./torchtitan/models/llama3/train_configs/llama3_8b.toml" ./run_train.sh --model.name llama3_simple_fsdp --training.compile
 ```
-
-Note: The mixed precision training support is on-going. We set `training.mixed_precision_param` to `float32` for now and will remove it once the integration is completed.
 
 ### Composability Support
 
@@ -18,12 +20,12 @@ Some of the features require the updates from PyTorch, with which we are working
 | :--------: | :--------: |
 |Meta Initialization| ✅ |
 |Activation Checkpointing| ✅ |
-|Mixed Precision Training| 🚧 |
-|Tensor Parallelism| 🚧 |
+|Mixed Precision Training| ✅ |
+|Tensor Parallelism| ✅ |
 |Context Parallelism| ✅ |
 |Pipeline Parallelism| ✅ |
 |Distributed Checkpointing| 🚧 |
-|Float8 Training| ❌ |
+|Float8 Training| 🚧 |
 
 
 ### Citation
