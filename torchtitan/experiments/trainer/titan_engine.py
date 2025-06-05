@@ -34,91 +34,18 @@ class TorchTitianEngine(Engine, Trainer):
         Trainer.__init__(self, job_config=config)
 
     def init_model_and_optimizer(self):
-        # model_config = self.config.model
-        # system_config = self.config.system
-        # optim_config = self.config.optim
+        """
+        return empty function becuase the model and optimizer are initialized in the parent class initalize function
+        """
+        return
 
-        # self._build_model(model_config, system_config)
-        # self._build_optimizer(optim_config)
-
-        # for us, do the HF->titan model definition convertion when init the model
-        self._convert_model
-
-    def _convert_model(self, model_config, system_config):
-        local_model_path = copy_to_local(src=model_config.path, verbose=True)
-
-        # load config first
-        hf_config = AutoConfig.from_pretrained(local_model_path)
-        init_context = get_init_weight_context_manager(
-            use_meta_tensor=not hf_config.tie_word_embeddings, mesh=self.device_mesh
-        )
-
-        with init_context():
-            self.model = AutoModelForCausalLM.from_pretrained(
-                local_model_path,
-                config=hf_config,
-                torch_dtype=torch.float32,
-                attn_implementation="flash_attention_2",
-            )
-
-        if model_config.use_rmpad or system_config.ulysses_sequence_parallel_size > 1:
-            from verl.models.transformers.monkey_patch import apply_monkey_patch
-
-            apply_monkey_patch(
-                model=self.model,
-                ulysses_sp_size=system_config.ulysses_sequence_parallel_size,
-            )
-
-        if model_config.enable_gradient_checkpointing:
-            self.model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
-            )
-
-        # ???
-        cpu_offload = None
-        if system_config.param_offload:
-            cpu_offload = CPUOffload(offload_params=system_config.param_offload)
-
-    def forward_backward_step(self, batch, forward_only=False):
+    def forward_backward_step(self, batch, forward_only=False) -> torch.Tensor:
+        """
+        return loss of the output
+        """
         # follow the implementation in https://github.com/pytorch/torchtitan/pull/1238
 
-        self.model.train()
-
-        input_ids = batch["input_ids"].cuda()
-        attention_mask = batch["attention_mask"].cuda()
-        position_ids = batch["position_ids"].cuda()
-        loss_mask = batch.pop("loss_mask")[:, :-1].reshape(-1).cuda()
-
-        # Context manager for sequence parallel if needed
-        context = nullcontext()
-        with context, torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            # Standard forward pass without sequence parallel
-            labels = input_ids[:, 1:].contiguous()
-            outputs = self.fsdp_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                use_cache=False,
-            )
-            logits = outputs.logits
-
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels.contiguous()
-            # Flatten the tokens
-            shift_logits = shift_logits.view(-1, self.model.config.vocab_size)
-            shift_labels = shift_labels.view(-1)
-            # Enable model parallelism
-            shift_labels = shift_labels.to(shift_logits.device)
-            loss = self.loss_fn(shift_logits, shift_labels)
-            loss = loss * loss_mask.to(loss.device)
-
-        valid_token_this_rank = torch.sum(loss_mask)
-        dp_size = 1
-        loss = torch.sum(loss) / (valid_token_this_rank + 1e-8) * dp_size
-        outputs.loss = loss
-        loss.backward()
-
-        return outputs
+        return super().forward_backward_step(batch, forward_only=forward_only)
 
     def optimizer_zero_grad(self):
         self.optimizer.zero_grad()
