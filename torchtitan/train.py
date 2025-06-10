@@ -377,17 +377,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if parallel_dims.pp_enabled:
             # Pipeline Parallel forward / backward inside step() call
             with self.train_context(optional_context_parallel_ctx):
-                targets, losses, pred = (
-                    (labels, [], []) if self.pp_has_last_stage else (None, None, None)
+                targets, losses = (
+                    (labels, []) if self.pp_has_last_stage else (None, None)
                 )
                 if self.pp_has_first_stage:
                     self.pp_schedule.step(
-                        inputs, target=targets, losses=losses, input_batch=inputs
-                    )
-                elif (
-                    self.pp_has_last_stage
-                ):  # NOTE(jianiw): only last stage has prediction results
-                    pred = self.pp_schedule.step(
                         inputs, target=targets, losses=losses, input_batch=inputs
                     )
                 else:
@@ -411,7 +405,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 # need to free to before bwd to avoid peaking memory
                 loss.backward()
 
-        return loss, pred
+        return loss
 
     def train_step(
         self, data_iterator: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
@@ -427,8 +421,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # entire step will not be executed.
         for microbatch in range(self.gradient_accumulation_steps):
             input_dict, labels = next(data_iterator)
-            loss, pred = self.forward_backward_step(input_dict, labels)
-            del pred
+            loss = self.forward_backward_step(input_dict, labels)
             accumulated_losses.append(loss.detach())
 
         dist_utils.clip_grad_norm_(
