@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from dataclasses import dataclass, field
 from typing import Dict, List
 
@@ -52,13 +58,9 @@ class WrapPolicyConfig:
 @dataclass
 class FSDPSystemConfig:
     # mp
-    strategy: str = (
-        "fsdp"  # we need this to choice framework between [fsdp, vescale, fsdp2], bacause they use same code
-    )
+    strategy: str = "fsdp"  # we need this to choice framework between [fsdp, vescale, fsdp2], bacause they use same code
     mixed_precision: MixedPrecisionConfig = None
-    model_dtype: str = (
-        "fp32"  # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
-    )
+    model_dtype: str = "fp32"  # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
     fsdp_size: int = -1
     # act offload
     act_offload: bool = False
