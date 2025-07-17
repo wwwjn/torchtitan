@@ -426,12 +426,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 assert len(model_parts) == 1
                 with self.maybe_enable_amp:
                     pred = model_parts[0](inputs)
-                    loss = self.loss_fn(pred, labels)
+                    print("After forward pass, prediction is : ", pred)
+                    # loss = self.loss_fn(pred, labels)
                 # need to free to before bwd to avoid peaking memory
                 del pred
-                loss.backward()
+                # loss.backward()
 
-        return loss
+        return None
 
     def train_step(
         self, data_iterator: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
@@ -448,6 +449,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         for microbatch in range(self.gradient_accumulation_steps):
             input_dict, labels = next(data_iterator)
             loss = self.forward_backward_step(input_dict, labels)
+            return
             accumulated_losses.append(loss.detach())
 
         grad_norm = dist_utils.clip_grad_norm_(

@@ -13,7 +13,7 @@ enable_memory_snapshot = false
 save_memory_snapshot_folder = "memory_snapshot"
 
 [metrics]
-log_freq = 10
+log_freq = 1
 disable_color_printing = false
 enable_tensorboard = false
 save_tb_folder = "tb"
@@ -38,9 +38,9 @@ lr_min = 2.2e-5
 
 [training]
 local_batch_size = 4
-seq_len = 4096
+seq_len = 2048
 max_norm = 1.0  # grad norm clipping
-steps = 10_000
+steps = 1
 compile = false
 dataset = "c4"  # supported datasets: c4_test (2K), c4 (177M)
 
@@ -53,12 +53,13 @@ enable_async_tensor_parallel = false
 expert_parallel_degree = 1
 
 [checkpoint]
-enable_checkpoint = false
+enable_checkpoint = true
 folder = "checkpoint"
 interval = 500
 last_save_model_weights_only = false
 export_dtype = "float32"
 async_mode = "disabled"  # ["disabled", "async", "async_with_pinned_mem]"
+initial_load_path = "/data/users/jianiw/torchtitan/outputs/checkpoint-dsv3/step-0"
 
 [activation_checkpoint]
 mode = "full"  # ["none", "selective", "full"]
