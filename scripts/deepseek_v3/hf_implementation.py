@@ -13,7 +13,6 @@ import time
 import torch
 import os
 import gc
-from pathlib import Path
 
 
 def print_gpu_memory_usage(message=""):
@@ -24,9 +23,9 @@ def print_gpu_memory_usage(message=""):
         print(f"GPU Memory ({message}): Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB")
 
 
-def run_huggingface_implementation(args):
+def run_huggingface_implementation(args, hf_tokenizer):
     """Run the DeepSeek-V3 model using Hugging Face Transformers."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+    from transformers import AutoModelForCausalLM, AutoConfig
     
     print("\n" + "="*50)
     print("Running Hugging Face Implementation")
@@ -46,11 +45,10 @@ def run_huggingface_implementation(args):
     # Disable FP8 quantization which can cause issues
     os.environ["TRANSFORMERS_DISABLE_FP8"] = "1"
     
-    # Load tokenizer
-    print("Loading tokenizer...")
-    start_time = time.time()
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
-    print(f"Tokenizer loaded in {time.time() - start_time:.2f} seconds")
+    # Use the provided HF tokenizer instead of creating a new torchtitan tokenizer
+    # This ensures compatibility with the model
+    tokenizer = hf_tokenizer
+    print("Using provided Hugging Face tokenizer")
     
     # Load model configuration
     print(f"Loading model: {args.model_name}")

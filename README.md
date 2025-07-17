@@ -104,7 +104,7 @@ Or via conda:
 conda install conda-forge::torchtitan
 ```
 ### Sources
-   
+
 ```bash
 git clone https://github.com/pytorch/torchtitan
 cd torchtitan

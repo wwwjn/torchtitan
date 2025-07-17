@@ -11,20 +11,25 @@ Script to load and run inference with DeepSeek-V3 model using either:
 2. TorchTitan native implementation
 """
 
-import argparse
+import time
 import torch
-import os
 import sys
+import argparse
 from pathlib import Path
+from hf_implementation import run_huggingface_implementation
 
 # Add torchtitan to path if needed
 torchtitan_path = Path("/data/users/jianiw/torchtitan")
 if str(torchtitan_path) not in sys.path:
     sys.path.insert(0, str(torchtitan_path))
 
-# Import implementations
-from hf_implementation import run_huggingface_implementation, print_gpu_memory_usage
-from torchtitan_implementation import run_torchtitan_implementation
+
+def print_gpu_memory_usage(message=""):
+    """Print current GPU memory usage."""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+        reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+        print(f"GPU Memory ({message}): Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB")
 
 
 def main():
@@ -43,6 +48,7 @@ def main():
                         help="Device to use (cuda or cpu)")
     parser.add_argument("--num_layers", type=int, default=0,
                         help="Number of layers to use (0 for all layers)")
+    parser.add_argument("--tokenizer_path", type=str, default="/data/users/jianiw/torchtitan/assets/tokenizer/DeepSeek-V3",)
     
     # Hugging Face specific arguments
     parser.add_argument("--model_name", type=str, 
@@ -60,15 +66,27 @@ def main():
     parser.add_argument("--checkpoint_path", type=str, 
                         default="/data/users/jianiw/torchtitan/outputs/checkpoint-dsv3/step-0",
                         help="Path to the checkpoint directory")
+
     
     args = parser.parse_args()
     
+    # Create a shared tokenizer using Hugging Face
+    print("\n" + "="*50)
+    print("Loading shared tokenizer")
+    print("="*50)
+    
+    from transformers import AutoTokenizer
+    
+    start_time = time.time()
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
+    print(f"Tokenizer loaded in {time.time() - start_time:.2f} seconds")
+    
     # Run the selected implementation(s)
     if args.implementation in ["hf", "both"]:
-        run_huggingface_implementation(args)
+        run_huggingface_implementation(args, tokenizer)
     
-    if args.implementation in ["torchtitan", "both"]:
-        run_torchtitan_implementation(args)
+    # if args.implementation in ["torchtitan", "both"]:
+    #     run_torchtitan_implementation(args, tokenizer)
 
 
 if __name__ == "__main__":
