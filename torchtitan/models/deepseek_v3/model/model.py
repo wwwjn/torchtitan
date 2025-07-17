@@ -237,7 +237,7 @@ class Attention(nn.Module):
 
         # Reshape and project output
         output = output.transpose(1, 2)  # (bsz, seqlen, n_heads, v_head_dim)
-        output = output.view(bsz, seqlen, -1)  # (bsz, seqlen, n_heads * v_head_dim)
+        output = output.reshape(bsz, seqlen, -1)  # (bsz, seqlen, n_heads * v_head_dim)
         return self.wo(output)  # (bsz, seqlen, dim)
 
     def init_weights(self, init_std: float):
