@@ -270,6 +270,7 @@ class CheckpointConverter:
         # TODO: remove this hack. Drop all the parameter with layer_id > 10 
         keys_to_remove = []
         for key in self.metadata:
+            # Only keep the first 5 layers: 3 dense layers and 2 MoE layers
             for layer in range(5, 62):
                 if f"model.layers.{layer}" in key:
                     keys_to_remove.append(key)
@@ -439,7 +440,7 @@ class CheckpointConverter:
         path = os.path.join(self.path, assignment.filename)
         state_dict = hf_load_file(path)
         
-        # ============================== Handle quantization ==============================
+        # ================= Handle quantization ======================
         # Group quantized weights with their scales
         weight_groups = defaultdict(dict)
         for k, v in state_dict.items():
@@ -657,6 +658,7 @@ class CheckpointConverter:
                             del expert_weights_by_layer[layer]
 
 
+# TODO: need to support fake model
 def _create_verified_state_dict(
     pg: dist.ProcessGroup, mesh: DeviceMesh
 ) -> dict[str, torch.Tensor]:

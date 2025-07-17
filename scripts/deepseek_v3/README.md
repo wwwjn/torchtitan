@@ -9,3 +9,12 @@ From HuggingFace format:
 ```bash
 CONFIG_FILE=../../torchtitan/models/deepseek_v3/train_configs/deepseek_v3_671b.toml  ./convert_hf_to_dcp_with_gpus.sh --checkpoint.enable_checkpoint --checkpoint.convert_path=[checkpoint_folder] --checkpoint.convert_load_every_n_ranks=8
 ```
+
+# Run with Hugging Face (default)
+python scripts/deepseek_v3/hf_dsv3_forward.py
+
+# Run with TorchTitan
+python scripts/deepseek_v3/hf_dsv3_forward.py --implementation torchtitan
+
+# Run both implementations
+python scripts/deepseek_v3/hf_dsv3_forward.py --implementation both
