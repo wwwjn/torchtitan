@@ -97,7 +97,7 @@ class DeepSeekV3ModelArgs(BaseModelArgs):
         """
         Update the model_config config from the given job config.
         """
-        self.vocab_size = tokenizer.vocab_size
+        self.vocab_size = 129280  #  (vocab_size for DeepSeek-v3-0324 model)
         self.max_seq_len = job_config.training.seq_len
 
     def get_nparams_and_flops(self, model: nn.Module, seq_len: int) -> tuple[int, int]:

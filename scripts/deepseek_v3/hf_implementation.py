@@ -23,7 +23,7 @@ def print_gpu_memory_usage(message=""):
         print(f"GPU Memory ({message}): Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB")
 
 
-def run_huggingface_implementation(args, hf_tokenizer):
+def run_huggingface_implementation(args, _):
     """Run the DeepSeek-V3 model using Hugging Face Transformers."""
     from transformers import AutoModelForCausalLM, AutoConfig
     
@@ -42,45 +42,79 @@ def run_huggingface_implementation(args, hf_tokenizer):
     
     print_gpu_memory_usage("Before loading model")
     
-    # Disable FP8 quantization which can cause issues
+    # Disable FP8 quantization and other features that can cause issues
     os.environ["TRANSFORMERS_DISABLE_FP8"] = "1"
+    os.environ["TRANSFORMERS_DISABLE_FLASH_ATTN_2"] = "1"
+    os.environ["TRANSFORMERS_DISABLE_CUSTOM_KERNELS"] = "1"
+    os.environ["TRANSFORMERS_DISABLE_TRITON"] = "1"
     
-    # Use the provided HF tokenizer instead of creating a new torchtitan tokenizer
-    # This ensures compatibility with the model
-    tokenizer = hf_tokenizer
-    print("Using provided Hugging Face tokenizer")
+    # We're not using the tokenizer anymore, using fake inputs instead
+    print("Using fake inputs instead of tokenizer")
     
-    # Load model configuration
-    print(f"Loading model: {args.model_name}")
+    # Use local path for model weights if specified, otherwise use model_name
+    model_path = "/data/users/jianiw/dsv3-weights"
+    print(f"Loading model from local path: {model_path}")
     start_time = time.time()
     
-    # Change config to only use a few layers for testing if specified
+    # ============= Change config to only use a few layers  ============= 
     config = None
     if args.num_layers > 0:
-        config = AutoConfig.from_pretrained(args.model_name, trust_remote_code=True)
+        # Try to load config from local path first, fall back to model_name if needed
+        try:
+            config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        except Exception as e:
+            print(f"Could not load config from local path: {e}")
+            print(f"Falling back to loading config from {args.model_name}")
+            config = AutoConfig.from_pretrained(args.model_name, trust_remote_code=True)
+        
         config.num_hidden_layers = args.num_layers
         print(f"Modified config to use only {args.num_layers} layers")
     
-    # Load the model
+        config.n_group = config.n_routed_experts  # make n_groups = n_routed_experts
+        config.topk_group = config.num_experts_per_tok  # make topk_group = num_activate_experts
+    
+    # Load the model from local path
     try:
+        # First try with specific device
         model = AutoModelForCausalLM.from_pretrained(
-            args.model_name,
+            model_path,
             torch_dtype=dtype,
-            device_map=args.device,
+            device_map=args.device,  # Try with specific device first
             config=config,
             trust_remote_code=True,
+            # Disable features that can cause issues with device mapping
+            attn_implementation="eager",  # Use standard attention instead of flash attention
+            use_cache=True,
         )
     except Exception as e:
-        print(f"Error loading model with device_map={args.device}: {e}")
-        print("Trying with device_map='auto'...")
+        print(f"Error loading model from local path with device_map={args.device}: {e}")
+        print("Trying with device_map='cpu' first, then moving to GPU...")
         
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name,
-            torch_dtype=dtype,
-            device_map="auto",
-            config=config,
-            trust_remote_code=True,
-        )
+        try:
+            # Load on CPU first, then move to GPU
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                torch_dtype=dtype,
+                device_map="cpu",  # Load on CPU first
+                config=config,
+                trust_remote_code=True,
+            )
+            # Move model to GPU after loading
+            device = torch.device(args.device if args.device != "auto" else "cuda:0")
+            model = model.to(device)
+            print(f"Successfully loaded model on CPU and moved to {device}")
+        except Exception as e:
+            print(f"Error loading model on CPU: {e}")
+            print(f"Falling back to loading model from {args.model_name}...")
+            
+            # Last resort: try loading from HF hub with auto device mapping
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model_name,
+                torch_dtype=dtype,
+                device_map="auto",
+                config=config,
+                trust_remote_code=True,
+            )
     
     print(f"Model loaded in {time.time() - start_time:.2f} seconds")
     print_gpu_memory_usage("After loading model")
@@ -90,36 +124,74 @@ def run_huggingface_implementation(args, hf_tokenizer):
     print(f"Model type: {type(model).__name__}")
     print(f"Number of parameters: {sum(p.numel() for p in model.parameters()) / 1e9:.2f} billion")
     
-    # Tokenize input and ensure it's on the correct device
-    print(f"\nPrompt: {args.prompt}")
-    inputs = tokenizer(args.prompt, return_tensors="pt")
-    
-    # Print input information
-    print(f"Input token IDs: {inputs['input_ids'][0][:10]}...")
-    print(f"Input shape: {inputs['input_ids'].shape}")
-    
-    # Explicitly move all input tensors to the same device as the model
+    # Get the device where the model is loaded
     device = next(model.parameters()).device
     print(f"Model is on device: {device}")
     
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    # Create fake input directly on the correct device
+    print("\nCreating fake input with the same shape as tokenized input")
+    
+    # Define sequence length for fake input
+    seq_length = 2048  # You can adjust this based on your needs
+    
+    # Create fake input_ids directly on the device - using random integers between 0 and 50000 (typical vocab size)
+    torch.manual_seed(42)  # Set seed for reproducibility
+    input_ids = torch.randint(0, 50000, (1, seq_length), dtype=torch.long, device=device)
+    
+    # Create fake attention_mask directly on the device - all 1s for full attention
+    attention_mask = torch.ones((1, seq_length), dtype=torch.long, device=device)
+    
+    # Create inputs dictionary similar to what tokenizer would produce
+    inputs = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask
+    }
+    
+    # Print input information
+    print(f"Fake input token IDs: {inputs['input_ids'][0][:10].cpu().numpy()}...")
+    print(f"Fake input shape: {inputs['input_ids'].shape}")
+    print(f"Input tensors device: {inputs['input_ids'].device}")
     
     # Run a single forward pass
     print("\nRunning single forward pass...")
     start_time = time.time()
     
     with torch.no_grad():
-        # Forward pass through the model
-        outputs = model(**inputs)
+        # Forward pass through the model with output_hidden_states=True to get intermediate layer outputs
+        outputs = model(**inputs, output_hidden_states=True)
     
     forward_time = time.time() - start_time
     
     # Get the logits from the output
     logits = outputs.logits if hasattr(outputs, "logits") else outputs
     
+    # Print average values for each layer's hidden states
+    if hasattr(outputs, "hidden_states"):
+        print("\nLayer-wise Statistics:")
+        hidden_states = outputs.hidden_states
+        
+        # The first element is the input embeddings, followed by each layer's output
+        print(f"Number of hidden states: {len(hidden_states)}")
+        
+        for i, hidden_state in enumerate(hidden_states):
+            # Calculate statistics
+            layer_mean = hidden_state.mean().item()
+            layer_std = hidden_state.std().item()
+            layer_min = hidden_state.min().item()
+            layer_max = hidden_state.max().item()
+            
+            if i == 0:
+                print(f"Input Embeddings - Mean: {layer_mean:.6f}, Std: {layer_std:.6f}, Min: {layer_min:.6f}, Max: {layer_max:.6f}")
+            else:
+                print(f"Layer {i-1} - Mean: {layer_mean:.6f}, Std: {layer_std:.6f}, Min: {layer_min:.6f}, Max: {layer_max:.6f}")
+    else:
+        print("\nNo hidden states found in model outputs. Try setting return_dict=True and output_hidden_states=True in the model configuration.")
+    
     # Get the predictions for the next token (highest probability)
     next_token_logits = logits[:, -1, :]
+    print(f"\nNext token logits : {next_token_logits}")
     next_token_probs = torch.softmax(next_token_logits, dim=-1)
+    print(f"\nNext token probabilities: {next_token_probs}")
     top_k_values, top_k_indices = torch.topk(next_token_probs, 5, dim=-1)
     
     print("\nForward Pass Results:")
@@ -127,10 +199,9 @@ def run_huggingface_implementation(args, hf_tokenizer):
     print(f"- Sequence length: {logits.shape[1]}")
     print(f"- Vocabulary size: {logits.shape[2]}")
     
-    print("\nTop 5 predicted next tokens:")
+    print("\nTop 5 predicted next tokens (showing IDs only since we're not using tokenizer):")
     for i, (value, index) in enumerate(zip(top_k_values[0], top_k_indices[0])):
-        token = tokenizer.decode([index])
-        print(f"  {i+1}. Token: '{token}' (ID: {index}) - Probability: {value.item():.4f}")
+        print(f"  {i+1}. Token ID: {index} - Probability: {value.item():.4f}")
     
     print(f"\nForward pass stats:")
     print(f"- Time: {forward_time:.4f} seconds")

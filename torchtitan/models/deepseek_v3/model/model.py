@@ -233,7 +233,7 @@ class Attention(nn.Module):
         # TODO: Need to pass softmax_scale to sdpa() interface.
         # For mask, DeepseekV3 uses causal mask, so we can use the default mask in sdpa
         # https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py#L17
-        output = self.sdpa(q, k, v)
+        output = self.sdpa(q, k, v, scale=self.softmax_scale)
 
         # Reshape and project output
         output = output.transpose(1, 2)  # (bsz, seqlen, n_heads, v_head_dim)
@@ -369,8 +369,16 @@ class DeepSeekV3Model(nn.Module, ModelProtocol):
         """
         h = self.tok_embeddings(tokens)
 
+        # Check average value of tensor h after embedding
+        print(f"Average value after embedding: {h.mean().item()}")
+        
+
         for layer in self.layers.values():
             h = layer(h, self.freqs_cis)
+            print(f"Average value after layers: {h.mean().item()}")
         h = self.norm(h)
+        print(f"Average value after norm: {h.mean().item()}")
         output = self.output(h)
+        print(f"output weights: {self.output.weight.mean().item()}")
+        print(f"Average value after output: {output.mean().item()}")
         return output
