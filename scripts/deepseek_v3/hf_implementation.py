@@ -70,8 +70,8 @@ def run_huggingface_implementation(args, _):
         config.num_hidden_layers = args.num_layers
         print(f"Modified config to use only {args.num_layers} layers")
     
-        config.n_group = config.n_routed_experts  # make n_groups = n_routed_experts
-        config.topk_group = config.num_experts_per_tok  # make topk_group = num_activate_experts
+        config.n_group = 1  # make n_groups = a huge group
+        config.topk_group = 1  # make topk_group = a huge group 
     
     # Load the model from local path
     try:
@@ -115,6 +115,7 @@ def run_huggingface_implementation(args, _):
                 config=config,
                 trust_remote_code=True,
             )
+            model = model.to(torch.float32)
     
     print(f"Model loaded in {time.time() - start_time:.2f} seconds")
     print_gpu_memory_usage("After loading model")
@@ -156,6 +157,14 @@ def run_huggingface_implementation(args, _):
     print("\nRunning single forward pass...")
     start_time = time.time()
     
+    
+    layer_0_mlp_weights = model.model.layers[0].self_attn.q_a_proj.weight
+
+    # Layer 0 MLP weights: torch.Size([1536, 7168]) dtype torch.float8_e4m3fn
+    print(f"Layer 0 MLP weights: {layer_0_mlp_weights.shape} dtype {layer_0_mlp_weights.dtype}")
+    for i in range(0, 10):
+        print(f"Layer 0 MLP weights[0][{i}]: {layer_0_mlp_weights[0][i]}")
+
     with torch.no_grad():
         # Forward pass through the model with output_hidden_states=True to get intermediate layer outputs
         outputs = model(**inputs, output_hidden_states=True)
@@ -174,7 +183,7 @@ def run_huggingface_implementation(args, _):
         print(f"Number of hidden states: {len(hidden_states)}")
         
         for i, hidden_state in enumerate(hidden_states):
-            # Calculate statistics
+            # Calculate statistics.
             layer_mean = hidden_state.mean().item()
             layer_std = hidden_state.std().item()
             layer_min = hidden_state.min().item()
@@ -182,8 +191,18 @@ def run_huggingface_implementation(args, _):
             
             if i == 0:
                 print(f"Input Embeddings - Mean: {layer_mean:.6f}, Std: {layer_std:.6f}, Min: {layer_min:.6f}, Max: {layer_max:.6f}")
+                # Print embedding weights statistics
+                if i == 0:
+                    embedding_weights = model.model.embed_tokens.weight
+                    emb_mean = embedding_weights.mean().item()
+                    emb_std = embedding_weights.std().item()
+                    emb_min = embedding_weights.min().item()
+                    emb_max = embedding_weights.max().item()
+                    
+                    print(f"Embedding Weights - Mean: {emb_mean:.6f}, Std: {emb_std:.6f}, Min: {emb_min:.6f}, Max: {emb_max:.6f} shape {embedding_weights.shape}")
             else:
-                print(f"Layer {i-1} - Mean: {layer_mean:.6f}, Std: {layer_std:.6f}, Min: {layer_min:.6f}, Max: {layer_max:.6f}")
+                # dtype = bfloat16
+                print(f"Layer {i-1} - Mean: {layer_mean:.6f}, Std: {layer_std:.6f}, Min: {layer_min:.6f}, Max: {layer_max:.6f},  shape {hidden_state.shape} dtype {hidden_state.dtype}" )
     else:
         print("\nNo hidden states found in model outputs. Try setting return_dict=True and output_hidden_states=True in the model configuration.")
     

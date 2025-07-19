@@ -310,7 +310,7 @@ class MoE(nn.Module):
         """
         bs, slen, dim = x.shape
 
-        print("Checking GroupedExpert weights: ", self.experts.w1)
+        # print("Checking GroupedExpert weights: ", self.experts.w1)
 
         # top_scores and selected_indices shape (bs*slen*top_k,)
         # num_tokens_per_expert shape (num_experts,)

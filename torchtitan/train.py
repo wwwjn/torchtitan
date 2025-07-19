@@ -431,7 +431,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 with self.maybe_enable_amp:
                     model_parts[0].eval()
                     pred = model_parts[0](inputs)
-                    print("Prediction tensor is: ", pred)
+                    # print("Prediction tensor is: ", pred)
 
                     # Print detailed information about the model output
                     print("\nForward Pass Results:")
@@ -445,6 +445,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     next_token_probs = torch.softmax(next_token_logits, dim=-1)
                     print(f"\nNext token probabilities: {next_token_probs}")
                     top_k_values, top_k_indices = torch.topk(next_token_probs, 5, dim=-1)
+
+                    print("Top K values: ", top_k_values)
+                    print("Top K indices: ", top_k_indices)
                     
                     print("\nTop 5 predicted next tokens (showing IDs only since we're not using tokenizer):")
                     for i, (value, index) in enumerate(zip(top_k_values[0], top_k_indices[0])):

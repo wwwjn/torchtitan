@@ -7,9 +7,11 @@ import json
 import math
 import os
 import pprint
+import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
 import torch
@@ -169,7 +171,7 @@ def convert_to_titan_tensors(fqn: str, full_tensor: torch.Tensor) -> list[torch.
 class _Assignment:
     loader_id: int
     filename: str
-    fqns: list[str]
+    fqns: list[str] 
     shapes: list[torch.Size]
     dtypes: list[torch.dtype]
 
@@ -228,8 +230,9 @@ class CheckpointConverter:
                 # This rank is not the loader
                 if i != self.loader_id or not self.should_load:
                     continue
+                
+                # Loaded state_dict should be HF state_dict
                 loaded_state_dict = self._load_round(loader_assignments[i])
-
             
             torch.cuda.synchronize()
             logger.info(f"Loading round {idx} finished")
@@ -343,7 +346,7 @@ class CheckpointConverter:
                 # The shape is wrong for the following keys. We need to convert it.
                 shape = convert_to_hf_shape(fqn, titan_fqns, state_dict[titan_fqns[0]])
                 meta = TensorMetadata(
-                    fqn=fqn,
+                    fqn=fqn,  # HF fqn
                     shape=shape,
                     # TODO: don't hardcode this
                     dtype=torch.bfloat16,
@@ -389,50 +392,83 @@ class CheckpointConverter:
 
     def _dequantize_weight(self, weight: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tensor:
         """
-        Dequantize a weight tensor using its scale_inv tensor.
-        Implementation for DeepSeek-V3 block-wise quantization.
+        Dequantize an FP8 weight tensor using its weight_scale_inv tensor.
+        
+        The FP8 weight file includes a weight_scale_inv field, which stores the 
+        dequantization scale for each weight block.
+        
+        Dequantization Formula:
+        - If the weight block is not aligned to 128, it is zero-padded to 128 before 
+          calculating the scale. After quantization, the padded portion is removed.
+        - The dequantization process is performed as: (128x128 weight block) * weight_scale_inv.
+        - This enables online quantization at a granularity of per-token-per-128-channel.
         """
-        # For DeepSeek-V3, the scale_inv tensor is typically much smaller than the weight tensor
-        # and represents scaling factors for blocks of the weight tensor
+        # Convert to float32 for computation
+        float_weight = weight.to(torch.float32)
         
-        # Check if we're dealing with a quantized tensor
-        if weight.dtype == torch.int8:
-            print("_dequantize_weight: weight.dtype == torch.int8")
-            # Convert to float first
-            float_weight = weight.to(torch.float32)
+        # Get original dimensions
+        orig_shape = weight.shape
+        
+        # Fixed block size of 128x128 as specified in the algorithm
+        BLOCK_SIZE = 128
+        
+        # Calculate number of blocks needed
+        block_rows = (orig_shape[0] + BLOCK_SIZE - 1) // BLOCK_SIZE
+        block_cols = (orig_shape[1] + BLOCK_SIZE - 1) // BLOCK_SIZE
+        
+        # Verify scale_inv shape matches expected block dimensions
+        expected_scale_shape = (block_rows, block_cols)
+        if scale_inv.shape != expected_scale_shape:
+            logger.warning(f"scale_inv shape {scale_inv.shape} doesn't match expected shape {expected_scale_shape}")
+        
+        # Create output tensor directly in bfloat16
+        dequantized = torch.zeros(orig_shape, dtype=torch.bfloat16, device="cuda")
+        
+        # Apply scaling factors to each block
+        for i in range(block_rows):
+            row_start = i * BLOCK_SIZE
+            row_end = min(row_start + BLOCK_SIZE, orig_shape[0])
             
-            # Get original dimensions
-            orig_shape = weight.shape
-            
-            # For DeepSeek-V3, scale_inv shape is typically (block_rows, block_cols)
-            # where each element is the scaling factor for a block of the weight matrix
-            block_rows, block_cols = scale_inv.shape
-            
-            # Calculate block size
-            block_size_row = (orig_shape[0] + block_rows - 1) // block_rows
-            block_size_col = (orig_shape[1] + block_cols - 1) // block_cols
-            
-            # Create output tensor
-            dequantized = torch.zeros(orig_shape, dtype=torch.bfloat16, device="cuda")
-            
-            # Apply scaling factors to each block
-            for i in range(block_rows):
-                row_start = i * block_size_row
-                row_end = min(row_start + block_size_row, orig_shape[0])
+            for j in range(block_cols):
+                col_start = j * BLOCK_SIZE
+                col_end = min(col_start + BLOCK_SIZE, orig_shape[1])
                 
-                for j in range(block_cols):
-                    col_start = j * block_size_col
-                    col_end = min(col_start + block_size_col, orig_shape[1])
+                # Get the block
+                block = float_weight[row_start:row_end, col_start:col_end]
+                
+                # If block is not aligned to 128x128, we need to pad it
+                # (This simulates what would have happened during quantization)
+                actual_rows = row_end - row_start
+                actual_cols = col_end - col_start
+                
+                if actual_rows < BLOCK_SIZE or actual_cols < BLOCK_SIZE:
+                    # Create padded block
+                    padded_block = torch.zeros(BLOCK_SIZE, BLOCK_SIZE, dtype=torch.float32, device="cuda")
+                    padded_block[:actual_rows, :actual_cols] = block
                     
-                    # Get the block and apply the scaling factor
-                    block = float_weight[row_start:row_end, col_start:col_end]
+                    # Apply scale to padded block
                     scale = scale_inv[i, j]
-                    dequantized[row_start:row_end, col_start:col_end] = block * scale
-            
-            return dequantized
+                    padded_block = padded_block * scale
+                    
+                    # Extract only the needed portion back
+                    block = padded_block[:actual_rows, :actual_cols]
+                else:
+                    # Block is already 128x128, apply scale directly
+                    scale = scale_inv[i, j]
+                    block = block * scale
+                
+                # Explicitly convert block to bfloat16 before assignment
+                block_bf16 = block.to(torch.bfloat16)
+                
+                # Store the dequantized block
+                dequantized[row_start:row_end, col_start:col_end] = block_bf16
         
-        # If not quantized or unknown format, return as is
-        return weight.to(dtype=torch.bfloat16)
+        # Verify the output is actually bfloat16
+        if dequantized.dtype != torch.bfloat16:
+            logger.warning(f"Dequantized tensor is not in bfloat16: {dequantized.dtype}")
+            dequantized = dequantized.to(torch.bfloat16)
+
+        return dequantized
 
     def _load_round(self, assignment: _Assignment) -> dict[str, Any]:
         from safetensors.torch import load_file as hf_load_file
@@ -444,18 +480,24 @@ class CheckpointConverter:
         # Group quantized weights with their scales
         weight_groups = defaultdict(dict)
         for k, v in state_dict.items():
-            if k in assignment.fqns:
+            base_name = k.split(".weight")[0]
+            if f"{base_name}.weight" in assignment.fqns:  # HF fqn, but not inlucde weight_scale_inv
                 # Extract base name without quantization suffix
                 if ".weight_" in k:
                     base_name = k.split(".weight_")[0]
+                    weight_groups[base_name][k] = v.to(device="cuda")
+                elif ".weight" in k:
+                    base_name = k.split(".weight")[0]
                     weight_groups[base_name][k] = v.to(device="cuda")
                 else:
                     # Regular tensor
                     weight_groups[k][k] = v.to(device="cuda")
         
         # Process and dequantize weights
+        
         result_dict = {}
         for base_name, tensors in weight_groups.items():
+            print(f"Processing {base_name} with {len(tensors)} tensors")
             # Check if this is a quantized weight that needs dequantization
             weight_key = f"{base_name}.weight" if f"{base_name}.weight" in tensors else base_name
             scale_inv_key = f"{base_name}.weight_scale_inv"
@@ -464,8 +506,8 @@ class CheckpointConverter:
                 # This is a quantized weight that needs dequantization
                 weight = tensors[weight_key]
                 scale_inv = tensors[scale_inv_key]
-                
-                logger.info(f"Dequantizing {weight_key} with shape {weight.shape}, using scale_inv with shape {scale_inv.shape}")
+
+                print(f"Dequantizing {weight_key} with shape {weight.shape}, using scale_inv with shape {scale_inv.shape}")
                 
                 # Dequantize the weight
                 dequantized_weight = self._dequantize_weight(weight, scale_inv)
@@ -475,7 +517,7 @@ class CheckpointConverter:
                 for k, v in tensors.items():
                     if k in assignment.fqns and not is_quantization_tensor(k):
                         result_dict[k] = v
-        
+        print("result_dict.keys(): ", result_dict.keys())
         return result_dict
 
     def _reshard_send(
@@ -497,6 +539,15 @@ class CheckpointConverter:
                 
             tensor = loaded_state_dict[fqn].to(dtype=torch.bfloat16)
             logger.info(f"Sending tensor {fqn} with shape {tensor.shape} and dtype {tensor.dtype}")
+            
+            # Check if this is the embedding weight tensor
+            if "model.embed_tokens.weight" in fqn:
+                logger.info(f"SENDER: Found embed_tokens.weight tensor with shape {tensor.shape}")
+                # Print some statistics about the tensor
+                logger.info(f"SENDER: embed_tokens.weight stats - Mean: {tensor.mean().item():.6f}, Std: {tensor.std().item():.6f}")
+                # Print a few sample values
+                logger.info(f"SENDER: embed_tokens.weight first 5 values: {tensor.flatten()[:5].tolist()}")
+                logger.info(f"SENDER: embed_tokens.weight last 5 values: {tensor.flatten()[-5:].tolist()}")
             
             # Send tensor shape first (needed for receiving side to allocate correctly)
             tensor_shape = torch.tensor(tensor.shape, dtype=torch.long, device="cuda")
@@ -547,7 +598,17 @@ class CheckpointConverter:
             self.total_recv_bytes += flat_tensor.numel() * flat_tensor.element_size()
             
             # Reshape and store
-            ret[fqn] = flat_tensor.view(actual_shape)
+            tensor = flat_tensor.view(actual_shape)
+            ret[fqn] = tensor
+            
+            # Check if this is the embedding weight tensor
+            if "model.embed_tokens.weight" in fqn:
+                logger.info(f"RECEIVER: Found embed_tokens.weight tensor with shape {tensor.shape}")
+                # Print some statistics about the tensor
+                logger.info(f"RECEIVER: embed_tokens.weight stats - Mean: {tensor.mean().item():.6f}, Std: {tensor.std().item():.6f}")
+                # Print a few sample values
+                logger.info(f"RECEIVER: embed_tokens.weight first 5 values: {tensor.flatten()[:5].tolist()}")
+                logger.info(f"RECEIVER: embed_tokens.weight last 5 values: {tensor.flatten()[-5:].tolist()}")
             
         return ret
 
@@ -631,12 +692,75 @@ class CheckpointConverter:
                     # If we have all the experts, concatenate them
                     if len(experts) == expected_num_experts:
                         logger.info(f"Concatenating {len(experts)} experts for {titan_fqn}")
+
+                        sorted_expert_ids = sorted(experts.keys())
+                        sorted_experts = [experts[i] for i in sorted_expert_ids]
                         
-                        # Sort experts by ID and stack them
-                        sorted_experts = [experts[i] for i in sorted(experts.keys())]
-                        
-                        # Create a 3D tensor with all experts, and transpose to match torchtian shape
+                        # print info
+                        for i in range(len(sorted_experts)):
+                            logger.info(f"Expert {sorted_expert_ids[i]} - Shape: {sorted_experts[i].shape}, Dtype: {sorted_experts[i].dtype}, Device: {sorted_experts[i].device}")
+
                         stacked_tensor = torch.stack(sorted_experts, dim=0).transpose(1, 2)
+                        
+                        # # Sort experts by ID
+                        # sorted_expert_ids = sorted(experts.keys())
+                        # sorted_experts = [experts[i] for i in sorted_expert_ids]
+                        
+                        # # Print detailed info about each tensor before conversion
+                        # logger.info(f"Expert tensors before conversion for {titan_fqn}:")
+                        # for i, expert in enumerate(sorted_experts[:5]):  # Log first 5 experts only to avoid flooding logs
+                        #     logger.info(f"Expert {sorted_expert_ids[i]} - Shape: {expert.shape}, Dtype: {expert.dtype}, Device: {expert.device}")
+                        
+                        # # ALWAYS convert ALL tensors to bfloat16 regardless of their current type
+                        # logger.info(f"Converting ALL expert tensors to bfloat16 for {titan_fqn}")
+                        # converted_experts = []
+                        
+                        # for i, expert in enumerate(sorted_experts):
+                        #     try:
+                        #         # First convert to float32 as an intermediate step for better precision
+                        #         converted = expert.to(torch.float32).to(torch.bfloat16)
+                        #         converted_experts.append(converted)
+                        #     except Exception as e:
+                        #         logger.error(f"Error converting expert {sorted_expert_ids[i]}: {e}")
+                        #         # Try a different approach
+                        #         logger.info(f"Trying alternative conversion for expert {sorted_expert_ids[i]}")
+                        #         # Create a new tensor and copy values
+                        #         new_tensor = torch.empty_like(expert, dtype=torch.bfloat16)
+                        #         with torch.no_grad():
+                        #             new_tensor.copy_(expert)
+                        #         converted_experts.append(new_tensor)
+                        
+                        # # Verify all tensors are now the same type
+                        # data_types = set(expert.dtype for expert in converted_experts)
+                        # logger.info(f"After conversion, expert tensor types: {data_types}")
+                        
+                        # # Create a 3D tensor with all experts, and transpose to match torchtitan shape
+                        # try:
+                        #     logger.info("Attempting to stack converted tensors")
+                        #     stacked_tensor = torch.stack(converted_experts, dim=0).transpose(1, 2)
+                        #     logger.info(f"Successfully stacked tensors with shape {stacked_tensor.shape} and dtype {stacked_tensor.dtype}")
+                        # except RuntimeError as e:
+                        #     # If we still have issues, create a new tensor and copy data manually
+                        #     logger.error(f"Error stacking tensors: {e}")
+                        #     logger.info("Using manual tensor creation and copying")
+                            
+                        #     # Get shapes from the first tensor
+                        #     expert_shape = converted_experts[0].shape
+                        #     num_experts = len(converted_experts)
+                            
+                        #     # Create a new empty tensor with the right shape and dtype
+                        #     stacked_tensor = torch.empty(
+                        #         (num_experts, expert_shape[1], expert_shape[0]),  # Already transposed
+                        #         dtype=torch.bfloat16,
+                        #         device="cuda"
+                        #     )
+                            
+                        #     # Copy each expert tensor manually
+                        #     for i, expert in enumerate(converted_experts):
+                        #         # Transpose each expert and copy
+                        #         stacked_tensor[i] = expert.t().to(torch.bfloat16)
+                            
+                        #     logger.info(f"Manual stacking successful with shape {stacked_tensor.shape}")
                         
                         # Copy to the state_dict
                         shape, offset = compute_local_shape_and_global_offset(
@@ -777,17 +901,12 @@ if __name__ == "__main__":
             size += v.numel() * v.element_size()
         logger.info(f"Total size of the model: {size / 1e9:.2f} GB")
 
-        # Our tokenizer is not up-to-date yet.
-        tok_embeddings_weight = state_dict.pop("tok_embeddings.weight", None)
-        output_weight = state_dict.pop("output.weight", None)
         state_dict = CheckpointConverter(
             process_group=trainer.parallel_dims.world_mesh.get_group(),
             path=config.checkpoint.convert_path,
             token=config.checkpoint.convert_hf_token,
             loader_every_n_ranks=config.checkpoint.convert_load_every_n_ranks,
         ).convert(state_dict)
-        state_dict["tok_embeddings.weight"] = tok_embeddings_weight
-        state_dict["output.weight"] = output_weight
 
         class DummyModel:
             def __init__(self, state_dict: dict[str, torch.Tensor]) -> None:

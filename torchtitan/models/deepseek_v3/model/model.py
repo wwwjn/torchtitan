@@ -191,6 +191,9 @@ class Attention(nn.Module):
         Returns:
             torch.Tensor: Output tensor with the same shape as the input.
         """
+        for i in range(0, 10):
+            print("self.wkv_a.weight: ", self.wq_a.weight[0][i])
+        
         bsz, seqlen, _ = x.size()
 
         # Query projection
@@ -291,11 +294,29 @@ class TransformerBlock(nn.Module):
         Returns:
             torch.Tensor: Output tensor with the same shape as the input.
         """
-        x = x + self.attention(self.attention_norm(x), freqs_cis)
+        # Create a helper function to print tensor statistics
+        def print_tensor_stats(name, tensor):
+            mean = tensor.mean().item()
+            std = tensor.std().item()
+            min_val = tensor.min().item()
+            max_val = tensor.max().item()
+            print(f"{name} - Mean: {mean:.6f}, Std: {std:.6f}, Min: {min_val:.6f}, Max: {max_val:.6f}")
+
+        # Print statistics before and after each normalization
+        # print_tensor_stats("Before attention_norm", x)
+        attn_norm_out = self.attention_norm(x)
+        # print_tensor_stats("After attention_norm", attn_norm_out)
+
+        x = x + self.attention(attn_norm_out, freqs_cis)
+
+        # print_tensor_stats("Before ffn_norm", x)
+        ffn_norm_out = self.ffn_norm(x)
+        # print_tensor_stats("After ffn_norm", ffn_norm_out)
+
         if self.moe_enabled:
-            x = x + self.moe(self.ffn_norm(x))
+            x = x + self.moe(ffn_norm_out)
         else:
-            x = x + self.feed_forward(self.ffn_norm(x))
+            x = x + self.feed_forward(ffn_norm_out)
         return x
 
     def init_weights(self, buffer_device: torch.device):
@@ -367,18 +388,54 @@ class DeepSeekV3Model(nn.Module, ModelProtocol):
         Returns:
             torch.Tensor: Logits tensor of shape (batch_size, vocab_size).
         """
-        h = self.tok_embeddings(tokens)
-
-        # Check average value of tensor h after embedding
-        print(f"Average value after embedding: {h.mean().item()}")
+        # Reset hidden states collection
+        self._hidden_states = []
         
-
-        for layer in self.layers.values():
+        # Get embeddings
+        h = self.tok_embeddings(tokens)
+        emb_mean = self.tok_embeddings.weight.mean().item()
+        emb_std = self.tok_embeddings.weight.std().item()
+        emb_min = self.tok_embeddings.weight.min().item()
+        emb_max = self.tok_embeddings.weight.max().item()
+        print(f"Token Embedding weights - Mean: {emb_mean:.6f}, Std: {emb_std:.6f}, Min: {emb_min:.6f}, Max: {emb_max:.6f}")
+        
+        print("h type after embedding: ", h.dtype, h.shape, type(h))
+        
+        # Store and print statistics for input embeddings
+        self._hidden_states.append(h.detach())
+        emb_mean = h.mean().item()
+        emb_std = h.std().item()
+        emb_min = h.min().item()
+        emb_max = h.max().item()
+        print(f"Input Embeddings - Mean: {emb_mean:.6f}, Std: {emb_std:.6f}, Min: {emb_min:.6f}, Max: {emb_max:.6f}")
+        
+        # Process through layers
+        for i, layer in enumerate(self.layers.values()):
             h = layer(h, self.freqs_cis)
-            print(f"Average value after layers: {h.mean().item()}")
+            
+            # Store and print statistics for this layer
+            self._hidden_states.append(h.detach())
+            layer_mean = h.mean().item()
+            layer_std = h.std().item()
+            layer_min = h.min().item()
+            layer_max = h.max().item()
+            print(f"Layer {i} - Mean: {layer_mean:.6f}, Std: {layer_std:.6f}, Min: {layer_min:.6f}, Max: {layer_max:.6f}")
+        
+        # Apply final normalization
         h = self.norm(h)
-        print(f"Average value after norm: {h.mean().item()}")
+        
+        # Generate output logits
         output = self.output(h)
-        print(f"output weights: {self.output.weight.mean().item()}")
-        print(f"Average value after output: {output.mean().item()}")
+        
         return output
+    
+    def get_hidden_states(self):
+        """
+        Returns the hidden states collected during the forward pass.
+        
+        Returns:
+            list[torch.Tensor]: List of hidden states, where:
+                - hidden_states[0] is the input embeddings
+                - hidden_states[i] for i>0 is the output of the i-th layer
+        """
+        return self._hidden_states
