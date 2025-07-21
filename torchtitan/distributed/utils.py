@@ -169,6 +169,7 @@ def create_context_parallel_ctx(
         )
 
     set_rotate_method(cp_rotate_method)
+    torch.distributed.tensor.experimental._attention._cp_options.enable_load_balance = False
     return context_parallel(
         cp_mesh,
         buffers=cp_buffers,
