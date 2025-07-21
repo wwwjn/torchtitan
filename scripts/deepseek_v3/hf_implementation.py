@@ -32,7 +32,7 @@ def run_huggingface_implementation(args, _):
     print("="*50)
     
     # Set precision
-    dtype = torch.bfloat16 if args.bf16 else torch.float16
+    dtype = torch.bfloat16
     print(f"Using precision: {dtype}")
     
     # Clear CUDA cache before loading model
@@ -73,6 +73,15 @@ def run_huggingface_implementation(args, _):
         config.n_group = 1  # make n_groups = a huge group
         config.topk_group = 1  # make topk_group = a huge group 
     
+    # Define quantization config
+    quantization_config = {
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128]
+    }
+    print(f"Using quantization config: {quantization_config}")
+    
     # Load the model from local path
     try:
         # First try with specific device
@@ -85,6 +94,7 @@ def run_huggingface_implementation(args, _):
             # Disable features that can cause issues with device mapping
             attn_implementation="eager",  # Use standard attention instead of flash attention
             use_cache=True,
+            quantization_config=quantization_config,
         )
     except Exception as e:
         print(f"Error loading model from local path with device_map={args.device}: {e}")
@@ -98,6 +108,7 @@ def run_huggingface_implementation(args, _):
                 device_map="cpu",  # Load on CPU first
                 config=config,
                 trust_remote_code=True,
+                quantization_config=quantization_config,
             )
             # Move model to GPU after loading
             device = torch.device(args.device if args.device != "auto" else "cuda:0")
@@ -114,6 +125,7 @@ def run_huggingface_implementation(args, _):
                 device_map="auto",
                 config=config,
                 trust_remote_code=True,
+                quantization_config=quantization_config,
             )
             model = model.to(torch.float32)
     
@@ -158,10 +170,18 @@ def run_huggingface_implementation(args, _):
     start_time = time.time()
     
     
+    # dense layer
     layer_0_mlp_weights = model.model.layers[0].self_attn.q_a_proj.weight
-
+    
     # Layer 0 MLP weights: torch.Size([1536, 7168]) dtype torch.float8_e4m3fn
     print(f"Layer 0 MLP weights: {layer_0_mlp_weights.shape} dtype {layer_0_mlp_weights.dtype}")
+    
+    # Check if weight_scale attribute exists (common in FP8 implementations)
+    if hasattr(model.model.layers[0].self_attn.q_a_proj, "weight_scale"):
+        weight_scale = model.model.layers[0].self_attn.q_a_proj.weight_scale
+        print(f"Weight scale shape: {weight_scale.shape}, dtype: {weight_scale.dtype}")
+        
+    # Print some weight values
     for i in range(0, 10):
         print(f"Layer 0 MLP weights[0][{i}]: {layer_0_mlp_weights[0][i]}")
 

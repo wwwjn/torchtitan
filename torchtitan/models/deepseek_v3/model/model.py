@@ -191,8 +191,8 @@ class Attention(nn.Module):
         Returns:
             torch.Tensor: Output tensor with the same shape as the input.
         """
-        for i in range(0, 10):
-            print("self.wkv_a.weight: ", self.wq_a.weight[0][i])
+        # for i in range(0, 10):
+        #     print("self.wkv_a.weight: ", self.wq_a.weight[0][i])
         
         bsz, seqlen, _ = x.size()
 

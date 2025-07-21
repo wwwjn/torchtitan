@@ -475,10 +475,12 @@ class CheckpointConverter:
         
         path = os.path.join(self.path, assignment.filename)
         state_dict = hf_load_file(path)
-        
-        # ================= Handle quantization ======================
+
         # Group quantized weights with their scales
         weight_groups = defaultdict(dict)
+        missing_scale_inv = []
+        
+        # First pass: collect weights and available scale_inv values
         for k, v in state_dict.items():
             base_name = k.split(".weight")[0]
             if f"{base_name}.weight" in assignment.fqns:  # HF fqn, but not inlucde weight_scale_inv
@@ -489,15 +491,56 @@ class CheckpointConverter:
                 elif ".weight" in k:
                     base_name = k.split(".weight")[0]
                     weight_groups[base_name][k] = v.to(device="cuda")
+                    # Check if scale_inv is missing
+                    if f"{base_name}.weight_scale_inv" not in state_dict:
+                        if base_name in ["model.embed_tokens", "model.norm", "lm_head"] :
+                            # These are the only two cases where scale_inv is not needed
+                            continue
+                        if "input_layernorm" in base_name or "post_attention_layernorm" in base_name:
+                            # These are the only two cases where scale_inv is not needed
+                            continue
+                        missing_scale_inv.append(base_name)
+                        logger.info(f"Need to look for {base_name}.weight_scale_inv in other files")
                 else:
                     # Regular tensor
                     weight_groups[k][k] = v.to(device="cuda")
         
-        # Process and dequantize weights
+        # If we have missing scale_inv values, try to find them in other files
+        # Simplified approach: Just check the next file in the metadata list
+        if missing_scale_inv:
+            logger.info(f"Looking for {len(missing_scale_inv)} missing scale_inv values")
+            
+            # Get all available files from metadata
+            all_files = sorted(list(set(self.metadata.values())))
+            current_file = assignment.filename
+            
+            # Find the next file after the current one
+            try:
+                current_idx = all_files.index(current_file)
+                next_file = all_files[(current_idx + 1) % len(all_files)]
+                
+                try:
+                    other_path = os.path.join(self.path, next_file)
+                    other_state_dict = hf_load_file(other_path)
+                    
+                    # Check for each missing scale_inv
+                    for base_name in missing_scale_inv:
+                        scale_inv_key = f"{base_name}.weight_scale_inv"
+                        if scale_inv_key in other_state_dict:
+                            logger.info(f"Found {scale_inv_key} in {next_file}")
+                            weight_groups[base_name][scale_inv_key] = other_state_dict[scale_inv_key].to(device="cuda")
+                        else:
+                            logger.warning(f"Could not find {scale_inv_key} in next file")
+                    
+                except Exception as e:
+                    logger.warning(f"Error loading file {next_file}: {e}")
+            except ValueError:
+                logger.warning(f"Could not find current file {current_file} in metadata files")
         
+        # Process and dequantize weights
         result_dict = {}
         for base_name, tensors in weight_groups.items():
-            print(f"Processing {base_name} with {len(tensors)} tensors")
+            logger.info(f"Processing {base_name} with {len(tensors)} tensors")
             # Check if this is a quantized weight that needs dequantization
             weight_key = f"{base_name}.weight" if f"{base_name}.weight" in tensors else base_name
             scale_inv_key = f"{base_name}.weight_scale_inv"
@@ -507,17 +550,22 @@ class CheckpointConverter:
                 weight = tensors[weight_key]
                 scale_inv = tensors[scale_inv_key]
 
-                print(f"Dequantizing {weight_key} with shape {weight.shape}, using scale_inv with shape {scale_inv.shape}")
+                logger.info(f"Dequantizing {weight_key} with shape {weight.shape}, using scale_inv with shape {scale_inv.shape}")
                 
-                # Dequantize the weight
+                # Convert Float8 to Float32 first, then to BFloat16
+                # This avoids the direct promotion error between Float8 and BFloat16
                 dequantized_weight = self._dequantize_weight(weight, scale_inv)
+                # dequantized_weight = weight.to(torch.float32).to(torch.bfloat16)
+                logger.info(f"Dequantized {weight_key} from {weight.dtype} to {dequantized_weight.dtype}")
+
                 result_dict[weight_key] = dequantized_weight
             else:
                 # Regular tensors or already in full precision
                 for k, v in tensors.items():
                     if k in assignment.fqns and not is_quantization_tensor(k):
                         result_dict[k] = v
-        print("result_dict.keys(): ", result_dict.keys())
+        
+        logger.info(f"Processed {len(result_dict)} tensors in this round")
         return result_dict
 
     def _reshard_send(
@@ -701,66 +749,6 @@ class CheckpointConverter:
                             logger.info(f"Expert {sorted_expert_ids[i]} - Shape: {sorted_experts[i].shape}, Dtype: {sorted_experts[i].dtype}, Device: {sorted_experts[i].device}")
 
                         stacked_tensor = torch.stack(sorted_experts, dim=0).transpose(1, 2)
-                        
-                        # # Sort experts by ID
-                        # sorted_expert_ids = sorted(experts.keys())
-                        # sorted_experts = [experts[i] for i in sorted_expert_ids]
-                        
-                        # # Print detailed info about each tensor before conversion
-                        # logger.info(f"Expert tensors before conversion for {titan_fqn}:")
-                        # for i, expert in enumerate(sorted_experts[:5]):  # Log first 5 experts only to avoid flooding logs
-                        #     logger.info(f"Expert {sorted_expert_ids[i]} - Shape: {expert.shape}, Dtype: {expert.dtype}, Device: {expert.device}")
-                        
-                        # # ALWAYS convert ALL tensors to bfloat16 regardless of their current type
-                        # logger.info(f"Converting ALL expert tensors to bfloat16 for {titan_fqn}")
-                        # converted_experts = []
-                        
-                        # for i, expert in enumerate(sorted_experts):
-                        #     try:
-                        #         # First convert to float32 as an intermediate step for better precision
-                        #         converted = expert.to(torch.float32).to(torch.bfloat16)
-                        #         converted_experts.append(converted)
-                        #     except Exception as e:
-                        #         logger.error(f"Error converting expert {sorted_expert_ids[i]}: {e}")
-                        #         # Try a different approach
-                        #         logger.info(f"Trying alternative conversion for expert {sorted_expert_ids[i]}")
-                        #         # Create a new tensor and copy values
-                        #         new_tensor = torch.empty_like(expert, dtype=torch.bfloat16)
-                        #         with torch.no_grad():
-                        #             new_tensor.copy_(expert)
-                        #         converted_experts.append(new_tensor)
-                        
-                        # # Verify all tensors are now the same type
-                        # data_types = set(expert.dtype for expert in converted_experts)
-                        # logger.info(f"After conversion, expert tensor types: {data_types}")
-                        
-                        # # Create a 3D tensor with all experts, and transpose to match torchtitan shape
-                        # try:
-                        #     logger.info("Attempting to stack converted tensors")
-                        #     stacked_tensor = torch.stack(converted_experts, dim=0).transpose(1, 2)
-                        #     logger.info(f"Successfully stacked tensors with shape {stacked_tensor.shape} and dtype {stacked_tensor.dtype}")
-                        # except RuntimeError as e:
-                        #     # If we still have issues, create a new tensor and copy data manually
-                        #     logger.error(f"Error stacking tensors: {e}")
-                        #     logger.info("Using manual tensor creation and copying")
-                            
-                        #     # Get shapes from the first tensor
-                        #     expert_shape = converted_experts[0].shape
-                        #     num_experts = len(converted_experts)
-                            
-                        #     # Create a new empty tensor with the right shape and dtype
-                        #     stacked_tensor = torch.empty(
-                        #         (num_experts, expert_shape[1], expert_shape[0]),  # Already transposed
-                        #         dtype=torch.bfloat16,
-                        #         device="cuda"
-                        #     )
-                            
-                        #     # Copy each expert tensor manually
-                        #     for i, expert in enumerate(converted_experts):
-                        #         # Transpose each expert and copy
-                        #         stacked_tensor[i] = expert.t().to(torch.bfloat16)
-                            
-                        #     logger.info(f"Manual stacking successful with shape {stacked_tensor.shape}")
                         
                         # Copy to the state_dict
                         shape, offset = compute_local_shape_and_global_offset(
