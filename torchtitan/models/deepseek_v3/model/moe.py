@@ -47,9 +47,9 @@ class FeedForward(nn.Module):
             max_val = tensor.max().item()
             print(f"{name} - Shape: {tensor.shape} Mean: {mean:.6f}, Min: {min_val:.6f}, Max: {max_val:.6f}, Std: {std:.6f}, ")
         print_tensor_stats("MLP input: ", x)
-        t1 = self.w3(x)
+        t1 = self.w1(x)
         print_tensor_stats("after w3: ", t1)
-        t = self.w1(x)
+        t = self.w3(x)
         print_tensor_stats("after w1 ", t)
         t = F.silu(t)
         print_tensor_stats("after silu ", t)
@@ -57,6 +57,8 @@ class FeedForward(nn.Module):
         print_tensor_stats("after mul", t)
         t = self.w2(t)
         print_tensor_stats("after w2", t)
+        # down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        # self.w2(F.silu(self.w1(x)) * self.w3(x))
         return t
 
     def init_weights(self, init_std: float = 0.02):

@@ -106,12 +106,14 @@ def convert_to_titan_fqns(fqn: str) -> list[str]:
         return [f"layers.{layer}.moe.shared_expert.w1"]
 
     # Dense Layer
+    # down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    # self.w2(F.silu(self.w1(x)) * self.w3(x))
     elif f"mlp.gate_proj.weight" in fqn:
-        return [f"layers.{layer}.feed_forward.w3.weight"]
+        return [f"layers.{layer}.feed_forward.w1.weight"]
     elif f"mlp.down_proj.weight" in fqn:
         return [f"layers.{layer}.feed_forward.w2.weight"]
     elif f"mlp.up_proj.weight" in fqn:
-        return [f"layers.{layer}.feed_forward.w1.weight"]
+        return [f"layers.{layer}.feed_forward.w3.weight"]
     
     # Transformer layer
     elif "input_layernorm.weight" in fqn:

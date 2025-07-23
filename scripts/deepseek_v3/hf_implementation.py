@@ -170,20 +170,8 @@ def run_huggingface_implementation(args, _):
     start_time = time.time()
     
     
-    # dense layer
-    layer_0_mlp_weights = model.model.layers[0].self_attn.q_a_proj.weight
-    
-    # Layer 0 MLP weights: torch.Size([1536, 7168]) dtype torch.float8_e4m3fn
-    print(f"Layer 0 MLP weights: {layer_0_mlp_weights.shape} dtype {layer_0_mlp_weights.dtype}")
-    
-    # Check if weight_scale attribute exists (common in FP8 implementations)
-    if hasattr(model.model.layers[0].self_attn.q_a_proj, "weight_scale"):
-        weight_scale = model.model.layers[0].self_attn.q_a_proj.weight_scale
-        print(f"Weight scale shape: {weight_scale.shape}, dtype: {weight_scale.dtype}")
-        
-    # Print some weight values
-    for i in range(0, 10):
-        print(f"Layer 0 MLP weights[0][{i}]: {layer_0_mlp_weights[0][i]}")
+    # # dense layer
+    # layer_0_mlp_weights = model.model.layers[0].self_attn.q_a_proj.weight
 
     with torch.no_grad():
         # Forward pass through the model with output_hidden_states=True and output_attentions=True
