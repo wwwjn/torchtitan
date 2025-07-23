@@ -46,7 +46,7 @@ def main():
     parser.add_argument("--device", type=str, 
                         default="cuda" if torch.cuda.is_available() else "cpu",
                         help="Device to use (cuda or cpu)")
-    parser.add_argument("--num_layers", type=int, default=2,  # tailered to 5 layers for 671B model
+    parser.add_argument("--num_layers", type=int, default=5,  # tailered to 5 layers for 671B model
                         help="Number of layers to use (0 for all layers)")
     parser.add_argument("--tokenizer_path", type=str, default="/data/users/jianiw/torchtitan/assets/tokenizer/DeepSeek-V3",)
     

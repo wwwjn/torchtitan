@@ -17,6 +17,13 @@ from .args import DeepSeekV3ModelArgs
 from .moe import FeedForward, MoE
 
 
+def print_tensor_stats(name, tensor):
+    mean = tensor.mean().item()
+    std = tensor.std().item()
+    min_val = tensor.min().item()
+    max_val = tensor.max().item()
+    print(f"{name} - Shape: {tensor.shape} Mean: {mean:.6f}, Min: {min_val:.6f}, Max: {max_val:.6f}, Std: {std:.6f}, ")
+
 # Adapted from https://github.com/DeepSeek-ai/DeepSeek-V3/blob/main/inference/model.py#L294
 def precompute_freqs_cis(args: DeepSeekV3ModelArgs) -> torch.Tensor:
     """
@@ -281,13 +288,6 @@ class Attention(nn.Module):
         # for i in range(0, 10):
         #     print("self.wkv_a.weight: ", self.wq_a.weight[0][i])
 
-        def print_tensor_stats(name, tensor):
-            mean = tensor.mean().item()
-            std = tensor.std().item()
-            min_val = tensor.min().item()
-            max_val = tensor.max().item()
-            print(f"{name} - Shape: {tensor.shape} Mean: {mean:.6f}, Min: {min_val:.6f}, Max: {max_val:.6f}, Std: {std:.6f}, ")
-
         bsz, seqlen, _ = x.size()
 
         print_tensor_stats("input: ", x)
@@ -535,22 +535,30 @@ class DeepSeekV3Model(nn.Module, ModelProtocol):
         self._hidden_states = []
         
         # Get embeddings
-        h = self.tok_embeddings(tokens)
+        input_embeds = self.tok_embeddings(tokens)
         # Store and print statistics for input embeddings
-        self._hidden_states.append(h.detach())
+        self._hidden_states.append(input_embeds.detach())
+
+        print_tensor_stats("input_embeds: ", input_embeds)
+        h = input_embeds
     
         # Process through layers
         for i, layer in enumerate(self.layers.values()):
+            # NOTE(jianiw): Reset the hidden states to be input embeddings for the each layer to avoid numerical difference accumualation
+            # h = input_embeds
             h = layer(h, self.freqs_cis)
             
+            print_tensor_stats(f"layer {i} output: ", h)
             # Store and print statistics for this layer
             self._hidden_states.append(h.detach())
             
         # Apply final normalization
         h = self.norm(h)
         
+        print_tensor_stats("After norm: ", h)
         # Generate output logits
         output = self.output(h)
+        print_tensor_stats("output: ", output)
         
         return output
     

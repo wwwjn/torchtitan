@@ -525,7 +525,6 @@ class CheckpointConverter:
         # Process and dequantize weights
         result_dict = {}
         for base_name, tensors in weight_groups.items():
-            logger.info(f"Processing {base_name} with {len(tensors)} tensors")
             # Check if this is a quantized weight that needs dequantization
             weight_key = f"{base_name}.weight" if f"{base_name}.weight" in tensors else base_name
             scale_inv_key = f"{base_name}.weight_scale_inv"
@@ -534,9 +533,7 @@ class CheckpointConverter:
                 # This is a quantized weight that needs dequantization
                 weight = tensors[weight_key]
                 scale_inv = tensors[scale_inv_key]
-
-                logger.info(f"Dequantizing {weight_key} with shape {weight.shape}, using scale_inv with shape {scale_inv.shape}, first elements: {scale_inv.flatten()[:5].tolist()}")
-                
+                                
                 # Convert Float8 to Float32 first, then to BFloat16
                 # This avoids the direct promotion error between Float8 and BFloat16
                 dequantized_weight = self._dequantize_weight(weight, scale_inv)
