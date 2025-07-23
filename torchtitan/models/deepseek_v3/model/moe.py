@@ -12,6 +12,14 @@ from torchtitan.experiments.llama4.infra.expert_parallel import expert_parallel
 from .args import DeepSeekV3ModelArgs
 
 
+
+def print_tensor_stats(name, tensor):
+    mean = tensor.mean().item()
+    std = tensor.std().item()
+    min_val = tensor.min().item()
+    max_val = tensor.max().item()
+    print(f"{name} - Shape: {tensor.shape} Mean: {mean:.6f}, Min: {min_val:.6f}, Max: {max_val:.6f}, Std: {std:.6f}, ")
+
 class FeedForward(nn.Module):
     """
     FeedForward module
@@ -40,12 +48,7 @@ class FeedForward(nn.Module):
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        def print_tensor_stats(name, tensor):
-            mean = tensor.mean().item()
-            std = tensor.std().item()
-            min_val = tensor.min().item()
-            max_val = tensor.max().item()
-            print(f"{name} - Shape: {tensor.shape} Mean: {mean:.6f}, Min: {min_val:.6f}, Max: {max_val:.6f}, Std: {std:.6f}, ")
+
         print_tensor_stats("MLP input: ", x)
         t1 = self.w3(x)
         print_tensor_stats("after w3: ", t1)
@@ -238,7 +241,8 @@ class TokenChoiceTopKRouter(nn.Module):
             top_scores, selected_experts_indices = torch.topk(
                 scores, k=self.top_k, dim=1
             )
-        
+
+        print("Selected experts: ", selected_experts_indices[:10])        
         if self.use_sigmoid:
             denominator = top_scores.sum(dim=-1, keepdim=True) + 1e-20
             top_scores = top_scores / denominator
@@ -333,6 +337,8 @@ class MoE(nn.Module):
         """
         bs, slen, dim = x.shape
 
+        print_tensor_stats("input of MoE: ", x)
+
         # print("Checking GroupedExpert weights: ", self.experts.w1)
 
         # top_scores and selected_indices shape (bs*slen*top_k,)
@@ -342,6 +348,9 @@ class MoE(nn.Module):
             token_indices,
             num_tokens_per_expert,
         ) = self.router(x.reshape(bs * slen, dim), self.expert_bias)
+
+        print_tensor_stats("top_score: ", top_scores)
+        print("First 10 elements in token_indices:", token_indices[:10])
 
         # tokens_per_expert will be used to update the expert bias for load balancing.
         # Prevent extra local tokens accumulation on evaluation or activation recomputation.
@@ -360,10 +369,13 @@ class MoE(nn.Module):
 
         # shape (bs*slen*top_k, dim)
         routed_output = self.experts(routed_input, num_tokens_per_expert)
+        
 
         routed_output = (routed_output.to(torch.float32) * top_scores.unsqueeze(-1)).to(
             x.dtype
         )
+
+        print_tensor_stats("routed output: ", routed_output)
 
         # shared expert
         if self.shared_expert is not None:
@@ -373,9 +385,12 @@ class MoE(nn.Module):
         else:
             out = torch.zeros_like(x.reshape(bs * slen, dim))
 
+        print_tensor_stats("output of shard expert: ", out)
+
         # Accumulate multiple expert results becase each token can be routed to multiple experts
         out = out.scatter_add(dim=0, index=token_indices, src=routed_output)
         out = out.reshape(bs, slen, dim)
+        print_tensor_stats("output of MoE: ", out)
         return out
 
     def init_weights(

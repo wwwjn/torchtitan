@@ -11,7 +11,7 @@ set -ex
 # use envs as local overrides for convenience
 # e.g.
 # LOG_RANK=0,1 NGPU=4 ./convert_hf_to_dcp_with_gpus.sh
-NGPU=${NGPU:-"8"}
+NGPU=${NGPU:-"4"}
 LOG_RANK=${LOG_RANK:-0,1,2,3,4,5,6,7}
 CONFIG_FILE=${CONFIG_FILE:-"../train_configs/llama4_17bx16e.toml"}
 
@@ -23,4 +23,4 @@ fi
 PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \
 torchrun --nproc_per_node=${NGPU} --rdzv_backend c10d --rdzv_endpoint="localhost:0" \
 --local-ranks-filter ${LOG_RANK} --role rank --tee 3 \
-./scripts/deepseek_v3/convert_hf_to_dcp_with_gpus.py --job.config_file ${CONFIG_FILE} $overrides
+-m scripts.deepseek_v3.convert_hf_to_dcp_with_gpus --job.config_file ${CONFIG_FILE} $overrides
