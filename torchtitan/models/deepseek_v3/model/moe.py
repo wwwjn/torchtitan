@@ -40,7 +40,24 @@ class FeedForward(nn.Module):
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        def print_tensor_stats(name, tensor):
+            mean = tensor.mean().item()
+            std = tensor.std().item()
+            min_val = tensor.min().item()
+            max_val = tensor.max().item()
+            print(f"{name} - Shape: {tensor.shape} Mean: {mean:.6f}, Min: {min_val:.6f}, Max: {max_val:.6f}, Std: {std:.6f}, ")
+        print_tensor_stats("MLP input: ", x)
+        t1 = self.w3(x)
+        print_tensor_stats("after w3: ", t1)
+        t = self.w1(x)
+        print_tensor_stats("after w1 ", t)
+        t = F.silu(t)
+        print_tensor_stats("after silu ", t)
+        t = t * t1
+        print_tensor_stats("after mul", t)
+        t = self.w2(t)
+        print_tensor_stats("after w2", t)
+        return t
 
     def init_weights(self, init_std: float = 0.02):
         nn.init.trunc_normal_(self.w1.weight, mean=0.0, std=0.02)

@@ -322,7 +322,6 @@ class Attention(nn.Module):
         #     k_pe.unsqueeze(2), freqs_cis
         # )  # (bsz, seqlen, 1, qk_rope_head_dim)
 
-        q = torch.cat([q_nope, q_pe], dim=-1)  # (bsz, seqlen, n_heads, qk_head_dim)
 
         kv = self.kv_norm(kv)
         print_tensor_stats("After kv_norm: ", kv)
@@ -336,7 +335,7 @@ class Attention(nn.Module):
         
         # NOTE(jianiw): Test using HF rotary embedding implementation
         from .deepseek_rotary_emb import apply_rotary_pos_emb
-        kv_seq_len = v.shape[-2]
+        kv_seq_len = v.shape[-3]
         cos, sin = self.rotary_emb(v, seq_len=kv_seq_len)
         device = x.device
         position_ids = torch.arange(
@@ -347,8 +346,11 @@ class Attention(nn.Module):
         )
         position_ids = position_ids.unsqueeze(0)
         k_pe = k_pe.view(bsz, seqlen, 1, self.qk_rope_head_dim).transpose(1, 2)
-        q_pe = q_pe.transpose(1, 2)
-        print(f"Before applying rotary emb, the shape is: k_pe {k_pe.shape} q_pe: {q_pe.shape}")
+        q_pe = q_pe.transpose(1, 2)  # k_pe torch.Size([1, 1, 2048, 64]) q_pe: torch.Size([1, 128, 2048, 64])
+        # HF: before apply rotary post emb: q_pe torch.Size([1, 128, 2048, 64]), k_pe torch.Size([1, 1, 2048, 64]), cos torch.Size([2048, 64]), sin torch.Size([2048, 64]), position_ids torch.Size([1, 2048])
+        # titan: Before applying rotary emb, the shape is: k_pe torch.Size([1, 1, 2048, 64]) q_pe: torch.Size([1, 128, 2048, 64]), cos torch.Size([128, 64]), sin torch.Size([128, 64]), position_ids torch.Size([1, 128])
+
+        print(f"Before applying rotary emb, the shape is: k_pe {k_pe.shape} q_pe: {q_pe.shape}, cos {cos.shape}, sin {sin.shape}, position_ids {position_ids.shape}")
 
         q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
         q_pe, k_pe = q_pe.transpose(1, 2), k_pe.transpose(1, 2)
@@ -359,6 +361,7 @@ class Attention(nn.Module):
         k = torch.cat(
             [k_nope, k_pe.expand(-1, -1, self.n_heads, -1)], dim=-1
         )  # (bsz, seqlen, n_heads, qk_head_dim)  
+        q = torch.cat([q_nope, q_pe], dim=-1)  # (bsz, seqlen, n_heads, qk_head_dim)
 
         print_tensor_stats("k: ", k)
         print_tensor_stats("v: ", v)
