@@ -140,7 +140,6 @@ def convert_to_titan_fqns(fqn: str) -> list[str]:
 
 def convert_to_hf_shape(fqn: str, titan_fqns: list[str], dtensor: DTensor) -> torch.Size:
     if "shared_expert" in fqn:
-        # TODO(jianiw): check this
         s = dtensor.shape
         # TODO: this is not right but I have to do this to load the checkpoint.
         return torch.Size((s[2], s[1]))
@@ -438,24 +437,8 @@ class CheckpointConverter:
                 
                 # If block is not aligned to 128x128, we need to pad it
                 # (This simulates what would have happened during quantization)
-                actual_rows = row_end - row_start
-                actual_cols = col_end - col_start
-                
-                if actual_rows < BLOCK_SIZE or actual_cols < BLOCK_SIZE:
-                    # Create padded block
-                    padded_block = torch.zeros(BLOCK_SIZE, BLOCK_SIZE, dtype=torch.float32, device="cuda")
-                    padded_block[:actual_rows, :actual_cols] = block
-                    
-                    # Apply scale to padded block
-                    scale = scale_inv[i, j]
-                    padded_block = padded_block * scale
-                    
-                    # Extract only the needed portion back
-                    block = padded_block[:actual_rows, :actual_cols]
-                else:
-                    # Block is already 128x128, apply scale directly
-                    scale = scale_inv[i, j]
-                    block = block * scale
+                scale = scale_inv[i, j]
+                block = block * scale
                 
                 # Explicitly convert block to bfloat16 before assignment
                 block_bf16 = block.to(torch.bfloat16)
@@ -550,13 +533,12 @@ class CheckpointConverter:
                 weight = tensors[weight_key]
                 scale_inv = tensors[scale_inv_key]
 
-                logger.info(f"Dequantizing {weight_key} with shape {weight.shape}, using scale_inv with shape {scale_inv.shape}")
+                logger.info(f"Dequantizing {weight_key} with shape {weight.shape}, using scale_inv with shape {scale_inv.shape}, first elements: {scale_inv.flatten()[:5].tolist()}")
                 
                 # Convert Float8 to Float32 first, then to BFloat16
                 # This avoids the direct promotion error between Float8 and BFloat16
                 dequantized_weight = self._dequantize_weight(weight, scale_inv)
                 # dequantized_weight = weight.to(torch.float32).to(torch.bfloat16)
-                logger.info(f"Dequantized {weight_key} from {weight.dtype} to {dequantized_weight.dtype}")
 
                 result_dict[weight_key] = dequantized_weight
             else:

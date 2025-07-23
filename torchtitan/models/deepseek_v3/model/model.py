@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
+from re import S
 from typing import Tuple
 
 import torch
@@ -133,6 +134,41 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     y = torch.view_as_real(x * freqs_cis).flatten(3)
     return y.to(dtype)
 
+def apply_rotary_emb_with_permute(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply rotary embeddings to input tensors using the given frequency tensor.
+
+    This function applies rotary embeddings to the given query 'xq' and key 'xk' tensors using the provided
+    frequency tensor 'freqs_cis'. The input tensors are reshaped as complex numbers, and the frequency tensor
+    is reshaped for broadcasting compatibility. The resulting tensors contain rotary embeddings and are
+    returned as real tensors.
+
+    Args:
+        xq (torch.Tensor): Query tensor to apply rotary embeddings.
+        xk (torch.Tensor): Key tensor to apply rotary embeddings.
+        freqs_cis (torch.Tensor): Precomputed frequency tensor for complex exponentials.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
+    """
+    # first half is real, second half is imaginary
+    from torchtitan.models.llama3.model.model import reshape_for_broadcast
+    xq_ = torch.complex(xq[..., :xq.shape[-1] // 2].float(), xq[..., xq.shape[-1] // 2:].float())
+    xk_ = torch.complex(xk[..., :xk.shape[-1] // 2].float(), xk[..., xk.shape[-1] // 2:].float())
+    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    
+    # added this
+    xq_out = torch.cat([xq_out[..., ::2], xq_out[..., 1::2]], dim=-1)
+    xk_out = torch.cat([xk_out[..., ::2], xk_out[..., 1::2]], dim=-1)
+    
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
 
 class Attention(nn.Module):
     """
@@ -170,11 +206,62 @@ class Attention(nn.Module):
         self.wo = nn.Linear(self.n_heads * self.v_head_dim, self.dim, bias=False)
         self.softmax_scale = self.qk_head_dim**-0.5
 
+        self._init_rope()
+        
         if model_args.max_seq_len > model_args.original_seq_len:
             mscale = 0.1 * model_args.mscale * math.log(model_args.rope_factor) + 1.0
             self.softmax_scale = self.softmax_scale * mscale * mscale
 
         self.sdpa = build_attention(model_args.use_flex_attn, model_args.attn_mask_type)
+
+    
+    def _init_rope(self):
+        from .deepseek_rotary_emb import DeepseekV3RotaryEmbedding, DeepseekV3YarnRotaryEmbedding
+        config = {
+            "rope_scaling": {
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "factor": 40,
+                "mscale": 1.0,
+                "mscale_all_dim": 1.0,
+                "original_max_position_embeddings": 4096,
+                "type": "yarn",
+            },
+            "max_position_embeddings": 163840,
+            "rope_theta": 10000,
+        }
+        if config["rope_scaling"] is None:
+            self.rotary_emb = DeepseekV3RotaryEmbedding(
+                self.qk_rope_head_dim,
+                max_position_embeddings=config["max_position_embeddings"],
+                base=config["rope_theta"],
+            )
+        else:
+            scaling_type = config["rope_scaling"]["type"]
+            scaling_factor = config["rope_scaling"]["factor"]
+            scaling_type = "yarn"
+
+            if scaling_type == "yarn":
+                kwargs = {
+                    key: config["rope_scaling"][key]
+                    for key in [
+                        "original_max_position_embeddings",
+                        "beta_fast",
+                        "beta_slow",
+                        "mscale",
+                        "mscale_all_dim",
+                    ]
+                    if key in config["rope_scaling"]
+                }
+                self.rotary_emb = DeepseekV3YarnRotaryEmbedding(
+                    self.qk_rope_head_dim,
+                    max_position_embeddings=config["max_position_embeddings"],
+                    scaling_factor=scaling_factor,
+                    base=config["rope_theta"],
+                    **kwargs,
+                )
+            else:
+                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
 
     def forward(
         self,
@@ -193,15 +280,28 @@ class Attention(nn.Module):
         """
         # for i in range(0, 10):
         #     print("self.wkv_a.weight: ", self.wq_a.weight[0][i])
-        
+
+        def print_tensor_stats(name, tensor):
+            mean = tensor.mean().item()
+            std = tensor.std().item()
+            min_val = tensor.min().item()
+            max_val = tensor.max().item()
+            print(f"{name} - Shape: {tensor.shape} Mean: {mean:.6f}, Min: {min_val:.6f}, Max: {max_val:.6f}, Std: {std:.6f}, ")
+
         bsz, seqlen, _ = x.size()
+
+        print_tensor_stats("input: ", x)
 
         # Query projection
         if self.q_lora_rank == 0:
             q = self.wq(x)  # (bsz, seqlen, n_heads * qk_head_dim)
         else:
             q = self.wq_a(x)
-            q = self.wq_b(self.q_norm(q))
+            print_tensor_stats("After wq_a: ", q)
+            q = self.q_norm(q)
+            print_tensor_stats("After q_norm: ", q)
+            q = self.wq_b(q)
+        print_tensor_stats("After wq_b: ", q)
         # Use -1 instead of `n_heads` (or `n_kv_heads`) to infer the actual
         # local heads from sizes of q and kv as TP may have sharded them after
         # the above linear ops.
@@ -209,25 +309,60 @@ class Attention(nn.Module):
         q_nope, q_pe = torch.split(
             q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
-        q_pe = apply_rotary_emb(q_pe, freqs_cis)
-        q = torch.cat([q_nope, q_pe], dim=-1)  # (bsz, seqlen, n_heads, qk_head_dim)
-
+        
+        
         # Key-value projection
         kv = self.wkv_a(x)  # (bsz, seqlen, kv_lora_rank + qk_rope_head_dim)
+        print_tensor_stats("After wkv_a: ", kv)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
 
-        k_pe = apply_rotary_emb(
-            k_pe.unsqueeze(2), freqs_cis
-        )  # (bsz, seqlen, 1, qk_rope_head_dim)
+        # TODO(jiani): switch to HF rotary embedding implementation
+        # q_pe = apply_rotary_emb(q_pe, freqs_cis)
+        # k_pe = apply_rotary_emb(
+        #     k_pe.unsqueeze(2), freqs_cis
+        # )  # (bsz, seqlen, 1, qk_rope_head_dim)
 
+        q = torch.cat([q_nope, q_pe], dim=-1)  # (bsz, seqlen, n_heads, qk_head_dim)
+
+        kv = self.kv_norm(kv)
+        print_tensor_stats("After kv_norm: ", kv)
         kv = self.wkv_b(
-            self.kv_norm(kv)
+            kv
         )  # (bsz, seqlen, n_heads * (qk_nope_head_dim + v_head_dim))
+        print_tensor_stats("After wkv_b: ", kv)
         kv = kv.view(bsz, seqlen, -1, self.qk_nope_head_dim + self.v_head_dim)
         k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        
+        
+        # NOTE(jianiw): Test using HF rotary embedding implementation
+        from .deepseek_rotary_emb import apply_rotary_pos_emb
+        kv_seq_len = v.shape[-2]
+        cos, sin = self.rotary_emb(v, seq_len=kv_seq_len)
+        device = x.device
+        position_ids = torch.arange(
+            0,
+            kv_seq_len,  # TODO: Check this is correct
+            dtype=torch.long,
+            device=device,
+        )
+        position_ids = position_ids.unsqueeze(0)
+        k_pe = k_pe.view(bsz, seqlen, 1, self.qk_rope_head_dim).transpose(1, 2)
+        q_pe = q_pe.transpose(1, 2)
+        print(f"Before applying rotary emb, the shape is: k_pe {k_pe.shape} q_pe: {q_pe.shape}")
+
+        q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
+        q_pe, k_pe = q_pe.transpose(1, 2), k_pe.transpose(1, 2)
+        
+        print_tensor_stats("After k_pe apply_rotary_emb: ", k_pe)
+        print_tensor_stats("After q_pe apply_rotary_emb: ", q_pe)
+        
         k = torch.cat(
             [k_nope, k_pe.expand(-1, -1, self.n_heads, -1)], dim=-1
-        )  # (bsz, seqlen, n_heads, qk_head_dim)
+        )  # (bsz, seqlen, n_heads, qk_head_dim)  
+
+        print_tensor_stats("k: ", k)
+        print_tensor_stats("v: ", v)
+        print_tensor_stats("q: ", q)
 
         q = q.transpose(1, 2)  # (bsz, n_heads, seqlen, qk_head_dim)
         k = k.transpose(1, 2)  # (bsz, n_heads, seqlen, qk_head_dim)
@@ -238,10 +373,14 @@ class Attention(nn.Module):
         # https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py#L17
         output = self.sdpa(q, k, v, scale=self.softmax_scale)
 
+
         # Reshape and project output
         output = output.transpose(1, 2)  # (bsz, seqlen, n_heads, v_head_dim)
+        print_tensor_stats("After attention: ", output)
         output = output.view(bsz, seqlen, -1)  # (bsz, seqlen, n_heads * v_head_dim)
-        return self.wo(output)  # (bsz, seqlen, dim)
+        output = self.wo(output)  # (bsz, seqlen, dim)
+        print_tensor_stats("output after wo: ", output)
+        return output
 
     def init_weights(self, init_std: float):
         linear_list = [
@@ -300,23 +439,24 @@ class TransformerBlock(nn.Module):
             std = tensor.std().item()
             min_val = tensor.min().item()
             max_val = tensor.max().item()
-            print(f"{name} - Mean: {mean:.6f}, Std: {std:.6f}, Min: {min_val:.6f}, Max: {max_val:.6f}")
+            print(f"{name} - Shape: {tensor.shape} Mean: {mean:.6f}, Min: {min_val:.6f}, Max: {max_val:.6f}, Std: {std:.6f}, ")
 
         # Print statistics before and after each normalization
-        # print_tensor_stats("Before attention_norm", x)
+        print_tensor_stats("input: ", x)
         attn_norm_out = self.attention_norm(x)
-        # print_tensor_stats("After attention_norm", attn_norm_out)
+        print_tensor_stats("After attention_norm", attn_norm_out)
 
         x = x + self.attention(attn_norm_out, freqs_cis)
 
-        # print_tensor_stats("Before ffn_norm", x)
+        print_tensor_stats("after attention", x)
         ffn_norm_out = self.ffn_norm(x)
-        # print_tensor_stats("After ffn_norm", ffn_norm_out)
+        print_tensor_stats("After norm", ffn_norm_out)
 
         if self.moe_enabled:
             x = x + self.moe(ffn_norm_out)
         else:
             x = x + self.feed_forward(ffn_norm_out)
+        print_tensor_stats("After feed_forward", x)
         return x
 
     def init_weights(self, buffer_device: torch.device):
@@ -393,34 +533,16 @@ class DeepSeekV3Model(nn.Module, ModelProtocol):
         
         # Get embeddings
         h = self.tok_embeddings(tokens)
-        emb_mean = self.tok_embeddings.weight.mean().item()
-        emb_std = self.tok_embeddings.weight.std().item()
-        emb_min = self.tok_embeddings.weight.min().item()
-        emb_max = self.tok_embeddings.weight.max().item()
-        print(f"Token Embedding weights - Mean: {emb_mean:.6f}, Std: {emb_std:.6f}, Min: {emb_min:.6f}, Max: {emb_max:.6f}")
-        
-        print("h type after embedding: ", h.dtype, h.shape, type(h))
-        
         # Store and print statistics for input embeddings
         self._hidden_states.append(h.detach())
-        emb_mean = h.mean().item()
-        emb_std = h.std().item()
-        emb_min = h.min().item()
-        emb_max = h.max().item()
-        print(f"Input Embeddings - Mean: {emb_mean:.6f}, Std: {emb_std:.6f}, Min: {emb_min:.6f}, Max: {emb_max:.6f}")
-        
+    
         # Process through layers
         for i, layer in enumerate(self.layers.values()):
             h = layer(h, self.freqs_cis)
             
             # Store and print statistics for this layer
             self._hidden_states.append(h.detach())
-            layer_mean = h.mean().item()
-            layer_std = h.std().item()
-            layer_min = h.min().item()
-            layer_max = h.max().item()
-            print(f"Layer {i} - Mean: {layer_mean:.6f}, Std: {layer_std:.6f}, Min: {layer_min:.6f}, Max: {layer_max:.6f}")
-        
+            
         # Apply final normalization
         h = self.norm(h)
         

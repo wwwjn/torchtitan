@@ -51,8 +51,8 @@ def main():
     parser.add_argument("--tokenizer_path", type=str, default="/data/users/jianiw/torchtitan/assets/tokenizer/DeepSeek-V3",)
     
     # Hugging Face specific arguments
-    parser.add_argument("--model_name", type=str, 
-                        default="deepseek-ai/DeepSeek-V3-0324",
+    parser.add_argument("--model_path", type=str, 
+                        default="/data/users/jianiw/dsv3-weights",
                         help="Hugging Face model name or path")
     parser.add_argument("--load_in_8bit", action="store_true", 
                         help="Load model in 8-bit quantization (HF only)")
@@ -78,7 +78,7 @@ def main():
     from transformers import AutoTokenizer
     
     start_time = time.time()
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     print(f"Tokenizer loaded in {time.time() - start_time:.2f} seconds")
     
     # Run the selected implementation(s)

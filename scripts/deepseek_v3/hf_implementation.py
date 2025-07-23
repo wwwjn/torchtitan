@@ -116,11 +116,11 @@ def run_huggingface_implementation(args, _):
             print(f"Successfully loaded model on CPU and moved to {device}")
         except Exception as e:
             print(f"Error loading model on CPU: {e}")
-            print(f"Falling back to loading model from {args.model_name}...")
+            print(f"Falling back to loading model from {args.model_path}...")
             
             # Last resort: try loading from HF hub with auto device mapping
             model = AutoModelForCausalLM.from_pretrained(
-                args.model_name,
+                args.model_path,
                 torch_dtype=dtype,
                 device_map="auto",
                 config=config,
@@ -186,22 +186,39 @@ def run_huggingface_implementation(args, _):
         print(f"Layer 0 MLP weights[0][{i}]: {layer_0_mlp_weights[0][i]}")
 
     with torch.no_grad():
-        # Forward pass through the model with output_hidden_states=True to get intermediate layer outputs
-        outputs = model(**inputs, output_hidden_states=True)
+        # Forward pass through the model with output_hidden_states=True and output_attentions=True
+        outputs = model(**inputs, output_hidden_states=True, output_attentions=True)
     
     forward_time = time.time() - start_time
     
     # Get the logits from the output
     logits = outputs.logits if hasattr(outputs, "logits") else outputs
+        
+    # Print attention outputs
+    if hasattr(outputs, "attentions"):
+        print("\nAttention Outputs:")
+        attentions = outputs.attentions
+        print(f"Number of attention layers: {len(attentions)}")
+        
+        for i, attn in enumerate(attentions):
+            # Print shape and statistics for each attention layer
+            print(f"Layer {i} attention weights - Shape: {attn.shape}, "
+                  f"Mean: {attn.mean().item():.6f}, "
+                  f"Std: {attn.std().item():.6f}, "
+                  f"Min: {attn.min().item():.6f}, "
+                  f"Max: {attn.max().item():.6f}")
+            
+            # Print a small sample of attention weights from the first head
+            if i == 0:  # Just for the first layer as an example
+                print(f"Sample attention weights (first head, first 5x5):")
+                # Convert to float32 before converting to numpy to avoid BFloat16 error
+                sample = attn[0, 0, :5, :5].to(torch.float32).cpu().numpy()
+                for row in sample:
+                    print(" ".join([f"{val:.4f}" for val in row]))
     
-    # Print average values for each layer's hidden states
+    # Print hidden states information if available
     if hasattr(outputs, "hidden_states"):
-        print("\nLayer-wise Statistics:")
         hidden_states = outputs.hidden_states
-        
-        # The first element is the input embeddings, followed by each layer's output
-        print(f"Number of hidden states: {len(hidden_states)}")
-        
         for i, hidden_state in enumerate(hidden_states):
             # Calculate statistics.
             layer_mean = hidden_state.mean().item()
