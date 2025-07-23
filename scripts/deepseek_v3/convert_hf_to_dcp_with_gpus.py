@@ -101,9 +101,9 @@ def convert_to_titan_fqns(fqn: str) -> list[str]:
     elif "mlp.shared_experts.down_proj.weight" in fqn:
         return [f"layers.{layer}.moe.shared_expert.w2"]
     elif "mlp.shared_experts.gate_proj.weight" in fqn:
-        return [f"layers.{layer}.moe.shared_expert.w3"]
-    elif "mlp.shared_experts.up_proj.weight" in fqn:
         return [f"layers.{layer}.moe.shared_expert.w1"]
+    elif "mlp.shared_experts.up_proj.weight" in fqn:
+        return [f"layers.{layer}.moe.shared_expert.w3"]
 
     # Dense Layer
     # down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
