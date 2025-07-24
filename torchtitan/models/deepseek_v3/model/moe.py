@@ -12,13 +12,15 @@ from torchtitan.experiments.llama4.infra.expert_parallel import expert_parallel
 from .args import DeepSeekV3ModelArgs
 
 
-
 def print_tensor_stats(name, tensor):
     mean = tensor.mean().item()
     std = tensor.std().item()
     min_val = tensor.min().item()
     max_val = tensor.max().item()
-    print(f"{name} - Shape: {tensor.shape} Mean: {mean:.6f}, Min: {min_val:.6f}, Max: {max_val:.6f}, Std: {std:.6f}, ")
+    print(
+        f"{name} - Shape: {tensor.shape} Mean: {mean:.6f}, Min: {min_val:.6f}, Max: {max_val:.6f}, Std: {std:.6f}, First 10 values: {tensor.flatten()[:10].tolist()}"
+    )
+
 
 class FeedForward(nn.Module):
     """
@@ -232,17 +234,17 @@ class TokenChoiceTopKRouter(nn.Module):
         # top scores shape (bs*slen, top_k)
         # NOTE: The expert_bias is only used for routing. The gating value
         #       top_scores is still derived from the original scores.
-        if expert_bias is not None:
-            _, selected_experts_indices = torch.topk(
-                scores + expert_bias, k=self.top_k, dim=1
-            )
-            top_scores = scores.gather(dim=1, index=selected_experts_indices)
-        else:
-            top_scores, selected_experts_indices = torch.topk(
-                scores, k=self.top_k, dim=1
-            )
+        # if expert_bias is not None:
+        #     _, selected_experts_indices = torch.topk(
+        #         scores + expert_bias, k=self.top_k, dim=1
+        #     )
+        #     top_scores = scores.gather(dim=1, index=selected_experts_indices)
+        # else:
+        #     top_scores, selected_experts_indices = torch.topk(scores, k=self.top_k, dim=1)
+        _, selected_experts_indices = torch.topk(scores, k=self.top_k, dim=1)
+        top_scores = scores.gather(dim=1, index=selected_experts_indices)
 
-        print("Selected experts: ", selected_experts_indices[:10])        
+        print("Selected experts: ", selected_experts_indices[:10])
         if self.use_sigmoid:
             denominator = top_scores.sum(dim=-1, keepdim=True) + 1e-20
             top_scores = top_scores / denominator
@@ -369,7 +371,6 @@ class MoE(nn.Module):
 
         # shape (bs*slen*top_k, dim)
         routed_output = self.experts(routed_input, num_tokens_per_expert)
-        
 
         routed_output = (routed_output.to(torch.float32) * top_scores.unsqueeze(-1)).to(
             x.dtype

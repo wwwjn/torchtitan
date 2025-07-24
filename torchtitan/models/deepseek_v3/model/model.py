@@ -23,7 +23,7 @@ def print_tensor_stats(name, tensor):
     min_val = tensor.min().item()
     max_val = tensor.max().item()
     print(
-        f"{name} - Shape: {tensor.shape} Mean: {mean:.6f}, Min: {min_val:.6f}, Max: {max_val:.6f}, Std: {std:.6f}, "
+        f"{name} - Shape: {tensor.shape} Mean: {mean:.6f}, Min: {min_val:.6f}, Max: {max_val:.6f}, Std: {std:.6f}, First 10 values: {tensor.flatten()[:10].tolist()}"
     )
 
 
@@ -389,9 +389,11 @@ class Attention(nn.Module):
         output = self.sdpa(q, k, v, scale=self.softmax_scale)
 
         # Reshape and project output
-        output = output.transpose(1, 2)  # (bsz, seqlen, n_heads, v_head_dim)
+        output = output.transpose(
+            1, 2
+        ).contiguous()  # (bsz, seqlen, n_heads, v_head_dim)
         print_tensor_stats("After attention: ", output)
-        output = output.view(bsz, seqlen, -1)  # (bsz, seqlen, n_heads * v_head_dim)
+        output = output.reshape(bsz, seqlen, -1)  # (bsz, seqlen, n_heads * v_head_dim)
         output = self.wo(output)  # (bsz, seqlen, dim)
         print_tensor_stats("output after wo: ", output)
         return output
@@ -448,16 +450,6 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output tensor with the same shape as the input.
         """
 
-        # Create a helper function to print tensor statistics
-        def print_tensor_stats(name, tensor):
-            mean = tensor.mean().item()
-            std = tensor.std().item()
-            min_val = tensor.min().item()
-            max_val = tensor.max().item()
-            print(
-                f"{name} - Shape: {tensor.shape} Mean: {mean:.6f}, Min: {min_val:.6f}, Max: {max_val:.6f}, Std: {std:.6f}, "
-            )
-
         # Print statistics before and after each normalization
         print_tensor_stats("input: ", x)
         attn_norm_out = self.attention_norm(x)
@@ -470,9 +462,9 @@ class TransformerBlock(nn.Module):
         print_tensor_stats("After ffn norm", ffn_norm_out)
 
         if self.moe_enabled:
-            x = x + self.moe(ffn_norm_out)
+            x = x + self.moe(x)
         else:
-            x = x + self.feed_forward(ffn_norm_out)
+            x = x + self.feed_forward(x)
         print_tensor_stats("After x+feed_forward", x)
         return x
 

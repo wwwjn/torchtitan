@@ -66,7 +66,7 @@ class DeepSeekV3ModelArgs(BaseModelArgs):
     n_layers: int = 27
     n_dense_layers: int = 1
     n_heads: int = 16
-    norm_eps: float = 1e-5  # eps used for RMSNorm
+    norm_eps: float = 1e-6  # eps used for RMSNorm
     # MoE
     n_routed_experts: int = 64
     n_shared_experts: int = 2
