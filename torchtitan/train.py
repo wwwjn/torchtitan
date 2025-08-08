@@ -477,14 +477,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             # Override input dict with fake data. Every rank will have the same input
             print("\nCreating fake input with the same shape as tokenized input")
             
-            # Set seed for reproducibility
-            torch.manual_seed(42)
-            
             # Define sequence length for fake input
             seq_length = self.job_config.training.seq_len
+            seq_length = 2048
             
             with torch.no_grad():
             # Create fake input_ids directly on the device - using random integers between 0 and 50000 (typical vocab size)
+                torch.manual_seed(42)
                 input_ids = torch.randint(0, 50000, (1, seq_length), dtype=torch.long, device=self.device)
                 
                 # Create fake attention_mask directly on the device - all 1s for full attention

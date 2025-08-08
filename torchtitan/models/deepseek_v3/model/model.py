@@ -455,22 +455,57 @@ class TransformerBlock(nn.Module):
         """
 
         # Print statistics before and after each normalization
+
+        # residual = hidden_states
+
+        # print_tensor_stats("hidden_states before input_layernorm", hidden_states)
+
+        # hidden_states = self.input_layernorm(hidden_states)
+
+        # print_tensor_stats("hidden_states after input_layernorm", hidden_states)
+
+        # # Self Attention
+        # hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        #     hidden_states=hidden_states,
+        #     attention_mask=attention_mask,
+        #     position_ids=position_ids,
+        #     past_key_value=past_key_value,
+        #     output_attentions=output_attentions,
+        #     use_cache=use_cache,
+        #     **kwargs,
+        # )
+        # hidden_states = residual + hidden_states
+
+        # print_tensor_stats("hidden_states after self attention", hidden_states)
+
+        # # Fully Connected
+        # residual = hidden_states
+        # hidden_states = self.post_attention_layernorm(hidden_states)
+
+        # print_tensor_stats(
+        #     "hidden_states after post attention layernorm", hidden_states
+        # )
+        # hidden_states = self.mlp(hidden_states)
+        # hidden_states = residual + hidden_states
+
+        # print_tensor_stats("hidden_states after mlp", hidden_states)
+        ## Our implementation of DeepSeek-V3
         print_tensor_stats("input: ", x)
         attn_norm_out = self.attention_norm(x)
         print_tensor_stats("After attention_norm", attn_norm_out)
 
-        x = x + self.attention(attn_norm_out, freqs_cis)
+        h = x + self.attention(attn_norm_out, freqs_cis)
 
-        print_tensor_stats("after x+attention", x)
-        ffn_norm_out = self.ffn_norm(x)
-        print_tensor_stats("After ffn norm", ffn_norm_out)
+        print_tensor_stats("after x+attention", h)
+        ffn_output = self.ffn_norm(h)
+        print_tensor_stats("After ffn norm", ffn_output)
 
         if self.moe_enabled:
-            x = x + self.moe(x)
+            out = h + self.moe(ffn_output)
         else:
-            x = x + self.feed_forward(x)
-        print_tensor_stats("After x+feed_forward", x)
-        return x
+            out = h + self.feed_forward(ffn_output)
+        print_tensor_stats("After x+feed_forward", out)
+        return out
 
     def init_weights(self, buffer_device: torch.device):
         for norm in (self.attention_norm, self.ffn_norm):
@@ -555,7 +590,7 @@ class DeepSeekV3Model(nn.Module, ModelProtocol):
         # Process through layers
         for i, layer in enumerate(self.layers.values()):
             # NOTE(jianiw): Reset the hidden states to be input embeddings for the each layer to avoid numerical difference accumualation
-            h = input_embeds
+            # h = input_embeds
             h = layer(h, self.freqs_cis)
 
             print_tensor_stats(f"layer {i} output: ", h)
