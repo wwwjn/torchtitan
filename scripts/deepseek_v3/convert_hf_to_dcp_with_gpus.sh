@@ -11,7 +11,7 @@ set -ex
 # use envs as local overrides for convenience
 # e.g.
 # LOG_RANK=0,1 NGPU=4 ./convert_hf_to_dcp_with_gpus.sh
-NGPU=${NGPU:-"4"}
+NGPU=${NGPU:-"8"}
 LOG_RANK=${LOG_RANK:-0,1,2,3,4,5,6,7}
 CONFIG_FILE=${CONFIG_FILE:-"../train_configs/llama4_17bx16e.toml"}
 

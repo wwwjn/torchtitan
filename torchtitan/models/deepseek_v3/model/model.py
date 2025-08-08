@@ -328,10 +328,10 @@ class Attention(nn.Module):
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
 
         # TODO(jiani): switch to HF rotary embedding implementation
-        # q_pe = apply_rotary_emb(q_pe, freqs_cis)
-        # k_pe = apply_rotary_emb(
-        #     k_pe.unsqueeze(2), freqs_cis
-        # )  # (bsz, seqlen, 1, qk_rope_head_dim)
+        q_pe = apply_rotary_emb(q_pe, freqs_cis)
+        k_pe = apply_rotary_emb(
+            k_pe.unsqueeze(2), freqs_cis
+        )  # (bsz, seqlen, 1, qk_rope_head_dim)
 
         kv = self.kv_norm(kv)
         print_tensor_stats("After kv_norm: ", kv)
@@ -340,35 +340,36 @@ class Attention(nn.Module):
         kv = kv.view(bsz, seqlen, -1, self.qk_nope_head_dim + self.v_head_dim)
         k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
-        # NOTE(jianiw): Test using HF rotary embedding implementation
-        from .deepseek_rotary_emb import apply_rotary_pos_emb
+        # # NOTE(jianiw): Test using HF rotary embedding implementation
+        # from .deepseek_rotary_emb import apply_rotary_pos_emb
 
-        kv_seq_len = v.shape[-3]
-        cos, sin = self.rotary_emb(v, seq_len=kv_seq_len)
-        device = x.device
-        position_ids = torch.arange(
-            0,
-            kv_seq_len,  # TODO: Check this is correct
-            dtype=torch.long,
-            device=device,
-        )
-        position_ids = position_ids.unsqueeze(0)
-        k_pe = k_pe.view(bsz, seqlen, 1, self.qk_rope_head_dim).transpose(1, 2)
-        q_pe = q_pe.transpose(
-            1, 2
-        )  # k_pe torch.Size([1, 1, 2048, 64]) q_pe: torch.Size([1, 128, 2048, 64])
+        # kv_seq_len = v.shape[-3]
+        # cos, sin = self.rotary_emb(v, seq_len=kv_seq_len)
+        # device = x.device
+        # position_ids = torch.arange(
+        #     0,
+        #     kv_seq_len,  # TODO: Check this is correct
+        #     dtype=torch.long,
+        #     device=device,
+        # )
+        # position_ids = position_ids.unsqueeze(0)
+        # k_pe = k_pe.view(bsz, seqlen, 1, self.qk_rope_head_dim).transpose(1, 2)
+        # q_pe = q_pe.transpose(
+        #     1, 2
+        # )  # k_pe torch.Size([1, 1, 2048, 64]) q_pe: torch.Size([1, 128, 2048, 64])
         # HF: before apply rotary post emb: q_pe torch.Size([1, 128, 2048, 64]), k_pe torch.Size([1, 1, 2048, 64]), cos torch.Size([2048, 64]), sin torch.Size([2048, 64]), position_ids torch.Size([1, 2048])
         # titan: Before applying rotary emb, the shape is: k_pe torch.Size([1, 1, 2048, 64]) q_pe: torch.Size([1, 128, 2048, 64]), cos torch.Size([128, 64]), sin torch.Size([128, 64]), position_ids torch.Size([1, 128])
 
-        print(
-            f"Before applying rotary emb, the shape is: k_pe {k_pe.shape} q_pe: {q_pe.shape}, cos {cos.shape}, sin {sin.shape}, position_ids {position_ids.shape}"
-        )
+        # print(
+        #     f"Before applying rotary emb, the shape is: k_pe {k_pe.shape} q_pe: {q_pe.shape}, cos {cos.shape}, sin {sin.shape}, position_ids {position_ids.shape}"
+        # )
 
-        q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
-        q_pe, k_pe = q_pe.transpose(1, 2), k_pe.transpose(1, 2)
+        # q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
+        # q_pe, k_pe = q_pe.transpose(1, 2), k_pe.transpose(1, 2)
 
         print_tensor_stats("After k_pe apply_rotary_emb: ", k_pe)
         print_tensor_stats("After q_pe apply_rotary_emb: ", q_pe)
+        
 
         k = torch.cat(
             [k_nope, k_pe.expand(-1, -1, self.n_heads, -1)], dim=-1
@@ -378,10 +379,13 @@ class Attention(nn.Module):
         print_tensor_stats("k: ", k)
         print_tensor_stats("v: ", v)
         print_tensor_stats("q: ", q)
+        qk = torch.matmul(q.transpose(1, 2), k.permute(0, 2, 3, 1))
+        print_tensor_stats("After titan's rotary_emb, qk: ", qk)
 
         q = q.transpose(1, 2)  # (bsz, n_heads, seqlen, qk_head_dim)
         k = k.transpose(1, 2)  # (bsz, n_heads, seqlen, qk_head_dim)
         v = v.transpose(1, 2)  # (bsz, n_heads, seqlen, v_head_dim)
+        
 
         # TODO: Need to pass softmax_scale to sdpa() interface.
         # For mask, DeepseekV3 uses causal mask, so we can use the default mask in sdpa

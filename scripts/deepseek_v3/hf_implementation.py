@@ -177,7 +177,7 @@ def run_huggingface_implementation(args, _):
 
     with torch.no_grad():
         # Forward pass through the model with output_hidden_states=True and output_attentions=True
-        outputs = model(**inputs, output_hidden_states=True, output_attentions=True)
+        outputs = model(**inputs, output_hidden_states=True, output_attentions=True, use_cache=False)
 
     forward_time = time.time() - start_time
 
