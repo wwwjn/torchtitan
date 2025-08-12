@@ -1,0 +1,13 @@
+{
+  "metadata": {
+    "total_size": 1369062772000
+  },
+  "weight_map": {
+    "model.layers.0.mlp.gate_proj.weight": "model-00001-of-000163.safetensors",
+    "model.layers.0.mlp.gate_proj.weight_scale_inv": "model-00001-of-000163.safetensors",
+    "model.layers.0.mlp.up_proj.weight": "model-00001-of-000163.safetensors",
+    "model.layers.0.mlp.up_proj.weight_scale_inv": "model-00001-of-000163.safetensors",
+    "model.layers.0.mlp.down_proj.weight": "model-00001-of-000163.safetensors",
+    "model.layers.0.mlp.down_proj.weight_scale_inv": "model-00001-of-000163.safetensors"
+  }
+}
