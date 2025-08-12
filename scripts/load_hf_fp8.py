@@ -1,3 +1,4 @@
+# Run this script: NGPU=8 torchrun --nproc_per_node=8 /data/users/jianiw/torchtitan/scripts/load_hf_fp8.py
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
