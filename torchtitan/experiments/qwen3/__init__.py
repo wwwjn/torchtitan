@@ -14,9 +14,11 @@ from torchtitan.components.validate import build_validator
 from torchtitan.datasets.hf_datasets import build_hf_dataloader
 from torchtitan.protocols.train_spec import register_train_spec, TrainSpec
 
+
 from .infra.parallelize import qwen3model
 from .model.args import Qwen3ModelArgs
 from .model.model import Transformer
+from .model.state_dict_adapter import Qwen3StateDictAdapter
 
 __all__ = [
     "qwen3model",
@@ -117,5 +119,6 @@ register_train_spec(
         build_tokenizer_fn=build_hf_tokenizer,
         build_loss_fn=build_cross_entropy_loss,
         build_validator_fn=build_validator,
+        state_dict_adapter=Qwen3StateDictAdapter,
     )
 )

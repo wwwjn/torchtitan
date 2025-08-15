@@ -30,7 +30,7 @@ warmup_steps = 200  # lr scheduler warm up
 local_batch_size = 4
 seq_len = 4096
 max_norm = 1.0  # grad norm clipping
-steps = 10
+steps = 1
 compile = false
 dataset = "c4"
 
@@ -40,12 +40,14 @@ data_parallel_replicate_degree = 1
 data_parallel_shard_degree = -1
 
 [checkpoint]
-enable_checkpoint = false
+enable_checkpoint = true
 folder = "checkpoint"
 interval = 500
 last_save_model_weights_only = false
 export_dtype = "float16"
 async_mode = "disabled" # ["disabled", "async", "async_with_pinned_mem"]
+initial_load_path = "/data/users/jianiw/model/qwen3-0.6b"
+initial_load_in_hf = true
 
 [activation_checkpoint]
 mode = "selective"  # ["none", "selective", "full"]

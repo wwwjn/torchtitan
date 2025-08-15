@@ -17,6 +17,15 @@ from torchtitan.protocols.train_spec import ModelProtocol
 from .args import Qwen3ModelArgs
 
 
+def print_tensor_stats(name, tensor):
+    mean = tensor.mean().item()
+    std = tensor.std().item()
+    min_val = tensor.min().item()
+    max_val = tensor.max().item()
+    print(
+        f"{name} - Shape: {tensor.shape} Mean: {mean:.6f}, Min: {min_val:.6f}, Max: {max_val:.6f}, Std: {std:.6f}, First 10 values: {tensor.flatten()[:10].tolist()}"
+    )
+
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
     """
     Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
@@ -87,22 +96,37 @@ def apply_rotary_emb(
     Returns:
         tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
     """
-    xk_complex = torch.view_as_complex(
-        xk.view(*xk.shape[:-1], 2, xk.shape[-1] // 2)
-        .transpose(-2, -1)
-        .contiguous()
-        .float()
-    )
-    xq_complex = torch.view_as_complex(
-        xq.view(*xq.shape[:-1], 2, xq.shape[-1] // 2)
-        .transpose(-2, -1)
-        .contiguous()
-        .float()
-    )
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_complex)
+    # xk_complex = torch.view_as_complex(
+    #     xk.view(*xk.shape[:-1], 2, xk.shape[-1] // 2)
+    #     .transpose(-2, -1)
+    #     .contiguous()
+    #     .float()
+    # )
+    # xq_complex = torch.view_as_complex(
+    #     xq.view(*xq.shape[:-1], 2, xq.shape[-1] // 2)
+    #     .transpose(-2, -1)
+    #     .contiguous()
+    #     .float()
+    # )
+    # print_tensor_stats("xq_complex", xq_complex)
+    # freqs_cis = reshape_for_broadcast(freqs_cis, xq_complex)
+    # xq_out = torch.view_as_real(xq_complex * freqs_cis).flatten(3)
+    # xk_out = torch.view_as_real(xk_complex * freqs_cis).flatten(3)
+    # return xq_out.type_as(xq), xk_out.type_as(xk)
 
-    xq_out = torch.view_as_real(xq_complex * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_complex * freqs_cis).flatten(3)
+    # Test permute q, k on-the-fly
+    # b, h, s, d = xq.shape
+    # xq = xq.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+
+    # b, h, s, d = xk.shape
+    # xk = xk.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    # print_tensor_stats("xq_", xq_)
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
 
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
@@ -201,6 +225,10 @@ class Attention(nn.Module):
         xk = xk.view(bs, seqlen, -1, self.head_dim)
         xv = xv.view(bs, seqlen, -1, self.head_dim)
 
+        print_tensor_stats("xq after metrics", xq)
+        print_tensor_stats("xk after metrics", xk)
+        print_tensor_stats("xv after metrics ", xv)
+
         # Adding the q_norm and k_norm here
         # Last layer of adding q-k norm
         if self.q_norm:
@@ -208,11 +236,18 @@ class Attention(nn.Module):
         if self.k_norm:
             xk = self.k_norm(xk)
 
-        # repeat k/v heads if n_kv_heads < n_heads
+        print_tensor_stats("xq after q_norm", xq)
+        print_tensor_stats("xk after k_norm", xk)
+
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
+        # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
         values = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+
+
+        print_tensor_stats("keys", keys)
+        print_tensor_stats("values", values)
 
         xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         xk = keys.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
