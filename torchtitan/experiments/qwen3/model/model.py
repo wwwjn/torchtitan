@@ -16,6 +16,89 @@ from torchtitan.protocols.train_spec import ModelProtocol
 
 from .args import Qwen3ModelArgs
 
+# Adapted from https://github.com/pytorch/torchtune/blob/main/torchtune/models/qwen2/_positional_embeddings.py
+class QwenRotaryEmbedding(nn.Module):
+    """
+    RoPE Embeddings used in the Qwen model.
+
+    Args:
+        dim (int): Embedding dimension. This is usually set to the dim of each
+            head in the attention module computed as ``embed_dim`` // ``num_heads`` or ``head_dim``
+        max_seq_len (int): Maximum expected sequence length for the
+            model, if exceeded the cached freqs will be recomputed
+        base (float): The base for the geometric progression used to compute
+            the rotation angles
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        max_seq_len: int = 4096,
+        base: float = 1_000_000.0,
+    ) -> None:
+        super().__init__()
+        self.dim = dim
+        self.base = base
+        self.max_seq_len = max_seq_len
+
+    def rope_init(self):
+        theta = 1.0 / (
+            self.base
+            ** (torch.arange(0, self.dim, 2)[: (self.dim // 2)].float() / self.dim)
+        )
+        self.register_buffer("theta", theta, persistent=False)
+        self.build_rope_cache(self.max_seq_len)
+
+    def build_rope_cache(self, max_seq_len: int = 4096) -> None:
+        # Create position indexes `[0, 1, ..., max_seq_len - 1]`
+        seq_idx = torch.arange(
+            max_seq_len, dtype=self.theta.dtype, device=self.theta.device
+        )
+        
+        # Outer product of theta and position index; output tensor has
+        # a shape of [max_seq_len, dim // 2]
+        idx_theta = torch.outer(seq_idx, self.theta).float()
+
+        # We cache the cos and sin embeddings instead of the IDs. This helps
+        # ensure we have correct behavior when training with bf16
+        # Size: [max_seq_len, (dim * 2)]
+        freqs = torch.cat([idx_theta, idx_theta], dim=-1)
+        cache = torch.cat([freqs.cos(), freqs.sin()], dim=-1)
+        self.register_buffer("cache", cache, persistent=False)
+    
+    def forward(
+        self, x: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): input tensor with shape
+                [bsz, seq_len, num_attn_heads, head_dim]
+
+        Returns:
+            cos (torch.Tensor): RoPE cosine embeddings
+            sin (torch.Tensor): RoPE sine embeddings
+
+        """
+        # input tensor x has shape [bsz, seq_len, num_attn_heads, head_dim]
+        seq_len = x.shape[1]
+        head_dim = x.shape[-1]
+
+        # reshape for broadcast
+        rope_cache = self.cache.view(-1, seq_len, 1, head_dim * 2)
+
+        # [b, s, 1, h_d]
+        cos = rope_cache[..., :head_dim].to(dtype=x.dtype, device=x.device)
+        sin = rope_cache[..., head_dim:].to(dtype=x.dtype, device=x.device)
+
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        rotated = torch.cat((-x2, x1), dim=-1)
+
+        # cos: [b, s, 1, h_d]
+        # x: [b, s, n_h, h_d]
+        x_out = (x * cos) + (rotated * sin)
+        return x_out.type_as(x)
+
 
 def print_tensor_stats(name, tensor):
     mean = tensor.mean().item()
@@ -25,111 +108,6 @@ def print_tensor_stats(name, tensor):
     print(
         f"{name} - Shape: {tensor.shape} Mean: {mean:.6f}, Min: {min_val:.6f}, Max: {max_val:.6f}, Std: {std:.6f}, First 10 values: {tensor.flatten()[:10].tolist()}"
     )
-
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
-    """
-    Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
-
-    This function calculates a frequency tensor with complex exponentials using the given dimension 'dim'
-    and the end index 'end'. The 'theta' parameter scales the frequencies.
-    The returned tensor contains complex values in complex64 data type.
-
-    Args:
-        dim (int): Dimension of the frequency tensor.
-        end (int): End index for precomputing frequencies.
-        theta (float | None): Scaling factor for frequency computation. Defaults to 10000.0.
-
-    Returns:
-        torch.Tensor: Precomputed frequency tensor with complex exponentials.
-    """
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)
-    freqs = torch.outer(t, freqs).float()
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
-
-
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    """
-    Reshape frequency tensor for broadcasting it with another tensor.
-
-    This function reshapes the frequency tensor to have the same shape as the target tensor 'x'
-    for the purpose of broadcasting the frequency tensor during element-wise operations.
-
-    The input freqs_cis tensor is assumed to be of shape (max_seqlen, dim),
-    and the first seqlen elements will be sliced, but dim must match x.
-
-    Args:
-        freqs_cis (torch.Tensor): Frequency tensor to be reshaped.
-        x (torch.Tensor): Target tensor for broadcasting compatibility.
-
-    Returns:
-        torch.Tensor: Reshaped frequency tensor.
-    """
-    ndim = x.ndim
-    assert ndim > 1
-    seqlen = x.shape[1]
-    freqs_cis = freqs_cis[0:seqlen]
-    assert freqs_cis.shape == (seqlen, x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(*shape)
-
-
-def apply_rotary_emb(
-    xq: torch.Tensor,
-    xk: torch.Tensor,
-    freqs_cis: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Apply rotary embeddings to input tensors using the given frequency tensor.
-
-    This function applies rotary embeddings to the given query 'xq' and key 'xk' tensors using the provided
-    frequency tensor 'freqs_cis'. The input tensors are reshaped as complex numbers, and the frequency tensor
-    is reshaped for broadcasting compatibility. The resulting tensors contain rotary embeddings and are
-    returned as real tensors.
-
-    Args:
-        xq (torch.Tensor): Query tensor to apply rotary embeddings.
-        xk (torch.Tensor): Key tensor to apply rotary embeddings.
-        freqs_cis (torch.Tensor): Precomputed frequency tensor for complex exponentials.
-
-    Returns:
-        tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
-    """
-    # xk_complex = torch.view_as_complex(
-    #     xk.view(*xk.shape[:-1], 2, xk.shape[-1] // 2)
-    #     .transpose(-2, -1)
-    #     .contiguous()
-    #     .float()
-    # )
-    # xq_complex = torch.view_as_complex(
-    #     xq.view(*xq.shape[:-1], 2, xq.shape[-1] // 2)
-    #     .transpose(-2, -1)
-    #     .contiguous()
-    #     .float()
-    # )
-    # print_tensor_stats("xq_complex", xq_complex)
-    # freqs_cis = reshape_for_broadcast(freqs_cis, xq_complex)
-    # xq_out = torch.view_as_real(xq_complex * freqs_cis).flatten(3)
-    # xk_out = torch.view_as_real(xk_complex * freqs_cis).flatten(3)
-    # return xq_out.type_as(xq), xk_out.type_as(xk)
-
-    # Test permute q, k on-the-fly
-    # b, h, s, d = xq.shape
-    # xq = xq.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
-
-    # b, h, s, d = xk.shape
-    # xk = xk.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
-
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    # print_tensor_stats("xq_", xq_)
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-
-    return xq_out.type_as(xq), xk_out.type_as(xk)
-
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
@@ -162,7 +140,7 @@ class Attention(nn.Module):
 
     """
 
-    def __init__(self, model_args: Qwen3ModelArgs):
+    def __init__(self, model_args: Qwen3ModelArgs, rotary_emb: QwenRotaryEmbedding):
         super().__init__()
         self.n_heads = model_args.n_heads
         self.n_kv_heads = (
@@ -182,6 +160,8 @@ class Attention(nn.Module):
             self.k_norm = nn.RMSNorm(
                 self.head_dim, eps=model_args.norm_eps, elementwise_affine=True
             )
+        
+        self.rotary_emb = rotary_emb
 
         self.wq = nn.Linear(
             model_args.dim, model_args.n_heads * self.head_dim, bias=False
@@ -201,14 +181,14 @@ class Attention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
     ):
         """
         Forward pass of the attention module.
 
         Args:
             x (torch.Tensor): Input tensor.
-            freqs_cis (torch.Tensor): Precomputed frequency tensor.
+            cos (torch.Tensor): Precomputed cos Rotary embedding tensor.
+            sin (torch.Tensor): Precomputed cos Rotary embedding tensor.
 
         Returns:
             torch.Tensor: Output tensor after attention.
@@ -236,10 +216,14 @@ class Attention(nn.Module):
         if self.k_norm:
             xk = self.k_norm(xk)
 
-        print_tensor_stats("xq after q_norm", xq)
-        print_tensor_stats("xk after k_norm", xk)
+        print_tensor_stats("xq after q_norm", xq) # Shape: torch.Size([1, 4096, 16, 128])
+        print_tensor_stats("xk after k_norm", xk)  # Shape: torch.Size([1, 4096, 8, 128])
 
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        # print_tensor_stats("cos", cos)
+        # print_tensor_stats("sin", sin)
+        # xq, xk = apply_rotary_emb(xq, xk, cos, sin, unsqueeze_dim=2)
+        xq = self.rotary_emb(xq)
+        xk = self.rotary_emb(xk)
 
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
@@ -321,12 +305,12 @@ class TransformerBlock(nn.Module):
 
     """
 
-    def __init__(self, layer_id: int, model_args: Qwen3ModelArgs):
+    def __init__(self, layer_id: int, model_args: Qwen3ModelArgs, rotary_emb: QwenRotaryEmbedding):
         super().__init__()
         self.n_heads = model_args.n_heads
         self.dim = model_args.dim
 
-        self.attention = Attention(model_args)
+        self.attention = Attention(model_args, rotary_emb)
         self.feed_forward = FeedForward(
             dim=model_args.dim, hidden_dim=model_args.hidden_dim
         )
@@ -341,7 +325,6 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
     ):
         """
         Perform a forward pass through the TransformerBlock.
@@ -354,7 +337,7 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        h = x + self.attention(self.attention_norm(x), freqs_cis)
+        h = x + self.attention(self.attention_norm(x))
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -392,14 +375,21 @@ class Transformer(nn.Module, ModelProtocol):
         self.eos_id = model_args.eos_id
         self.head_dim = model_args.head_dim
 
+        # init rotary embeddings only once 
+        self.rotary_emb = QwenRotaryEmbedding(dim=model_args.head_dim, max_seq_len=model_args.max_seq_len, base=model_args.rope_theta)
+        
         self.tok_embeddings = nn.Embedding(model_args.vocab_size, model_args.dim)
-        self.register_buffer("freqs_cis", self._precompute_freqs_cis(), persistent=True)
 
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(model_args.n_layers):
-            self.layers[str(layer_id)] = TransformerBlock(layer_id, model_args)
+            self.layers[str(layer_id)] = TransformerBlock(layer_id, model_args, self.rotary_emb)
         self.norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
+        
+       
         self.output = nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
+        if self.model_args.enable_weight_tying:
+            self.output.weight = self.tok_embeddings.weight
+        
         self.init_weights()
 
     def init_weights(
@@ -417,9 +407,7 @@ class Transformer(nn.Module, ModelProtocol):
         ``init_weights``. We only call it in the constructor of this
         ``Transformer`` root module to avoid reinitializing tensors.
         """
-        buffer_device = buffer_device or self.freqs_cis.device
-        with torch.device(buffer_device):
-            self.freqs_cis = self._precompute_freqs_cis()
+
         if self.tok_embeddings is not None:
             nn.init.normal_(self.tok_embeddings.weight)
         for layer in self.layers.values():
@@ -429,7 +417,8 @@ class Transformer(nn.Module, ModelProtocol):
             self.norm.reset_parameters()
         final_out_std = self.model_args.dim**-0.5
         cutoff_factor = 3
-        if self.output is not None:
+        
+        if self.output is not None and not self.model_args.enable_weight_tying:
             nn.init.trunc_normal_(
                 self.output.weight,
                 mean=0.0,
@@ -438,15 +427,8 @@ class Transformer(nn.Module, ModelProtocol):
                 b=cutoff_factor * final_out_std,
             )
 
-    def _precompute_freqs_cis(self) -> torch.Tensor:
-        return precompute_freqs_cis(
-            self.head_dim,
-            # Need to compute until at least the max token limit for generation
-            # TODO: explain in docs/composability.md why we removed the 2x
-            # relaxing in our CP enablement PR
-            self.model_args.max_seq_len,
-            self.model_args.rope_theta,
-        )
+        if self.rotary_emb:
+            self.rotary_emb.rope_init()
 
     def forward(
         self,
@@ -477,12 +459,12 @@ class Transformer(nn.Module, ModelProtocol):
                 input_batch if input_batch is not None else tokens,
                 eos_id=eos_id,
             )
-
+    
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
 
         for layer in self.layers.values():
-            h = layer(h, self.freqs_cis)
+            h = layer(h)
 
         h = self.norm(h) if self.norm else h
         output = self.output(h) if self.output else h

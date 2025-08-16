@@ -10,12 +10,21 @@
 from collections import defaultdict
 from typing import Optional
 
+from torch.distributed.tensor.parallel import (
+    ColwiseParallel,
+    parallelize_module,
+    PrepareModuleInput,
+    RowwiseParallel,
+    SequenceParallel,
+)
 import torch
 import torch.nn as nn
 from torch.distributed._composable.replicate import replicate
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
 )
+
+from torchtitan.distributed.expert_parallel import NoParallel
 
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
@@ -93,13 +102,71 @@ def qwen3model(
     return model
 
 
-_save_list = {
-    torch.ops.aten.mm.default,
-    torch.ops.aten._scaled_dot_product_efficient_attention.default,
-    torch.ops.aten._scaled_dot_product_flash_attention.default,
-    torch.ops._c10d_functional.reduce_scatter_tensor.default,
-    # for low precision training, it's useful to always save
-    # the result of max, since the absolute maximum is
-    # used to compute the scaling factor for quantization.
-    torch.ops.aten.max.default,
-}
+
+def apply_tp(
+    model: nn.Module,
+    tp_mesh: DeviceMesh,
+    loss_parallel: bool,
+    enable_float8_tensorwise_tp: bool,
+    enable_async_tp: bool,
+):
+    """Apply tensor parallelism."""
+    # 1. Parallelize the embedding and shard its outputs (which are the first
+    # transformer block's inputs)
+    # 2. Parallelize the root norm layer over the sequence dim
+    # 3. Parallelize the final linear output layer
+    parallelize_module(
+        model,
+        tp_mesh,
+        {
+            "tok_embeddings": RowwiseParallel(
+                input_layouts=Replicate(),
+                output_layouts=Shard(1),
+            ),
+            "norm": SequenceParallel(),
+            "output": ColwiseParallel(
+                input_layouts=Shard(1),
+                output_layouts=Shard(-1) if loss_parallel else Replicate(),
+                use_local_output=not loss_parallel,
+            ),
+        },
+    )
+
+    rowwise_parallel, colwise_parallel, prepare_module_input = (
+        RowwiseParallel,
+        ColwiseParallel,
+        PrepareModuleInput,
+    )
+
+    # Apply tensor + sequence parallelism to every transformer block
+    # NOTE: At the cost of model code change, we can accelerate Sequence Parallel
+    #       by folding (and unfolding) the batch dimension and the sequence dimension.
+    #       Examples can be found at https://github.com/pytorch/torchtitan/pull/437
+    for transformer_block in model.layers.values():
+        layer_plan = {
+            "attention_norm": SequenceParallel(),
+            "attention": prepare_module_input(
+                input_layouts=(Shard(1), Replicate()),
+                desired_input_layouts=(Shard(1), Replicate()),
+            ),
+            "attention.wq": colwise_parallel(use_local_output=False),
+            "attention.wk": colwise_parallel(use_local_output=False),
+            "attention.wv": colwise_parallel(use_local_output=False),
+            "attention.q_norm": NoParallel(use_local_output=False),
+            "attention.k_norm": NoParallel(use_local_output=False),
+            "attention.wo": rowwise_parallel(output_layouts=Shard(1)),
+            "ffn_norm": SequenceParallel(),
+            "feed_forward": prepare_module_input(
+                input_layouts=(Shard(1),),
+                desired_input_layouts=(Replicate(),),
+            ),
+            "feed_forward.w1": colwise_parallel(),
+            "feed_forward.w2": rowwise_parallel(output_layouts=Shard(1)),
+            "feed_forward.w3": colwise_parallel(),
+        }
+
+        parallelize_module(
+            module=transformer_block,
+            device_mesh=tp_mesh,
+            parallelize_plan=layer_plan,
+        )

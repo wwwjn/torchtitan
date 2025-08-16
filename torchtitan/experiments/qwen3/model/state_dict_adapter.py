@@ -76,11 +76,11 @@ class Qwen3StateDictAdapter(StateDictAdapter):
                 new_key = to_hf_map[abstract_key]
                 # We need to permute the weights in wq and wk layer in order to account for the difference between
                 # the native Llama and huggingface RoPE implementation.
-                if abstract_key == "layers.{}.attention.wq.weight":
-                    value = self._permute(value, n_heads)
-                if abstract_key == "layers.{}.attention.wk.weight":
-                    key_value_dim = head_dim * n_kv_heads
-                    value = self._permute(value, n_kv_heads, key_value_dim, dim)
+                # if abstract_key == "layers.{}.attention.wq.weight":
+                #     value = self._permute(value, n_heads)
+                # if abstract_key == "layers.{}.attention.wk.weight":
+                #     key_value_dim = head_dim * n_kv_heads
+                #     value = self._permute(value, n_kv_heads, key_value_dim, dim)
 
                 if new_key is None:
                     continue
@@ -111,11 +111,11 @@ class Qwen3StateDictAdapter(StateDictAdapter):
 
                 # We need to permute the weights in wq and wk layer in order to account for the difference between
                 # the native Llama and huggingface RoPE implementation.
-                if abstract_key == "model.layers.{}.self_attn.q_proj.weight":
-                    value = self._reverse_permute(value, n_heads)
-                if abstract_key == "model.layers.{}.self_attn.k_proj.weight":
-                    key_value_dim = head_dim * n_kv_heads
-                    value = self._reverse_permute(value, n_kv_heads, key_value_dim, dim)
+                # if abstract_key == "model.layers.{}.self_attn.q_proj.weight":
+                #     value = self._reverse_permute(value, n_heads)
+                # if abstract_key == "model.layers.{}.self_attn.k_proj.weight":
+                #     key_value_dim = head_dim * n_kv_heads
+                #     value = self._reverse_permute(value, n_kv_heads, key_value_dim, dim)
 
                 if new_key is None:
                     continue
