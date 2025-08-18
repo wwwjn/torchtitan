@@ -375,7 +375,7 @@ class Transformer(nn.Module, ModelProtocol):
         self.eos_id = model_args.eos_id
         self.head_dim = model_args.head_dim
 
-        # init rotary embeddings only once 
+        # init rotary embeddings only once in the Model
         self.rotary_emb = QwenRotaryEmbedding(dim=model_args.head_dim, max_seq_len=model_args.max_seq_len, base=model_args.rope_theta)
         
         self.tok_embeddings = nn.Embedding(model_args.vocab_size, model_args.dim)
@@ -384,7 +384,6 @@ class Transformer(nn.Module, ModelProtocol):
         for layer_id in range(model_args.n_layers):
             self.layers[str(layer_id)] = TransformerBlock(layer_id, model_args, self.rotary_emb)
         self.norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
-        
        
         self.output = nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
         if self.model_args.enable_weight_tying:

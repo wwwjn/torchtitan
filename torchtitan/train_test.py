@@ -11,9 +11,9 @@ from datetime import timedelta
 from typing import Any, Generator, Iterable, Optional
 
 import torch
-from torch.distributed.elastic.multiprocessing.errors import record
 
 import torchtitan.protocols.train_spec as train_spec_module
+from torch.distributed.elastic.multiprocessing.errors import record
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.dataloader import DataloaderStopIteration
 from torchtitan.components.ft import FTManager, maybe_semi_sync_training
@@ -101,7 +101,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             tp=parallelism_config.tensor_parallel_degree,
             pp=parallelism_config.pipeline_parallel_degree,
             ep=parallelism_config.expert_parallel_degree,
-            etp=parallelism_config.expert_tensor_parallel_degree,
             world_size=world_size,
         )
 
@@ -308,9 +307,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             states={"train_state": self},
             checkpoint_config=job_config.checkpoint,
             sd_adapter=(
-                self.train_spec.state_dict_adapter(
-                    model_args, job_config.model.hf_assets_path
-                )
+                self.train_spec.state_dict_adapter(model_args)
                 if self.train_spec.state_dict_adapter
                 else None
             ),
@@ -334,16 +331,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # Build validator if validation is configured
         if job_config.validation.enabled:
             assert self.train_spec.build_validator_fn is not None
-
-            pp_schedule, pp_has_first_stage, pp_has_last_stage = (
-                (
-                    self.pp_schedule,
-                    self.pp_has_first_stage,
-                    self.pp_has_last_stage,
-                )
-                if parallel_dims.pp_enabled
-                else (None, None, None)
-            )
+            assert (
+                not parallel_dims.pp_enabled
+            ), "pp is enabled but validation doesn't support pipeline parallelism yet"
 
             self.validator = self.train_spec.build_validator_fn(
                 job_config=job_config,
@@ -449,13 +439,37 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             with self.train_context(optional_context_parallel_ctx):
                 assert len(model_parts) == 1
                 with self.maybe_enable_amp:
-                    pred = model_parts[0](inputs, eos_id=self.tokenizer.eos_id)
-                    loss = self.loss_fn(pred, labels)
+                    model_parts[0].eval()
+                    pred = model_parts[0](inputs)
+                    # print("Prediction tensor is: ", pred)
+
+                    # Print detailed information about the model output
+                    print("\nForward Pass Results:")
+                    print(f"- Output logits shape: {pred.shape}")
+                    print(f"- Sequence length: {pred.shape[1]}")
+                    print(f"- Vocabulary size: {pred.shape[2]}")
+                    
+                    # Get the predictions for the next token (highest probability)
+                    next_token_logits = pred[:, -1, :]
+                    print(f"\nNext token logits : {next_token_logits}")
+                    next_token_probs = torch.softmax(next_token_logits, dim=-1)
+                    print(f"\nNext token probabilities: {next_token_probs}")
+                    top_k_values, top_k_indices = torch.topk(next_token_probs, 5, dim=-1)
+
+                    print("Top K values: ", top_k_values)
+                    print("Top K indices: ", top_k_indices)
+                    
+                    print("\nTop 5 predicted next tokens (showing IDs only since we're not using tokenizer):")
+                    for i, (value, index) in enumerate(zip(top_k_values[0], top_k_indices[0])):
+                        print(f"  {i+1}. Token ID: {index} - Probability: {value.item():.4f}")
+                    
+                    # loss = self.loss_fn(pred, labels)
+                
                 # need to free to before bwd to avoid peaking memory
                 del pred
-                loss.backward()
+                # loss.backward()
 
-        return loss
+        return None
 
     def train_step(
         self, data_iterator: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
@@ -472,8 +486,48 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # If data runs out during gradient accumulation, that
         # entire step will not be executed.
         for microbatch in range(self.gradient_accumulation_steps):
-            input_dict, labels = next(data_iterator)
+            # Override input dict with fake data. Every rank will have the same input
+            print("\nCreating fake input with the same shape as tokenized input")
+            
+            # Define sequence length for fake input
+            seq_length = self.job_config.training.seq_len
+            
+            with torch.no_grad():
+            # Create fake input_ids directly on the device - using random integers between 0 and 50000 (typical vocab size)
+                seq_length = 4096  # You can adjust this based on your needs
+
+                # Create fake input_ids directly on the device - using random integers between 0 and 50000 (typical vocab size)
+                torch.manual_seed(23)  # Set seed for reproducibility
+                input_ids = torch.randint(
+                    0, 50000, (1, seq_length), dtype=torch.long, device=self.device
+                )
+                
+                # Create fake attention_mask directly on the device - all 1s for full attention
+                attention_mask = torch.ones((1, seq_length), dtype=torch.long, device=self.device)
+                
+                # Create inputs dictionary similar to what tokenizer would produce
+                input_dict = {
+                    "input": input_ids,
+                    "attention_mask": attention_mask
+                }
+                
+                # Create fake labels (same as attention_mask for simplicity)
+                labels = attention_mask.clone()
+            
+            # Print input information
+            print(f"Fake input token IDs: {input_ids[0][:10].cpu().numpy()}...")
+            print(f"Fake input shape: {input_ids.shape}")
+            print(f"Input tensors device: {input_ids.device}")
+            
+            print("\nRunning single forward pass...")
+            
+            # forward / backward
             loss = self.forward_backward_step(input_dict, labels)
+            
+            # We'll return early after the first microbatch to just show the output
+            return
+            
+            # This code won't be reached due to the return above
             accumulated_losses.append(loss.detach())
 
         grad_norm = dist_utils.clip_grad_norm_(
@@ -523,7 +577,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             global_avg_loss,
             global_max_loss,
             grad_norm.item(),
-            extra_metrics=extra_metrics,
         )
 
     @record
@@ -612,7 +665,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         logger.info("Training completed")
 
     def state_dict(self) -> dict[str, Any]:
-        return {"step": self.step, "ntokens_seen": self.ntokens_seen}
+        return {"step": self.step}
 
     def load_state_dict(self, state_dict: dict[str, Any]):
         self.step = state_dict["step"]
@@ -652,4 +705,4 @@ if __name__ == "__main__":
     else:
         trainer.close()
         torch.distributed.destroy_process_group()
-        logger.info("Process group destroyed")
+        logger.info("Process group destroyed.")

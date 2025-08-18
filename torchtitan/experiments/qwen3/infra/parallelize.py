@@ -41,7 +41,6 @@ from torchtitan.config import JobConfig, TORCH_DTYPE_MAP
 from torchtitan.config.job_config import ActivationCheckpoint as ACConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.models.llama3.infra.parallelize import (
-    _apply_ac_to_transformer_block,
     apply_ac,
     apply_compile,
     apply_ddp,
@@ -50,13 +49,39 @@ from torchtitan.models.llama3.infra.parallelize import (
 from torchtitan.tools.logging import logger
 
 
-def qwen3model(
+def parallelize_qwen3(
     model: nn.Module,
     parallel_dims: ParallelDims,
     job_config: JobConfig,
 ):
 
     world_mesh = parallel_dims.world_mesh
+
+    if parallel_dims.tp_enabled:
+        if (
+            job_config.parallelism.enable_async_tensor_parallel
+            and not job_config.training.compile
+        ):
+            raise RuntimeError("Async TP requires --training.compile")
+
+        enable_float8_linear = "float8" in job_config.model.converters
+        float8_is_rowwise = job_config.float8.recipe_name in (
+            "rowwise",
+            "rowwise_with_gw_hp",
+        )
+
+        # For now, float8 all-gather with TP is only supported for tensorwise
+        # float8 scaling recipes. For rowwise recipes, we use regular TP and
+        # all-gather happens in high precision.
+        enable_float8_tensorwise_tp = enable_float8_linear and not float8_is_rowwise
+
+        apply_tp(
+            model,
+            world_mesh["tp"],
+            loss_parallel=not job_config.parallelism.disable_loss_parallel,
+            enable_float8_tensorwise_tp=enable_float8_tensorwise_tp,
+            enable_async_tp=job_config.parallelism.enable_async_tensor_parallel,
+        )
 
     if job_config.activation_checkpoint.mode != "none":
         apply_ac(model, job_config.activation_checkpoint)
@@ -80,6 +105,7 @@ def qwen3model(
             pp_enabled=parallel_dims.pp_enabled,
             cpu_offload=job_config.training.enable_cpu_offload,
             reshard_after_forward_policy=job_config.parallelism.fsdp_reshard_after_forward,
+            enable_weight_tying=model.model_args.enable_weight_tying,
         )
 
         if parallel_dims.dp_replicate_enabled:
