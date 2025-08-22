@@ -6,6 +6,7 @@
 
 import enum
 import functools
+from hashlib import new
 import os
 import queue
 import re
@@ -14,6 +15,8 @@ import threading
 import time
 from concurrent.futures import Future
 from typing import Any
+from torch.distributed.tensor import DTensor
+
 
 import torch
 import torch.distributed as dist
@@ -301,6 +304,94 @@ class CheckpointManager:
             f"Checkpointing active. Checkpoints will be loaded from and saved to {self.folder}"
         )
 
+    def _calculate_all_tensor_hash_sum(self, state_dict: dict[str, Any], context: str = "", key: list | None = None) -> str:
+        """Calculate the sum of all tensor hashes in the state dictionary.
+        
+        Args:
+            state_dict: The state dictionary to process
+            context: Context string for logging
+            
+        Returns:
+            str: Hex string of the combined hash sum
+        """
+        import hashlib
+        
+        def get_tensor_hash(tensor: torch.Tensor, prefix: str = "") -> tuple[str, str]:
+            """Get hash for a single tensor."""
+            try:
+                if isinstance(tensor, DTensor):
+                    tensor = tensor.to_local()
+                tensor_bytes = tensor.detach().cpu().numpy().tobytes()
+                hash_obj = hashlib.sha256(tensor_bytes)
+                hash_hex = hash_obj.hexdigest()
+                return prefix, hash_hex
+            except Exception as e:
+                logger.warning(f"Failed to hash tensor {prefix}: {e}")
+                return prefix, "0" * 64  # Return zero hash on failure
+        
+        def process_state_dict(sd: dict, prefix: str = "") -> list[tuple[str, str]]:
+            """Recursively process state dictionary to find all tensors."""
+            hashes = []
+            for key, value in sd.items():
+                full_key = f"{prefix}.{key}" if prefix else key
+                
+                if isinstance(value, torch.Tensor):
+                    tensor_prefix, tensor_hash = get_tensor_hash(value, full_key)
+                    hashes.append((tensor_prefix, tensor_hash))
+                    # if context:
+                    #     print(f"[{context}] Hash for {full_key} {type(value)}: {tensor_hash}")
+                elif hasattr(value, 'state_dict'):
+                    # Handle objects with state_dict method (optimizers, schedulers, etc.)
+                    try:
+                        nested_sd = value.state_dict()
+                        nested_hashes = process_state_dict(nested_sd, full_key)
+                        hashes.extend(nested_hashes)
+                    except Exception as e:
+                        logger.warning(f"Failed to get state_dict for {full_key}: {e}")
+                elif isinstance(value, dict):
+                    # Handle nested dictionaries
+                    nested_hashes = process_state_dict(value, full_key)
+                    hashes.extend(nested_hashes)
+                else:
+                    # Non-tensor values
+                    if context:
+                        logger.info(f"[{context}] Non-tensor {full_key} {type(value)}: {value}")
+            
+            return hashes
+        
+        # Get all tensor hashes
+        if key is None:
+            all_hashes = process_state_dict(state_dict)
+        else:
+            all_hashes = []
+            for k in key:
+                if k not in state_dict:
+                    raise ValueError(f"Key {k} not found in state_dict")
+                if isinstance(state_dict[k], DTensor):
+                    all_hashes.append(get_tensor_hash(state_dict[k], k))
+                elif hasattr(state_dict[k], 'state_dict'):
+                    all_hashes += process_state_dict(state_dict[k].state_dict(), k)
+    
+        
+        # Sum all hash values (treating them as hex numbers)
+        total_sum = 0
+        valid_hashes = 0
+        for prefix, hash_hex in all_hashes:
+            try:
+                total_sum += int(hash_hex, 16)
+                valid_hashes += 1
+            except ValueError:
+                logger.warning(f"Invalid hash for {prefix}: {hash_hex}")
+        
+        # Convert sum back to hex
+        total_hash_hex = hex(total_sum % (2**256))[2:]  # Remove '0x' prefix and keep within 256 bits
+        
+        if context:
+            print(f"[{context}] Processed {valid_hashes} tensors, total hash sum: {total_hash_hex}")
+            logger.info(f"[{context}] Calculated hash sum from {valid_hashes} tensors: {total_hash_hex}")
+        
+        return total_hash_hex
+
     def __del__(self):
         self.close()
 
@@ -381,6 +472,10 @@ class CheckpointManager:
                 async_stager=self.stager,
             )
         else:
+            print("Saving checkpointing with dcp")
+            total_hash_sum = self._calculate_all_tensor_hash_sum(state_dict, "before_save", key=["optimizer"])
+            print(f"Total hash sum after loading from DCP: {total_hash_sum}")
+
             ret = dcp.save(
                 state_dict,
                 storage_writer=storage_writer,
@@ -422,11 +517,23 @@ class CheckpointManager:
         else:
             dcp.load(state_dict, checkpoint_id=checkpoint_id)
 
+            print("After loading checkpointing from dcp")
+            # Calculate sum of all tensor hashes
+            total_hash_sum = self._calculate_all_tensor_hash_sum(state_dict, "after_load_dcp", key=["optimizer"])
+            print(f"Total hash sum after loading from DCP: {total_hash_sum}")
+
             # TODO: Since we flatten the model states in state_dict, we need to
             # manually call load_state_dict() for the model. Need to fix this.
             if MODEL in self.states:
                 self.states[MODEL].load_state_dict(state_dict)
 
+
+            state_dict = self.states
+            # Calculate hash for tok_embedding before saving
+            print("After loading checkpoints and put to torchtitan model")
+            total_hash_sum = self._calculate_all_tensor_hash_sum(state_dict, "after_put_onto_model", key=["optimizer"])
+            print(f"Total hash sum after loading from DCP: {total_hash_sum}")
+            
     @torch.no_grad()
     def save(self, curr_step: int, last_step: bool = False) -> None:
         """Save the checkpoint for the current step.
