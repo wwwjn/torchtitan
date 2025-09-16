@@ -254,17 +254,36 @@ def expert_parallel(func: Callable) -> Callable:
         num_ep_ranks = num_tokens_per_expert.shape[0] // experts_per_ep_rank
 
         with torch.no_grad():
-            (
-                permuted_indices,
-                num_tokens_per_expert,
-                _,  # offsets,
-            ) = generate_permute_indices(
-                num_tokens_per_expert,
-                experts_per_ep_rank,
-                num_ep_ranks,
-                x.shape[0] + experts_per_ep_rank * TOKEN_GROUP_ALIGN_SIZE_M,
-                TOKEN_GROUP_ALIGN_SIZE_M,
-            )
+            try:
+                (
+                    permuted_indices,
+                    num_tokens_per_expert,
+                    _,  # offsets,
+                ) = generate_permute_indices(
+                    num_tokens_per_expert,
+                    experts_per_ep_rank,
+                    num_ep_ranks,
+                    x.shape[0] + experts_per_ep_rank * TOKEN_GROUP_ALIGN_SIZE_M,
+                    TOKEN_GROUP_ALIGN_SIZE_M,
+                    use_cpu=False,
+                )
+            except Exception as e:
+                # Fallback to CPU implementation when Triton fails
+                print(
+                    f"Warning: Triton kernel failed ({e}), falling back to CPU implementation"
+                )
+                (
+                    permuted_indices,
+                    num_tokens_per_expert,
+                    _,  # offsets,
+                ) = generate_permute_indices(
+                    num_tokens_per_expert,
+                    experts_per_ep_rank,
+                    num_ep_ranks,
+                    x.shape[0] + experts_per_ep_rank * TOKEN_GROUP_ALIGN_SIZE_M,
+                    TOKEN_GROUP_ALIGN_SIZE_M,
+                    use_cpu=True,
+                )
 
         x = torch.vstack((x, x.new_zeros((x.shape[-1]))))
         input_shape = x.shape
