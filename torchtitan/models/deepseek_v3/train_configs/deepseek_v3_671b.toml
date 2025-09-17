@@ -6,7 +6,7 @@ print_args = false
 [profiling]
 enable_profiling = false
 save_traces_folder = "profile_trace"
-profile_freq = 10
+profile_freq = 1
 enable_memory_snapshot = false
 save_memory_snapshot_folder = "memory_snapshot"
 
@@ -25,7 +25,7 @@ hf_assets_path = "./assets/hf/DeepSeek-V3.1-Base"
 
 [optimizer]
 name = "AdamW"
-lr = 2.2e-4
+lr = 2.2e-5
 eps = 1e-8
 
 [lr_scheduler]
@@ -36,9 +36,9 @@ min_lr_factor = 0.1
 
 [training]
 local_batch_size = 1
-seq_len = 4096
+seq_len = 2048
 max_norm = 1.0  # grad norm clipping
-steps = 10_000
+steps = 1
 dataset = "c4"  # supported datasets: c4_test (2K), c4 (177M)
 
 [parallelism]

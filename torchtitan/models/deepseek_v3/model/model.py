@@ -16,6 +16,14 @@ from torchtitan.protocols.train_spec import ModelProtocol
 
 from .args import DeepSeekV3ModelArgs
 
+def print_tensor_stats(name, tensor):
+    mean = tensor.mean().item()
+    std = tensor.std().item()
+    min_val = tensor.min().item()
+    max_val = tensor.max().item()
+    print(
+        f"{name} - Shape: {tensor.shape} Mean: {mean:.6f}, Min: {min_val:.6f}, Max: {max_val:.6f}, Std: {std:.6f}, First 10 values: {tensor.flatten()[:10].tolist()}"
+    )
 
 # Adapted from https://github.com/DeepSeek-ai/DeepSeek-V3/blob/main/inference/model.py#L294
 def precompute_freqs_cis(args: DeepSeekV3ModelArgs) -> torch.Tensor:
@@ -385,8 +393,13 @@ class DeepSeekV3Model(nn.Module, ModelProtocol):
 
         h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
 
+        token_emb = h
+
         for layer in self.layers.values():
+            # Jiani: reset for each layer for simpler comparison
+            h = token_emb
             h = layer(h, self.freqs_cis)
+            print_tensor_stats(f"output of layer {layer.layer_id}", h)
         h = self.norm(h) if self.norm is not None else h
         output = self.output(h) if self.output is not None else h
         return output
