@@ -459,7 +459,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 assert len(model_parts) == 1
                 with self.maybe_enable_amp:
                     pred = model_parts[0](inputs)
-                    pred = model_parts[0](inputs)
                     # print("Prediction tensor is: ", pred)
 
                     # Print detailed information about the model output
@@ -517,17 +516,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 torch.manual_seed(42)
                 input_ids = torch.randint(0, 50000, (1, seq_length), dtype=torch.long, device=self.device)
                 
-                # Create fake attention_mask directly on the device - all 1s for full attention
-                attention_mask = torch.ones((1, seq_length), dtype=torch.long, device=self.device)
+                # Create fake labels
+                labels = torch.ones((1, seq_length), dtype=torch.long, device=self.device)
                 
                 # Create inputs dictionary similar to what tokenizer would produce
                 input_dict = {
                     "input": input_ids,
                 }
                 
-                # Create fake labels (same as attention_mask for simplicity)
-                labels = attention_mask.clone()
-            
             # Print input information
             print(f"Fake input token IDs: {input_ids[0][:10].cpu().numpy()}...")
             print(f"Fake input shape: {input_ids.shape}")

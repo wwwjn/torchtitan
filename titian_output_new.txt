@@ -1,0 +1,213 @@
++ NGPU=8
++ export LOG_RANK=0
++ LOG_RANK=0
++ CONFIG_FILE=./torchtitan/models/deepseek_v3/train_configs/deepseek_v3_671b.toml
++ TRAIN_FILE=torchtitan.train
++ TORCHFT_LIGHTHOUSE=http://localhost:29510
++ PYTORCH_ALLOC_CONF=expandable_segments:True
++ TORCHFT_LIGHTHOUSE=http://localhost:29510
++ torchrun --nproc_per_node=8 --rdzv_backend c10d --rdzv_endpoint=localhost:0 --local-ranks-filter 0 --role rank --tee 3 -m torchtitan.train --job.config_file ./torchtitan/models/deepseek_v3/train_configs/deepseek_v3_671b.toml
+W0917 10:35:33.753000 222981 site-packages/torch/distributed/run.py:803] 
+W0917 10:35:33.753000 222981 site-packages/torch/distributed/run.py:803] *****************************************
+W0917 10:35:33.753000 222981 site-packages/torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0917 10:35:33.753000 222981 site-packages/torch/distributed/run.py:803] *****************************************
+[rank0]:2025-09-17 10:35:43.066095: I tensorflow/core/util/port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+[rank0]:2025-09-17 10:35:43.077619: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:467] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
+[rank0]:WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+[rank0]:E0000 00:00:1758130543.090120  224321 cuda_dnn.cc:8579] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
+[rank0]:E0000 00:00:1758130543.093684  224321 cuda_blas.cc:1407] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
+[rank0]:W0000 00:00:1758130543.104274  224321 computation_placer.cc:177] computation placer already registered. Please check linkage and avoid linking the same target more than once.
+[rank0]:W0000 00:00:1758130543.104311  224321 computation_placer.cc:177] computation placer already registered. Please check linkage and avoid linking the same target more than once.
+[rank0]:W0000 00:00:1758130543.104315  224321 computation_placer.cc:177] computation placer already registered. Please check linkage and avoid linking the same target more than once.
+[rank0]:W0000 00:00:1758130543.104317  224321 computation_placer.cc:177] computation placer already registered. Please check linkage and avoid linking the same target more than once.
+[rank0]:2025-09-17 10:35:43.107513: I tensorflow/core/platform/cpu_feature_guard.cc:210] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
+[rank0]:To enable the following instructions: AVX2 AVX512F AVX512_VNNI AVX512_BF16 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.
+[rank0]:[titan] 2025-09-17 10:35:45,935 - root - INFO - Starting job: DeepSeek-V3 671B model training
+[rank0]:[titan] 2025-09-17 10:35:46,415 - root - WARNING - ENV[TORCH_NCCL_ASYNC_ERROR_HANDLING] = 1 will be overridden to 3 based on job config
+[rank0]:[titan] 2025-09-17 10:35:46,417 - root - INFO - Building 1-D device mesh with ['dp_shard'], [8]
+[rank0]:[titan] 2025-09-17 10:35:46,421 - root - INFO - [GC] Initial GC collection 0.00 seconds
+[rank0]:NCCL version 2.27.5+cuda12.9
+[rank0]:[titan] 2025-09-17 10:35:55,852 - root - INFO - Loading tokenizer from tokenizer.json
+[rank0]:[titan] 2025-09-17 10:35:56,036 - root - INFO - Preparing c4 dataset from allenai/c4
+[rank0]:[titan] 2025-09-17 10:36:00,447 - root - INFO - Building deepseek_v3 671B with DeepSeekV3ModelArgs(_enforced='This field is used to enforce all fields have defaults.', max_batch_size=8, max_seq_len=2048, vocab_size=129280, dim=7168, inter_dim=18432, moe_inter_dim=2048, n_layers=4, n_dense_layers=3, n_heads=128, norm_eps=1e-05, moe_args=MoEArgs(num_experts=256, num_shared_experts=1, score_func='sigmoid', route_norm=True, route_scale=2.5, score_before_experts=False, top_k=8, use_grouped_mm=True, load_balance_coeff=0.001), n_expert_groups=8, n_limited_groups=4, q_lora_rank=1536, kv_lora_rank=512, qk_nope_head_dim=128, qk_rope_head_dim=64, v_head_dim=128, use_flex_attn=False, attn_mask_type='causal', original_seq_len=4096, rope_theta=10000.0, rope_factor=40, beta_fast=32, beta_slow=1, mscale=1.0, hf_weight_quantized=True)
+[rank0]:[titan] 2025-09-17 10:36:00,476 - root - INFO - CUDA capacity: NVIDIA H100 with 94.99GiB memory
+[rank0]:[titan] 2025-09-17 10:36:00,507 - root - INFO - Total parameter count: dense 3,790,937,088, sparse 11,320,164,352, active 4,189,133,824
+[rank0]:[titan] 2025-09-17 10:36:00,507 - root - INFO - [34mModel deepseek_v3 671B [31msize: 15,111,101,440 total parameters[39m
+[rank0]:[titan] 2025-09-17 10:36:00,507 - root - INFO - Applied full activation checkpointing to the model
+[rank0]:[titan] 2025-09-17 10:36:00,539 - root - INFO - Applied FSDP to the model
+[rank0]:[titan] 2025-09-17 10:36:00,767 - root - INFO - Peak FLOPS used for computing MFU: 9.890e+14
+[rank0]:[titan] 2025-09-17 10:36:00,768 - root - INFO - CUDA memory usage for model: 7.07GiB(7.44%)
+[rank0]:[titan] 2025-09-17 10:36:00,768 - root - WARNING - Warmup steps (2000) exceed total training steps (1). Adjusting warmup steps to 1.
+[rank0]:[titan] 2025-09-17 10:36:00,768 - root - WARNING - Warmup (1) + decay (1) steps exceed total training steps (1). Adjusting decay steps to 0.
+[rank0]:[titan] 2025-09-17 10:36:00,768 - root - WARNING - model.safetensors.index.json not found at hf_assets_path: ./assets/hf/DeepSeek-V3.1-Base/model.safetensors.index.json.                     Defaulting to saving a single safetensors file if checkpoint is saved in HF format
+[rank0]:[titan] 2025-09-17 10:36:00,773 - root - INFO - Checkpointing active. Checkpoints will be loaded from and saved to ./outputs/checkpoint
+[rank0]:[titan] 2025-09-17 10:36:00,773 - root - INFO - Mixed precision training is handled by fully_shard
+[rank0]:[titan] 2025-09-17 10:36:00,773 - root - INFO - Trainer is initialized with local batch size 1, global batch size 8, gradient accumulation steps 1, sequence length 2048, total steps 1 (warmup 2000)
+[rank0]:[titan] 2025-09-17 10:36:00,774 - root - INFO - loading from HF safetensors from --checkpoint.initial_load_path: /home/jianiw/tmp/mffuse/deepseek-v3/DeepSeek-V3.1-Base
+[rank0]:[titan] 2025-09-17 10:36:00,774 - root - INFO - Loading the checkpoint from /home/jianiw/tmp/mffuse/deepseek-v3/DeepSeek-V3.1-Base.
+[rank0]:[titan] 2025-09-17 10:36:00,774 - root - INFO - Starting to_hf conversion, state_dict has 56 keys
+[rank0]:[titan] 2025-09-17 10:36:00,774 - root - INFO - Starting _get_local_experts_weights for layer 3, abstract_key: model.layers.{}.mlp.experts.{}.gate_proj.weight
+[rank0]:[titan] 2025-09-17 10:36:00,778 - root - INFO - Completed _get_local_experts_weights for layer 3, abstract_key: model.layers.{}.mlp.experts.{}.gate_proj.weight, duration: 0.0041s
+[rank0]:[titan] 2025-09-17 10:36:00,778 - root - INFO - Starting _get_local_experts_weights for layer 3, abstract_key: model.layers.{}.mlp.experts.{}.down_proj.weight
+[rank0]:[titan] 2025-09-17 10:36:00,781 - root - INFO - Completed _get_local_experts_weights for layer 3, abstract_key: model.layers.{}.mlp.experts.{}.down_proj.weight, duration: 0.0030s
+[rank0]:[titan] 2025-09-17 10:36:00,781 - root - INFO - Starting _get_local_experts_weights for layer 3, abstract_key: model.layers.{}.mlp.experts.{}.up_proj.weight
+[rank0]:[titan] 2025-09-17 10:36:00,783 - root - INFO - Completed _get_local_experts_weights for layer 3, abstract_key: model.layers.{}.mlp.experts.{}.up_proj.weight, duration: 0.0018s
+[rank0]:[titan] 2025-09-17 10:36:00,783 - root - INFO - Completed to_hf conversion, generated 149 keys, duration: 0.0093s
+[rank0]:[titan] 2025-09-17 10:36:00,783 - root - INFO - Starting dcp.load with <torch.distributed.checkpoint.quantized_hf_storage.QuantizedHuggingFaceStorageReader object at 0x7f2fde7093a0>
+[rank0]:[titan] 2025-09-17 10:38:30,851 - root - INFO - dcp.load with HuggingFaceStorageReader completed in 150.07 seconds
+[rank0]:[titan] 2025-09-17 10:38:30,851 - root - INFO - Starting from_hf conversion, state_dict has 149 keys
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,852 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Completed _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w1, duration: 0.0129s
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,865 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,866 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,866 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,866 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Completed _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w2, duration: 0.0083s
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,874 - root - INFO - Starting _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3
+[rank0]:[titan] 2025-09-17 10:38:30,876 - root - INFO - Completed _concatenate_expert_weights_dtensor for layer 3, abstract_key: layers.{}.moe.experts.w3, duration: 0.0012s
+[rank0]:[titan] 2025-09-17 10:38:30,876 - root - INFO - Completed from_hf conversion, processed 149 keys, duration: 0.0244s
+[rank0]:[titan] 2025-09-17 10:38:30,932 - root - INFO - [GC] GC collection for checkpoint loading. 0.01 seconds
+[rank0]:[titan] 2025-09-17 10:38:30,932 - root - INFO - Finished loading the checkpoint in 150.16 seconds.
+[rank0]:[titan] 2025-09-17 10:38:30,932 - root - INFO - Training starts at step 1
+[rank0]:
+[rank0]:Creating fake input with the same shape as tokenized input
+[rank0]:Fake input token IDs: [42643  2409 23798 23250 10593  6047  8142 29276  6908 14721]...
+[rank0]:Fake input shape: torch.Size([1, 2048])
+[rank0]:Input tensors device: cuda:0
+[rank0]:
+[rank0]:Running single forward pass...
+[rank0]:input of layer 0 - Shape: torch.Size([1, 2048, 7168]) Mean: 0.000022, Min: -0.863281, Max: 0.644531, Std: 0.040527, First 10 values: [-0.030517578125, -0.03173828125, -0.0089111328125, 4.9591064453125e-05, -0.09326171875, -0.003875732421875, -0.0240478515625, -0.007110595703125, 0.053466796875, -0.0145263671875]
+[rank0]:output of layer 0 - Shape: torch.Size([1, 2048, 7168]) Mean: -0.000094, Min: -0.664062, Max: 0.640625, Std: 0.048096, First 10 values: [-0.03857421875, -0.031494140625, -0.00323486328125, -0.0196533203125, -0.08984375, 0.007598876953125, -0.04345703125, -0.04296875, 0.0615234375, -0.0260009765625]
+[rank0]:input of layer 1 - Shape: torch.Size([1, 2048, 7168]) Mean: 0.000022, Min: -0.863281, Max: 0.644531, Std: 0.040527, First 10 values: [-0.030517578125, -0.03173828125, -0.0089111328125, 4.9591064453125e-05, -0.09326171875, -0.003875732421875, -0.0240478515625, -0.007110595703125, 0.053466796875, -0.0145263671875]
+[rank0]:output of layer 1 - Shape: torch.Size([1, 2048, 7168]) Mean: -0.000030, Min: -3.375000, Max: 2.906250, Std: 0.061035, First 10 values: [-0.0703125, 0.039306640625, -0.146484375, 0.0888671875, 0.07861328125, -0.01806640625, -0.007080078125, -0.109375, 0.35546875, -0.10205078125]
+[rank0]:input of layer 2 - Shape: torch.Size([1, 2048, 7168]) Mean: 0.000022, Min: -0.863281, Max: 0.644531, Std: 0.040527, First 10 values: [-0.030517578125, -0.03173828125, -0.0089111328125, 4.9591064453125e-05, -0.09326171875, -0.003875732421875, -0.0240478515625, -0.007110595703125, 0.053466796875, -0.0145263671875]
+[rank0]:output of layer 2 - Shape: torch.Size([1, 2048, 7168]) Mean: 0.000113, Min: -2.343750, Max: 3.500000, Std: 0.049805, First 10 values: [-0.0419921875, -0.040283203125, -0.015869140625, -0.021240234375, -0.041015625, 0.0228271484375, -0.0478515625, 0.05615234375, 0.0576171875, -0.04248046875]
+[rank0]:input of layer 3 - Shape: torch.Size([1, 2048, 7168]) Mean: 0.000022, Min: -0.863281, Max: 0.644531, Std: 0.040527, First 10 values: [-0.030517578125, -0.03173828125, -0.0089111328125, 4.9591064453125e-05, -0.09326171875, -0.003875732421875, -0.0240478515625, -0.007110595703125, 0.053466796875, -0.0145263671875]
+[rank0]:input of MoE:  - Shape: torch.Size([1, 2048, 7168]) Mean: 0.000134, Min: -1.164062, Max: 1.718750, Std: 0.117188, First 10 values: [-0.0458984375, -0.0712890625, -0.058349609375, 0.0267333984375, -0.1220703125, 0.051025390625, -0.1796875, -0.0142822265625, 0.087890625, 9.965896606445312e-05]
+[rank0]:top_score:  - Shape: torch.Size([2048, 8]) Mean: 0.312500, Min: 0.246544, Max: 0.455313, Std: 0.020875, First 10 values: [0.33881324529647827, 0.328999400138855, 0.32861363887786865, 0.30568620562553406, 0.3027527332305908, 0.2997959852218628, 0.29852190613746643, 0.296816885471344, 0.3490960896015167, 0.34166619181632996]
+[rank0]:routed input:  - Shape: torch.Size([16384, 7168]) Mean: 0.000134, Min: -1.164062, Max: 1.718750, Std: 0.117188, First 10 values: [-0.0458984375, -0.0712890625, -0.058349609375, 0.0267333984375, -0.1220703125, 0.051025390625, -0.1796875, -0.0142822265625, 0.087890625, 9.965896606445312e-05]
+[rank0]:routed output:  - Shape: torch.Size([16384, 7168]) Mean: -0.000003, Min: -0.322266, Max: 0.187500, Std: 0.003265, First 10 values: [0.0017242431640625, -0.005340576171875, -0.0031280517578125, -0.005279541015625, -0.0106201171875, 0.01226806640625, 0.01055908203125, -0.0025634765625, 0.006683349609375, -0.00335693359375]
+[rank0]:routed output 2:  - Shape: torch.Size([16384, 7168]) Mean: -0.000001, Min: -0.116211, Max: 0.064453, Std: 0.001068, First 10 values: [0.000583648681640625, -0.00180816650390625, -0.00106048583984375, -0.0017852783203125, -0.00360107421875, 0.004150390625, 0.003570556640625, -0.0008697509765625, 0.00225830078125, -0.00113677978515625]
+[rank0]:output of shard expert:  - Shape: torch.Size([2048, 7168]) Mean: -0.000057, Min: -1.945312, Max: 1.828125, Std: 0.054688, First 10 values: [-0.0037994384765625, -0.06591796875, 0.010009765625, -0.0159912109375, -0.0281982421875, -0.03369140625, 0.005706787109375, 0.006072998046875, -0.00390625, 0.034912109375]
+[rank0]:output of MoE:  - Shape: torch.Size([1, 2048, 7168]) Mean: -0.000063, Min: -1.945312, Max: 1.835938, Std: 0.055176, First 10 values: [-0.0159912109375, -0.0693359375, 0.0091552734375, -0.0234375, -0.031494140625, -0.03515625, 0.0164794921875, 0.0140380859375, 0.002685546875, 0.03173828125]
+[rank0]:output of layer 3 - Shape: torch.Size([1, 2048, 7168]) Mean: -0.000005, Min: -1.914062, Max: 2.187500, Std: 0.063477, First 10 values: [-0.04638671875, -0.1328125, -0.03466796875, -0.00933837890625, -0.080078125, -0.020263671875, -0.05908203125, 0.00811767578125, 0.059814453125, 0.031982421875]
+[rank0]:
+[rank0]:Forward Pass Results:
+[rank0]:- Output logits shape: torch.Size([1, 2048, 129280])
+[rank0]:- Sequence length: 2048
+[rank0]:- Vocabulary size: 129280
+[rank0]:
+[rank0]:Next token logits : tensor([[-2.5469,  0.9102, -0.6680,  ..., -0.4980, -0.4746, -0.4453]],
+[rank0]:       device='cuda:0', dtype=torch.bfloat16, grad_fn=<SelectBackward0>)
+[rank0]:
+[rank0]:Next token probabilities: tensor([[1.5949e-08, 5.0664e-07, 1.0431e-07,  ..., 1.2387e-07, 1.2666e-07,
+[rank0]:         1.3039e-07]], device='cuda:0', dtype=torch.bfloat16,
+[rank0]:       grad_fn=<SoftmaxBackward0>)
+[rank0]:Top K values:  tensor([[0.0513, 0.0483, 0.0425, 0.0332, 0.0332]], device='cuda:0',
+[rank0]:       dtype=torch.bfloat16, grad_fn=<TopkBackward0>)
+[rank0]:Top K indices:  tensor([[ 1399,  2015, 66500,  1586,  1164]], device='cuda:0')
+[rank0]:
+[rank0]:Top 5 predicted next tokens (showing IDs only since we're not using tokenizer):
+[rank0]:  1. Token ID: 1399 - Probability: 0.0513
+[rank0]:  2. Token ID: 2015 - Probability: 0.0483
+[rank0]:  3. Token ID: 66500 - Probability: 0.0425
+[rank0]:  4. Token ID: 1586 - Probability: 0.0332
+[rank0]:  5. Token ID: 1164 - Probability: 0.0332
+[rank0]:[titan] 2025-09-17 10:38:32,023 - root - INFO - Saving the checkpoint (or staging if async is enabled).
+[rank0]:[titan] 2025-09-17 10:38:32,024 - root - INFO - Saving a model only checkpoint in torch.float32 at last step, step 1.
+[rank0]:[titan] 2025-09-17 10:39:48,897 - root - INFO - [GC] GC collection invoked by checkpointer. 0.00 seconds
+[rank0]:[titan] 2025-09-17 10:39:48,898 - root - INFO - Synchronizing and adjusting timeout for all ProcessGroups to 0:01:40
+[rank0]:[titan] 2025-09-17 10:39:48,900 - root - INFO - Sleeping 2 seconds for other ranks to complete
+[rank0]:[titan] 2025-09-17 10:39:50,900 - root - INFO - Training completed
+[rank0]:[titan] 2025-09-17 10:39:50,900 - root - INFO - Destroying the purge thread.
+[rank0]:[titan] 2025-09-17 10:39:51,464 - root - INFO - Process group destroyed

@@ -34,7 +34,7 @@ def run_huggingface_implementation(args, _):
 
     # We're not using the tokenizer anymore, using fake inputs instead
     # Use local path for model weights if specified, otherwise use model_name
-    model_path = "/data/users/jianiw/dsv3-weights"
+    model_path = args.model_path
     print(f"Loading model from local path: {model_path}")
     start_time = time.time()
 
@@ -105,7 +105,7 @@ def run_huggingface_implementation(args, _):
         attention_mask = torch.ones((1, seq_length), dtype=torch.long, device=device)
 
         # Create inputs dictionary similar to what tokenizer would produce
-        inputs = {"input_ids": tokens, "attention_mask": attention_mask}
+        inputs = {"input_ids": tokens}
 
         # Print input information
         print(f"Fake input token IDs: {inputs['input_ids'][0][:10].cpu().numpy()}...")
@@ -157,7 +157,7 @@ def main():
     parser.add_argument(
         "--num_layers",
         type=int,
-        default=5,  # tailered to 5 layers for 671B model
+        default=4,  # tailered to 5 layers for 671B model
         help="Number of layers to use (0 for all layers)",
     )
 

@@ -398,6 +398,7 @@ class DeepSeekV3Model(nn.Module, ModelProtocol):
         for layer in self.layers.values():
             # Jiani: reset for each layer for simpler comparison
             h = token_emb
+            print_tensor_stats(f"input of layer {layer.layer_id}", h)
             h = layer(h, self.freqs_cis)
             print_tensor_stats(f"output of layer {layer.layer_id}", h)
         h = self.norm(h) if self.norm is not None else h
