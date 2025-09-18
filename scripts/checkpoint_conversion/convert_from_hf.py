@@ -34,10 +34,12 @@ def convert_from_hf(input_dir, output_dir, model_name, model_flavor):
     state_dict = model._get_state_dict()
     # convert empty state dict to hf format so that hf weights can be loaded into it
     hf_state_dict = sd_adapter.to_hf(state_dict)
+    storage_reader = sd_adapter.get_hf_storage_reader(path=input_dir)
     dcp.load(
         hf_state_dict,
-        storage_reader=HuggingFaceStorageReader(path=input_dir),
+        storage_reader=storage_reader,
     )
+    print(f"Storage_reader is: {storage_reader}")
     # convert state dict format back hf->tt and save
     state_dict = sd_adapter.from_hf(hf_state_dict)
     dcp.save(
