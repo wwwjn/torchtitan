@@ -6,6 +6,7 @@
 
 import enum
 import functools
+import json
 import os
 import queue
 import re
@@ -443,8 +444,15 @@ class CheckpointManager:
                 f"dcp.load with HuggingFaceStorageReader completed in {time.monotonic() - begin_load:.2f} seconds"
             )
 
+            # CHECK1: All-gather the hf_state_dict to be full tensor and save specific weights to JSON file
+            self._all_gather_and_save_weights(hf_state_dict, checkpoint_id)
+
             state_dict = self.sd_adapter.from_hf(hf_state_dict)
             self.states[MODEL].load_state_dict(state_dict)
+
+            # CHECK2: All gather the hf_state_dict
+            titan_loaded_state_dict = self.states[MODEL].state_dict()
+            self._all_gather_and_save_weights(titan_loaded_state_dict, checkpoint_id, key="layers.0.feed_forward", file_suffix="check2")
         else:
             dcp.load(state_dict, checkpoint_id=checkpoint_id)
 
@@ -452,6 +460,71 @@ class CheckpointManager:
             # manually call load_state_dict() for the model. Need to fix this.
             if MODEL in self.states:
                 self.states[MODEL].load_state_dict(state_dict)
+
+    def _all_gather_and_save_weights(
+        self, hf_state_dict: dict[str, Any], checkpoint_id: str, key: str = "model.layers.0.mlp", file_suffix: str = "check1"
+    ) -> None:
+        """All-gather the hf_state_dict tensors and save specific weights to JSON file.
+
+        Args:
+            hf_state_dict (dict): The HuggingFace state dict with potentially sharded tensors.
+            checkpoint_id (str): The checkpoint id for creating the output file name.
+        """
+        
+        from torch.distributed.tensor import DTensor        
+        # Filter keys that start with "model.layers.0.mlp"
+        mlp_keys = [
+            k for k in hf_state_dict.keys() if k.startswith(key)
+        ]
+
+        if not mlp_keys:
+            logger.info(
+                "No keys starting with 'model.layers.0.mlp' found in hf_state_dict"
+            )
+            return
+
+        # All-gather the tensors and prepare for JSON serialization
+        gathered_weights = {}
+
+        for key in mlp_keys:
+            tensor = hf_state_dict[key]
+
+            if isinstance(tensor, DTensor):
+                # Check if we're in a distributed environment
+                full_tensor = tensor.full_tensor()
+            else:
+                full_tensor = tensor
+            # Convert tensor to CPU and then to numpy for JSON serialization
+            cpu_tensor = full_tensor.detach().cpu()
+
+            # Convert to list for JSON serialization
+            # Note: For large tensors, this might use a lot of memory
+            gathered_weights[key] = {
+                "shape": list(cpu_tensor.shape),
+                "dtype": str(cpu_tensor.dtype),
+                "data": cpu_tensor.numpy().tolist(),
+            }
+
+        # Save to JSON file
+        if gathered_weights:
+            # Extract step number from checkpoint_id for the filename
+            import re
+
+            step_match = re.search(r"step-(\d+)", checkpoint_id)
+            step_suffix = f"_step_{step_match.group(1)}" if step_match else ""
+
+            output_file = os.path.join(
+                os.path.dirname(checkpoint_id), f"mlp_weights{step_suffix}_{file_suffix}.json"
+            )
+
+            # Only rank 0 should write the file in distributed setting
+            if  dist.get_rank() == 0:
+                try:
+                    with open(output_file, "w") as f:
+                        json.dump(gathered_weights, f, indent=2)
+                    logger.info(f"Saved MLP weights to {output_file}")
+                except Exception as e:
+                    logger.error(f"Failed to save MLP weights to {output_file}: {e}")
 
     @torch.no_grad()
     def save(self, curr_step: int, last_step: bool = False) -> None:

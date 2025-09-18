@@ -11,10 +11,353 @@ Hugging Face implementation for DeepSeek-V3 model inference.
 
 import argparse
 import gc
+import json
 import os
 import time
 
+import numpy as np
+
 import torch
+
+# Global dictionary to store intermediate results
+saved_tensors = {}
+
+def dequantize_from_fp8(
+    weight: torch.Tensor,
+    scale_inv: torch.Tensor,
+    dtype=torch.bfloat16,
+    BLOCK_SIZE: int = 128,
+) -> torch.Tensor:
+    """
+    Dequantize FP8 quantized weights using block-wise scaling.
+    
+    Args:
+        weight: Quantized FP8 weight tensor
+        scale_inv: Inverse scaling factors for each block
+        dtype: Target dtype for dequantized weights
+        BLOCK_SIZE: Size of quantization blocks
+    
+    Returns:
+        Dequantized weight tensor
+    """
+    orig_shape = weight.shape
+    float_weight = weight.float()
+    
+    block_rows = (orig_shape[0] + BLOCK_SIZE - 1) // BLOCK_SIZE
+    block_cols = (orig_shape[1] + BLOCK_SIZE - 1) // BLOCK_SIZE
+    
+    expected_scale_shape = torch.Size((block_rows, block_cols))
+    
+    if scale_inv.shape != expected_scale_shape:
+        raise ValueError(
+            f"scale_inv shape {scale_inv.shape} doesn't match expected shape {expected_scale_shape}"
+        )
+    
+    # NOTE: When processing large models on-the-fly, misalignment between block boundaries
+    # and DTensor local shape partitioning can lead to silent numerical inaccuracies.
+    dequantized = float_weight.detach().clone().to(dtype=dtype)
+    
+    # Apply scaling factors to each block
+    for i in range(block_rows):
+        row_start = i * BLOCK_SIZE
+        row_end = min(row_start + BLOCK_SIZE, orig_shape[0])
+        
+        for j in range(block_cols):
+            col_start = j * BLOCK_SIZE
+            col_end = min(col_start + BLOCK_SIZE, orig_shape[1])
+            
+            block = dequantized[row_start:row_end, col_start:col_end]
+            scale = scale_inv[i, j]
+            block = block * scale
+            
+            # Explicitly convert block to dtype
+            block_converted = block.to(dtype=torch.float32)
+            # Store the dequantized block
+            dequantized[row_start:row_end, col_start:col_end] = block_converted
+    
+    return dequantized
+
+def tensor_to_json_compatible(tensor, state_dict=None):
+    """
+    Convert tensor to JSON-compatible format.
+    If the tensor is quantized (has a corresponding _scale_inv tensor), dequantize it first.
+    
+    Args:
+        tensor: The tensor to convert
+        state_dict: Optional state_dict to look for quantization scale tensors
+    
+    Returns:
+        Dictionary with tensor metadata and statistics
+    """
+    if isinstance(tensor, torch.Tensor):
+        try:
+            # Detach tensor from computation graph and move to CPU
+            tensor_cpu = tensor.detach().cpu()
+            
+            # Check if this tensor is quantized by looking for a corresponding scale_inv tensor
+            is_quantized = False
+            dequantized_tensor = tensor_cpu
+            quantization_info = {}
+            
+            if state_dict is not None:
+                # We need the tensor name to check for quantization, but we don't have it here
+                # This will be handled in the calling function
+                pass
+            
+            # Only save first 10 values to avoid memory issues
+            values = []
+            if dequantized_tensor.numel() > 0:
+                values = dequantized_tensor.flatten().numpy().tolist()
+            
+            result = {
+                "shape": list(tensor.shape),
+                "dtype": str(tensor.dtype),
+                "device": str(tensor.device),
+                "mean": float(dequantized_tensor.mean().item()),
+                "std": float(dequantized_tensor.std().item()),
+                "min": float(dequantized_tensor.min().item()),
+                "max": float(dequantized_tensor.max().item()),
+                "values": values,
+                "is_quantized": is_quantized,
+            }
+            
+            # Add quantization info if available
+            if quantization_info:
+                result.update(quantization_info)
+                
+            return result
+            
+        except Exception as e:
+            # Fallback for tensors that can't be processed
+            return {
+                "shape": list(tensor.shape) if hasattr(tensor, 'shape') else "unknown",
+                "dtype": str(tensor.dtype) if hasattr(tensor, 'dtype') else "unknown",
+                "device": str(tensor.device) if hasattr(tensor, 'device') else "unknown",
+                "error": f"Could not process tensor: {str(e)}",
+                "values": [],
+                "is_quantized": False,
+            }
+    return tensor
+
+def tensor_to_json_compatible_with_dequant(tensor_name, tensor, state_dict):
+    """
+    Convert tensor to JSON-compatible format with dequantization support.
+    
+    Args:
+        tensor_name: Name/key of the tensor in state_dict
+        tensor: The tensor to convert
+        state_dict: Full state_dict to look for quantization scale tensors
+    
+    Returns:
+        Dictionary with tensor metadata and statistics
+    """
+    if isinstance(tensor, torch.Tensor):
+        try:
+            # Detach tensor from computation graph and move to CPU
+            tensor_cpu = tensor.detach().cpu()
+            
+            # Check if this tensor is quantized by looking for a corresponding scale_inv tensor
+            is_quantized = False
+            dequantized_tensor = tensor_cpu
+            quantization_info = {}
+            
+            scale_inv_key = tensor_name + "_scale_inv"
+            if scale_inv_key in state_dict:
+                print(f"Found quantized tensor: {tensor_name}")
+                is_quantized = True
+                scale_inv = state_dict[scale_inv_key].detach().cpu()
+                
+                try:
+                    # Dequantize the tensor
+                    dequantized_tensor = dequantize_from_fp8(
+                        tensor_cpu, scale_inv, dtype=torch.float32
+                    )
+                      
+                    # For Float8 tensors, we need to convert to a supported dtype first to compute statistics
+                    try:
+                        # Convert to float32 for statistics computation
+                        tensor_for_stats = tensor_cpu.float()
+                        quantization_info = {
+                            "quantization_blocks": list(scale_inv.shape),
+                            "original_mean": float(tensor_for_stats.mean().item()),
+                            "original_std": float(tensor_for_stats.std().item()),
+                            "original_min": float(tensor_for_stats.min().item()),
+                            "original_max": float(tensor_for_stats.max().item()),
+                        }
+                    except Exception as stats_error:
+                        print(f"Could not compute original tensor statistics for {tensor_name}: {stats_error}")
+                        quantization_info = {
+                            "quantization_blocks": list(scale_inv.shape),
+                            "original_stats_error": str(stats_error),
+                        }
+                      
+                    print(f"Successfully dequantized {tensor_name}")
+                except Exception as dequant_error:
+                    print(f"Failed to dequantize {tensor_name}: {dequant_error}")
+                    # Fall back to using original quantized tensor
+                    dequantized_tensor = tensor_cpu
+                    quantization_info["dequantization_error"] = str(dequant_error)
+            
+            # Only save first 10 values to avoid memory issues
+            values = []
+            if dequantized_tensor.numel() > 0:
+                values = dequantized_tensor.flatten().numpy().tolist()
+            
+            result = {
+                "shape": list(tensor.shape),
+                "dtype": str(tensor.dtype),
+                "device": str(tensor.device),
+                "mean": float(dequantized_tensor.mean().item()),
+                "std": float(dequantized_tensor.std().item()),
+                "min": float(dequantized_tensor.min().item()),
+                "max": float(dequantized_tensor.max().item()),
+                "values": values,
+                "is_quantized": is_quantized,
+            }
+            
+            # Add quantization info if available
+            if quantization_info:
+                result.update(quantization_info)
+                
+            return result
+            
+        except Exception as e:
+            # Fallback for tensors that can't be processed
+            return {
+                "shape": list(tensor.shape) if hasattr(tensor, 'shape') else "unknown",
+                "dtype": str(tensor.dtype) if hasattr(tensor, 'dtype') else "unknown",
+                "device": str(tensor.device) if hasattr(tensor, 'device') else "unknown",
+                "error": f"Could not process tensor: {str(e)}",
+                "value": [],
+                "is_quantized": False,
+            }
+    return tensor
+
+
+def save_model_state_dict_subset(model, save_path):
+    """Save subset of model state_dict to JSON file with dequantization support."""
+    state_dict = model.state_dict()
+    filtered_dict = {}
+    
+    print(f"Processing model state_dict with {len(state_dict)} total keys")
+
+    # Filter keys that start with "model.layers.0.mlp"
+    mlp_keys = [key for key in state_dict.keys() if key.startswith("model.layers.0.mlp")]
+    print(f"Found {len(mlp_keys)} MLP keys in layer 0:")
+    
+    for key in mlp_keys:
+        print(f"  Processing: {key}")
+        # Skip scale_inv keys as they are processed with their corresponding weight tensors
+        if key.endswith("_scale_inv"):
+            print(f"    Skipping scale_inv key: {key}")
+            continue
+        
+        value = state_dict[key]
+        # Use the dequantization-aware conversion function
+        filtered_dict[key] = tensor_to_json_compatible_with_dequant(key, value, state_dict)
+
+    # Add intermediate results from global dictionary
+    if saved_tensors:
+        filtered_dict["intermediate_results"] = saved_tensors
+
+    # Save to JSON
+    with open(save_path, "w") as f:
+        json.dump(filtered_dict, f, indent=2)
+
+    print(f"Saved tensor data to {save_path}")
+    print(f"Saved {len(filtered_dict)} tensor entries")
+    
+    # Print summary of quantized vs non-quantized tensors
+    quantized_count = sum(1 for v in filtered_dict.values() 
+                         if isinstance(v, dict) and v.get("is_quantized", False))
+    non_quantized_count = len(filtered_dict) - quantized_count - (1 if "intermediate_results" in filtered_dict else 0)
+    print(f"Summary: {quantized_count} quantized tensors, {non_quantized_count} non-quantized tensors")
+
+
+def hook_intermediate_results(model):
+    """Add hooks to capture intermediate results."""
+
+    def capture_layer_outputs(module, input, output):
+        """Hook to capture layer outputs at different stages"""
+        if hasattr(output, "__len__") and len(output) > 0:
+            hidden_states = output[0]  # First element is usually hidden_states
+            # This captures the final output of the decoder layer (after x+mlp)
+            saved_tensors["hidden_states_after_x_plus_mlp"] = tensor_to_json_compatible(
+                hidden_states
+            )
+
+    def capture_self_attention_output(module, input, output):
+        """Hook to capture self-attention output"""
+        if hasattr(output, "__len__") and len(output) > 0:
+            attn_output = output[0]  # Attention output
+            saved_tensors["self_attention_output"] = tensor_to_json_compatible(
+                attn_output
+            )
+
+    def capture_mlp_output(module, input, output):
+        """Hook to capture MLP output"""
+        if isinstance(output, torch.Tensor):
+            saved_tensors["mlp_output"] = tensor_to_json_compatible(output)
+
+    # Register hooks on the first decoder layer (layer 0)
+    if (
+        hasattr(model, "model")
+        and hasattr(model.model, "layers")
+        and len(model.model.layers) > 0
+    ):
+        first_layer = model.model.layers[0]
+
+        # Hook the entire decoder layer to capture final output (after x+mlp)
+        first_layer.register_forward_hook(capture_layer_outputs)
+
+        # Hook the self-attention module to capture attention output
+        if hasattr(first_layer, "self_attn"):
+            first_layer.self_attn.register_forward_hook(capture_self_attention_output)
+
+        # Hook the MLP module to capture MLP output
+        if hasattr(first_layer, "mlp"):
+            first_layer.mlp.register_forward_hook(capture_mlp_output)
+
+    # # Also try to monkey patch the modeling_deepseek print_tensor_stats function to capture data
+    # try:
+    #     import os
+
+    #     # Import the modeling module to patch it
+    #     import sys
+
+    #     model_path = "/data/users/jianiw/model/DeepSeek-V3.1-Base"
+    #     if model_path not in sys.path:
+    #         sys.path.insert(0, model_path)
+
+    #     # Try to import and patch the print_tensor_stats function
+    #     try:
+    #         import modeling_deepseek
+
+    #         original_print_tensor_stats = modeling_deepseek.print_tensor_stats
+
+    #         def patched_print_tensor_stats(name, tensor):
+    #             # Call original function
+    #             original_print_tensor_stats(name, tensor)
+
+    #             # Save specific tensors we're interested in
+    #             if "hidden_states after x + self attention" in name:
+    #                 saved_tensors["hidden_states_after_x_plus_self_attention"] = (
+    #                     tensor_to_json_compatible(tensor)
+    #                 )
+    #             elif "hidden_states after x+mlp" in name:
+    #                 saved_tensors["hidden_states_after_x_plus_mlp"] = (
+    #                     tensor_to_json_compatible(tensor)
+    #                 )
+
+    #         # Replace the function
+    #         modeling_deepseek.print_tensor_stats = patched_print_tensor_stats
+    #         print("Successfully patched print_tensor_stats function")
+
+    #     except ImportError:
+    #         print("Could not import modeling_deepseek module for patching")
+
+    # except Exception as e:
+    #     print(f"Error setting up patching: {e}")
 
 
 def print_gpu_memory_usage(message=""):
@@ -75,7 +418,7 @@ def run_huggingface_implementation(args, _):
         trust_remote_code=True,
         # Disable features that can cause issues with device mapping
         attn_implementation="eager",  # Use standard attention instead of flash attention
-        quantization_config=quantization_config,
+        quantization_config=None,
         local_files_only=True,  # Only use local files, don't fetch from cache
         use_auth_token=False,  # Don't try to authenticate with HF
     )
@@ -86,6 +429,11 @@ def run_huggingface_implementation(args, _):
     # Get the device where the model is loaded
     device = next(model.parameters()).device
     print(f"Model is on device: {device}")
+
+    # Set up hooks to capture intermediate results if JSON saving is enabled
+    if args.save_tensors_json:
+        print("Setting up hooks to capture intermediate results...")
+        hook_intermediate_results(model)
 
     # Create fake input directly on the correct device
     print("\nCreating fake input with the same shape as tokenized input")
@@ -151,13 +499,18 @@ def run_huggingface_implementation(args, _):
     print(f"- Tokens per second: {inputs['input_ids'].shape[1] / forward_time:.2f}")
     print_gpu_memory_usage("After forward pass")
 
+    # Save tensors to JSON if requested
+    if args.save_tensors_json:
+        print(f"\nSaving tensors to JSON file: {args.save_tensors_json}")
+        save_model_state_dict_subset(model, args.save_tensors_json)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Load and test DeepSeek-V3 model")
     parser.add_argument(
         "--num_layers",
         type=int,
-        default=4,  # tailered to 5 layers for 671B model
+        default=4,  # tailered to 1 layers for 671B model
         help="Number of layers to use (0 for all layers)",
     )
 
@@ -167,6 +520,14 @@ def main():
         type=str,
         default="/data/users/jianiw/model/DeepSeek-V3.1-Base",
         help="Hugging Face model name or path",
+    )
+
+    # JSON saving option
+    parser.add_argument(
+        "--save_tensors_json",
+        type=str,
+        default=None,
+        help="Path to save intermediate tensors to JSON file",
     )
 
     args = parser.parse_args()
