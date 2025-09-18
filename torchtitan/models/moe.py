@@ -376,6 +376,13 @@ class MoE(nn.Module):
         Returns:
             out (torch.Tensor): Output tensor with shape ``(bs, slen, dim)``.
         """
+        # random generate a tensor Shape: torch.Size([1, 2048, 7168]),
+        torch.manual_seed(42)
+        # Randomly generate a tensor with shape [1, 2048, 7168]
+        random_tensor = torch.randn(1, 2048, 7168, dtype=x.dtype, device=x.device)
+        print_tensor_stats("Randomized input tensor of MoE", random_tensor)
+        x = random_tensor
+        
         bs, slen, dim = x.shape
         
         print_tensor_stats("input of MoE: ", x)

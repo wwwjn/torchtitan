@@ -165,7 +165,7 @@ def main():
     parser.add_argument(
         "--model_path",
         type=str,
-        default="/home/jianiw/tmp/mffuse/deepseek-v3/DeepSeek-V3.1-Base",
+        default="/data/users/jianiw/model/DeepSeek-V3.1-Base",
         help="Hugging Face model name or path",
     )
 

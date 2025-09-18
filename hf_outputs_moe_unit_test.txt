@@ -1,15 +1,15 @@
 /home/jianiw/.conda/envs/pytorch-3.12/lib/python3.12/site-packages/transformers/models/auto/auto_factory.py:492: FutureWarning: The `use_auth_token` argument is deprecated and will be removed in v5 of Transformers. Please use `token` instead.
   warnings.warn(
-2025-09-17 20:15:17.888233: I tensorflow/core/util/port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
-2025-09-17 20:15:17.900173: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:467] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
+2025-09-17 20:47:25.922860: I tensorflow/core/util/port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+2025-09-17 20:47:25.934506: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:467] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
 WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
-E0000 00:00:1758165317.912717  992711 cuda_dnn.cc:8579] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
-E0000 00:00:1758165317.916420  992711 cuda_blas.cc:1407] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
-W0000 00:00:1758165317.927457  992711 computation_placer.cc:177] computation placer already registered. Please check linkage and avoid linking the same target more than once.
-W0000 00:00:1758165317.927495  992711 computation_placer.cc:177] computation placer already registered. Please check linkage and avoid linking the same target more than once.
-W0000 00:00:1758165317.927499  992711 computation_placer.cc:177] computation placer already registered. Please check linkage and avoid linking the same target more than once.
-W0000 00:00:1758165317.927502  992711 computation_placer.cc:177] computation placer already registered. Please check linkage and avoid linking the same target more than once.
-2025-09-17 20:15:17.930789: I tensorflow/core/platform/cpu_feature_guard.cc:210] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
+E0000 00:00:1758167245.946347 3495659 cuda_dnn.cc:8579] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
+E0000 00:00:1758167245.949945 3495659 cuda_blas.cc:1407] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
+W0000 00:00:1758167245.961427 3495659 computation_placer.cc:177] computation placer already registered. Please check linkage and avoid linking the same target more than once.
+W0000 00:00:1758167245.961473 3495659 computation_placer.cc:177] computation placer already registered. Please check linkage and avoid linking the same target more than once.
+W0000 00:00:1758167245.961478 3495659 computation_placer.cc:177] computation placer already registered. Please check linkage and avoid linking the same target more than once.
+W0000 00:00:1758167245.961481 3495659 computation_placer.cc:177] computation placer already registered. Please check linkage and avoid linking the same target more than once.
+2025-09-17 20:47:25.964723: I tensorflow/core/platform/cpu_feature_guard.cc:210] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
 To enable the following instructions: AVX2 AVX512F AVX512_VNNI AVX512_BF16 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.
 /home/jianiw/.conda/envs/pytorch-3.12/lib/python3.12/site-packages/transformers/quantizers/auto.py:226: UserWarning: You passed `quantization_config` or equivalent parameters to `from_pretrained` but the model you're loading already has a `quantization_config` attribute. The `quantization_config` from the model will be used.
   warnings.warn(warning_msg)
@@ -87,8 +87,8 @@ Config of Deepseek: DeepseekV3Config {
 }
 
 In hub index_filename:  /data/users/jianiw/model/DeepSeek-V3.1-Base/model.safetensors.index.json
-Loading checkpoint shards:   0%|          | 0/5 [00:00<?, ?it/s]Loading checkpoint shards:  20%|██        | 1/5 [00:00<00:03,  1.09it/s]Loading checkpoint shards:  40%|████      | 2/5 [00:01<00:02,  1.10it/s]Loading checkpoint shards:  60%|██████    | 3/5 [00:02<00:01,  1.13it/s]Loading checkpoint shards:  80%|████████  | 4/5 [00:02<00:00,  1.55it/s]Loading checkpoint shards: 100%|██████████| 5/5 [00:03<00:00,  1.89it/s]Loading checkpoint shards: 100%|██████████| 5/5 [00:03<00:00,  1.52it/s]
-Model loaded in 12.05 seconds
+Loading checkpoint shards:   0%|          | 0/5 [00:00<?, ?it/s]Loading checkpoint shards:  20%|██        | 1/5 [00:00<00:03,  1.06it/s]Loading checkpoint shards:  40%|████      | 2/5 [00:01<00:02,  1.12it/s]Loading checkpoint shards:  60%|██████    | 3/5 [00:02<00:01,  1.14it/s]Loading checkpoint shards:  80%|████████  | 4/5 [00:02<00:00,  1.56it/s]Loading checkpoint shards: 100%|██████████| 5/5 [00:03<00:00,  1.89it/s]Loading checkpoint shards: 100%|██████████| 5/5 [00:03<00:00,  1.53it/s]
+Model loaded in 11.23 seconds
 GPU Memory (After loading model): Allocated: 15.96 GB, Reserved: 15.96 GB
 Model is on device: cuda:0
 
@@ -192,18 +192,19 @@ attn_output before reshape:  - Shape: torch.Size([1, 128, 2048, 128]) Mean: 0.00
 attn_output after o_proj:  - Shape: torch.Size([1, 2048, 7168]) Mean: 0.000063, Min: -0.384766, Max: 0.367188, Std: 0.006714, First 10 values: [0.0181884765625, -0.0478515625, -0.0458984375, -0.01153564453125, 0.05908203125, 0.0228271484375, -0.06640625, 0.00604248046875, -0.01904296875, 0.060546875]
 hidden_states after x + self attention - Shape: torch.Size([1, 2048, 7168]) Mean: 0.000084, Min: -0.843750, Max: 0.656250, Std: 0.040527, First 10 values: [-0.0123291015625, -0.07958984375, -0.0546875, -0.011474609375, -0.0341796875, 0.0189208984375, -0.09033203125, -0.001068115234375, 0.034423828125, 0.0458984375]
 hidden_states after post attention layernorm - Shape: torch.Size([1, 2048, 7168]) Mean: 0.000172, Min: -2.156250, Max: 2.546875, Std: 0.117188, First 10 values: [-0.016845703125, -0.080078125, -0.0654296875, -0.01953125, -0.0771484375, 0.05859375, -0.193359375, -0.0023193359375, 0.0478515625, 0.0225830078125]
-routed input - Shape: torch.Size([2048, 7168]) Mean: 0.000172, Min: -2.156250, Max: 2.546875, Std: 0.117188, First 10 values: [-0.016845703125, -0.080078125, -0.0654296875, -0.01953125, -0.0771484375, 0.05859375, -0.193359375, -0.0023193359375, 0.0478515625, 0.0225830078125]
-routed output - Shape: torch.Size([1, 2048, 7168]) Mean: -0.000002, Min: -2.562500, Max: 2.578125, Std: 0.004578, First 10 values: [-0.00188446044921875, 0.00010013580322265625, -0.006134033203125, -0.007171630859375, -0.00372314453125, 0.0064697265625, 0.017333984375, 0.006561279296875, 0.01470947265625, -0.004241943359375]
-output of shared experts:  - Shape: torch.Size([1, 2048, 7168]) Mean: -0.000022, Min: -5.093750, Max: 6.000000, Std: 0.050537, First 10 values: [0.001800537109375, -0.0040283203125, -0.0025482177734375, -0.00274658203125, -0.00115966796875, -0.0036468505859375, -0.00616455078125, -0.00147247314453125, 0.004608154296875, 0.00537109375]
-moe output - Shape: torch.Size([1, 2048, 7168]) Mean: -0.000024, Min: -5.156250, Max: 5.875000, Std: 0.051025, First 10 values: [-8.392333984375e-05, -0.003936767578125, -0.0086669921875, -0.0098876953125, -0.0048828125, 0.0028228759765625, 0.01116943359375, 0.005096435546875, 0.019287109375, 0.001129150390625]
-hidden_states after x+mlp - Shape: torch.Size([1, 2048, 7168]) Mean: 0.000060, Min: -5.156250, Max: 5.875000, Std: 0.061035, First 10 values: [-0.01239013671875, -0.08349609375, -0.0634765625, -0.0213623046875, -0.0390625, 0.021728515625, -0.0791015625, 0.0040283203125, 0.0537109375, 0.047119140625]
-layer {i} output - Shape: torch.Size([1, 2048, 7168]) Mean: 0.000060, Min: -5.156250, Max: 5.875000, Std: 0.061035, First 10 values: [-0.01239013671875, -0.08349609375, -0.0634765625, -0.0213623046875, -0.0390625, 0.021728515625, -0.0791015625, 0.0040283203125, 0.0537109375, 0.047119140625]
+Randomized input tensor of MoE - Shape: torch.Size([1, 2048, 7168]) Mean: -0.000013, Min: -5.312500, Max: 5.375000, Std: 1.000000, First 10 values: [0.1943359375, 2.15625, -0.171875, 0.84765625, -1.921875, 0.65234375, -0.6484375, -0.81640625, 0.52734375, -1.2734375]
+routed input - Shape: torch.Size([2048, 7168]) Mean: -0.000013, Min: -5.312500, Max: 5.375000, Std: 1.000000, First 10 values: [0.1943359375, 2.15625, -0.171875, 0.84765625, -1.921875, 0.65234375, -0.6484375, -0.81640625, 0.52734375, -1.2734375]
+routed output - Shape: torch.Size([1, 2048, 7168]) Mean: -0.000096, Min: -3.718750, Max: 2.453125, Std: 0.056641, First 10 values: [-0.006744384765625, -0.07275390625, 0.044921875, 0.03955078125, -0.0159912109375, -0.08935546875, 0.0284423828125, 0.05078125, 0.03271484375, -0.03271484375]
+output of shared experts:  - Shape: torch.Size([1, 2048, 7168]) Mean: 0.000633, Min: -79.000000, Max: 65.000000, Std: 0.980469, First 10 values: [-0.4296875, 0.23046875, 0.25, 0.515625, 0.373046875, -0.333984375, -2.09375, -0.75, 0.40625, 0.1318359375]
+moe output - Shape: torch.Size([1, 2048, 7168]) Mean: 0.000538, Min: -79.000000, Max: 64.500000, Std: 0.980469, First 10 values: [-0.435546875, 0.158203125, 0.294921875, 0.5546875, 0.357421875, -0.423828125, -2.0625, -0.69921875, 0.439453125, 0.09912109375]
+hidden_states after x+mlp - Shape: torch.Size([1, 2048, 7168]) Mean: 0.000622, Min: -79.000000, Max: 64.500000, Std: 0.984375, First 10 values: [-0.447265625, 0.07861328125, 0.240234375, 0.54296875, 0.32421875, -0.404296875, -2.15625, -0.69921875, 0.474609375, 0.14453125]
+layer {i} output - Shape: torch.Size([1, 2048, 7168]) Mean: 0.000622, Min: -79.000000, Max: 64.500000, Std: 0.984375, First 10 values: [-0.447265625, 0.07861328125, 0.240234375, 0.54296875, 0.32421875, -0.404296875, -2.15625, -0.69921875, 0.474609375, 0.14453125]
 
-Next token logits : tensor([[-0.8711,  2.7188, -0.6250,  ..., -0.3887, -0.4316, -0.2617]],
+Next token logits : tensor([[ 1.6719, -1.2891,  0.0908,  ..., -0.0840,  0.0771,  0.3574]],
        device='cuda:0')
 
-Next token probabilities: tensor([[8.9108e-08, 3.2283e-06, 1.1397e-07,  ..., 1.4436e-07, 1.3828e-07,
-         1.6390e-07]], device='cuda:0')
+Next token probabilities: tensor([[9.0420e-07, 4.6811e-08, 1.8605e-07,  ..., 1.5621e-07, 1.8352e-07,
+         2.4289e-07]], device='cuda:0')
 
 Forward Pass Results:
 - Output logits shape: torch.Size([1, 2048, 129280])
@@ -211,14 +212,14 @@ Forward Pass Results:
 - Vocabulary size: 129280
 
 Top 5 predicted next tokens (showing IDs only since we're not using tokenizer):
-  1. Token ID: 66500 - Probability: 0.0831
-  2. Token ID: 1586 - Probability: 0.0369
-  3. Token ID: 66664 - Probability: 0.0287
-  4. Token ID: 1164 - Probability: 0.0224
-  5. Token ID: 67361 - Probability: 0.0185
+  1. Token ID: 21308 - Probability: 0.0277
+  2. Token ID: 81405 - Probability: 0.0277
+  3. Token ID: 28926 - Probability: 0.0190
+  4. Token ID: 28508 - Probability: 0.0168
+  5. Token ID: 41870 - Probability: 0.0115
 
 Forward pass stats:
-- Time: 1.6981 seconds
+- Time: 0.9787 seconds
 - Input tokens: 2048
-- Tokens per second: 1206.06
+- Tokens per second: 2092.47
 GPU Memory (After forward pass): Allocated: 20.88 GB, Reserved: 27.77 GB
