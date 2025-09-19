@@ -1,0 +1,88 @@
++ NGPU=8
++ export LOG_RANK=0
++ LOG_RANK=0
++ CONFIG_FILE=./torchtitan/models/deepseek_v3/train_configs/deepseek_v3_671b.toml
++ TRAIN_FILE=torchtitan.train
++ TORCHFT_LIGHTHOUSE=http://localhost:29510
++ PYTORCH_ALLOC_CONF=expandable_segments:True
++ TORCHFT_LIGHTHOUSE=http://localhost:29510
++ torchrun --nproc_per_node=8 --rdzv_backend c10d --rdzv_endpoint=localhost:0 --local-ranks-filter 0 --role rank --tee 3 -m torchtitan.train --job.config_file ./torchtitan/models/deepseek_v3/train_configs/deepseek_v3_671b.toml
+W0918 10:46:10.893000 1475399 site-packages/torch/distributed/run.py:815] 
+W0918 10:46:10.893000 1475399 site-packages/torch/distributed/run.py:815] *****************************************
+W0918 10:46:10.893000 1475399 site-packages/torch/distributed/run.py:815] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0918 10:46:10.893000 1475399 site-packages/torch/distributed/run.py:815] *****************************************
+[rank0]:2025-09-18 10:46:21.543047: I tensorflow/core/util/port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+[rank0]:2025-09-18 10:46:21.555274: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:467] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
+[rank0]:WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+[rank0]:E0000 00:00:1758217581.566686 1478040 cuda_dnn.cc:8579] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
+[rank0]:E0000 00:00:1758217581.570437 1478040 cuda_blas.cc:1407] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
+[rank0]:W0000 00:00:1758217581.581346 1478040 computation_placer.cc:177] computation placer already registered. Please check linkage and avoid linking the same target more than once.
+[rank0]:W0000 00:00:1758217581.581362 1478040 computation_placer.cc:177] computation placer already registered. Please check linkage and avoid linking the same target more than once.
+[rank0]:W0000 00:00:1758217581.581365 1478040 computation_placer.cc:177] computation placer already registered. Please check linkage and avoid linking the same target more than once.
+[rank0]:W0000 00:00:1758217581.581367 1478040 computation_placer.cc:177] computation placer already registered. Please check linkage and avoid linking the same target more than once.
+[rank0]:2025-09-18 10:46:21.584629: I tensorflow/core/platform/cpu_feature_guard.cc:210] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
+[rank0]:To enable the following instructions: AVX2 AVX512F AVX512_VNNI AVX512_BF16 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.
+[rank0]:[titan] 2025-09-18 10:46:24,318 - root - INFO - Starting job: DeepSeek-V3 671B model training
+[rank0]:[titan] 2025-09-18 10:46:26,790 - root - WARNING - ENV[TORCH_NCCL_ASYNC_ERROR_HANDLING] = 1 will be overridden to 3 based on job config
+[rank0]:[titan] 2025-09-18 10:46:26,793 - root - INFO - Building 1-D device mesh with ['dp_shard'], [8]
+[rank0]:[titan] 2025-09-18 10:46:26,797 - root - INFO - [GC] Initial GC collection 0.00 seconds
+[rank0]:NCCL version 2.27.5+cuda12.9
+[rank0]:[titan] 2025-09-18 10:46:31,673 - root - INFO - Loading tokenizer from tokenizer.json
+[rank0]:[titan] 2025-09-18 10:46:31,886 - root - INFO - Preparing c4 dataset from allenai/c4
+[rank0]:[titan] 2025-09-18 10:46:36,663 - root - INFO - Building deepseek_v3 671B with DeepSeekV3ModelArgs(_enforced='This field is used to enforce all fields have defaults.', max_batch_size=8, max_seq_len=2048, vocab_size=129280, dim=7168, inter_dim=18432, moe_inter_dim=2048, n_layers=1, n_dense_layers=1, n_heads=128, norm_eps=1e-05, moe_args=MoEArgs(num_experts=256, num_shared_experts=1, score_func='sigmoid', route_norm=True, route_scale=2.5, score_before_experts=False, top_k=8, use_grouped_mm=True, load_balance_coeff=0.001), n_expert_groups=8, n_limited_groups=4, q_lora_rank=1536, kv_lora_rank=512, qk_nope_head_dim=128, qk_rope_head_dim=64, v_head_dim=128, use_flex_attn=False, attn_mask_type='causal', original_seq_len=4096, rope_theta=10000.0, rope_factor=40, beta_fast=32, beta_slow=1, mscale=1.0, hf_weight_quantized=True)
+[rank0]:[titan] 2025-09-18 10:46:36,675 - root - INFO - CUDA capacity: NVIDIA H100 with 94.99GiB memory
+[rank0]:[titan] 2025-09-18 10:46:36,694 - root - INFO - Total parameter count: dense 2,436,848,640, sparse 0, active 2,436,848,640
+[rank0]:[titan] 2025-09-18 10:46:36,694 - root - INFO - [34mModel deepseek_v3 671B [31msize: 2,436,848,640 total parameters[39m
+[rank0]:[titan] 2025-09-18 10:46:36,694 - root - INFO - Applied full activation checkpointing to the model
+[rank0]:[titan] 2025-09-18 10:46:36,710 - root - INFO - Applied FSDP to the model
+[rank0]:[titan] 2025-09-18 10:46:36,833 - root - INFO - Peak FLOPS used for computing MFU: 9.890e+14
+[rank0]:[titan] 2025-09-18 10:46:36,833 - root - INFO - CUDA memory usage for model: 1.14GiB(1.20%)
+[rank0]:[titan] 2025-09-18 10:46:36,833 - root - WARNING - Warmup steps (2000) exceed total training steps (1). Adjusting warmup steps to 1.
+[rank0]:[titan] 2025-09-18 10:46:36,833 - root - WARNING - Warmup (1) + decay (1) steps exceed total training steps (1). Adjusting decay steps to 0.
+[rank0]:[titan] 2025-09-18 10:46:36,834 - root - WARNING - model.safetensors.index.json not found at hf_assets_path: ./assets/hf/DeepSeek-V3.1-Base/model.safetensors.index.json.                     Defaulting to saving a single safetensors file if checkpoint is saved in HF format
+[rank0]:[titan] 2025-09-18 10:46:36,836 - root - INFO - Checkpointing active. Checkpoints will be loaded from and saved to ./outputs/checkpoint
+[rank0]:[titan] 2025-09-18 10:46:36,836 - root - INFO - Mixed precision training is handled by fully_shard
+[rank0]:[titan] 2025-09-18 10:46:36,836 - root - INFO - Trainer is initialized with local batch size 1, global batch size 8, gradient accumulation steps 1, sequence length 2048, total steps 1 (warmup 2000)
+[rank0]:[titan] 2025-09-18 10:46:36,836 - root - INFO - Loading the checkpoint from /data/users/jianiw/torchtitan/outputs/checkpoint-dsv3-cpu.
+[rank0]:[titan] 2025-09-18 10:46:45,061 - root - INFO - [GC] GC collection for checkpoint loading. 0.01 seconds
+[rank0]:[titan] 2025-09-18 10:46:45,061 - root - INFO - Finished loading the checkpoint in 8.23 seconds.
+[rank0]:[titan] 2025-09-18 10:46:45,061 - root - INFO - Training starts at step 1
+[rank0]:
+[rank0]:Creating fake input with the same shape as tokenized input
+[rank0]:Fake input token IDs: [42643  2409 23798 23250 10593  6047  8142 29276  6908 14721]...
+[rank0]:Fake input shape: torch.Size([1, 2048])
+[rank0]:Input tensors device: cuda:0
+[rank0]:
+[rank0]:Running single forward pass...
+[rank0]:input of layer 0 - Shape: torch.Size([1, 2048, 7168]) Mean: 0.000022, Min: -0.863281, Max: 0.644531, Std: 0.040527, First 10 values: [-0.030517578125, -0.03173828125, -0.0089111328125, 4.9591064453125e-05, -0.09326171875, -0.003875732421875, -0.0240478515625, -0.007110595703125, 0.053466796875, -0.0145263671875]
+[rank0]:output of layer 0 - Shape: torch.Size([1, 2048, 7168]) Mean: -0.000058, Min: -0.886719, Max: 1.875000, Std: 0.047607, First 10 values: [-0.05517578125, -0.0301513671875, -0.00152587890625, -0.034912109375, -0.078125, 0.0047607421875, -0.036865234375, -0.023193359375, 0.044921875, -0.025146484375]
+[rank0]:
+[rank0]:Forward Pass Results:
+[rank0]:- Output logits shape: torch.Size([1, 2048, 129280])
+[rank0]:- Sequence length: 2048
+[rank0]:- Vocabulary size: 129280
+[rank0]:
+[rank0]:Next token logits : tensor([[-0.7656,  0.3320, -0.3340,  ..., -0.1436, -0.2451, -0.0381]],
+[rank0]:       device='cuda:0', dtype=torch.bfloat16, grad_fn=<SelectBackward0>)
+[rank0]:
+[rank0]:Next token probabilities: tensor([[1.2480e-07, 3.7439e-07, 1.9278e-07,  ..., 2.3283e-07, 2.1048e-07,
+[rank0]:         2.5891e-07]], device='cuda:0', dtype=torch.bfloat16,
+[rank0]:       grad_fn=<SoftmaxBackward0>)
+[rank0]:Top K values:  tensor([[0.0302, 0.0194, 0.0183, 0.0161, 0.0134]], device='cuda:0',
+[rank0]:       dtype=torch.bfloat16, grad_fn=<TopkBackward0>)
+[rank0]:Top K indices:  tensor([[ 2015, 21507, 66500, 20586,  1586]], device='cuda:0')
+[rank0]:
+[rank0]:Top 5 predicted next tokens (showing IDs only since we're not using tokenizer):
+[rank0]:  1. Token ID: 2015 - Probability: 0.0302
+[rank0]:  2. Token ID: 21507 - Probability: 0.0194
+[rank0]:  3. Token ID: 66500 - Probability: 0.0183
+[rank0]:  4. Token ID: 20586 - Probability: 0.0161
+[rank0]:  5. Token ID: 1586 - Probability: 0.0134
+[rank0]:[titan] 2025-09-18 10:46:45,469 - root - INFO - Saving the checkpoint (or staging if async is enabled).
+[rank0]:[titan] 2025-09-18 10:46:45,469 - root - INFO - Saving a model only checkpoint in torch.float32 at last step, step 1.
+[rank0]:[titan] 2025-09-18 10:46:58,853 - root - INFO - [GC] GC collection invoked by checkpointer. 0.00 seconds
+[rank0]:[titan] 2025-09-18 10:46:58,853 - root - INFO - Synchronizing and adjusting timeout for all ProcessGroups to 0:01:40
+[rank0]:[titan] 2025-09-18 10:46:58,861 - root - INFO - Sleeping 2 seconds for other ranks to complete
+[rank0]:[titan] 2025-09-18 10:47:00,861 - root - INFO - Training completed
+[rank0]:[titan] 2025-09-18 10:47:00,861 - root - INFO - Destroying the purge thread.
+[rank0]:[titan] 2025-09-18 10:47:01,497 - root - INFO - Process group destroyed
