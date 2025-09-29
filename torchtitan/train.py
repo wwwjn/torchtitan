@@ -409,6 +409,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     def forward_backward_step(
         self, input_dict: dict[str, torch.Tensor], labels: torch.Tensor
     ) -> torch.Tensor:
+
+        # torch.autograd.set_detect_anomaly(True)
+        
         model_parts = self.model_parts
         parallel_dims = self.parallel_dims
 
@@ -473,6 +476,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     loss = self.loss_fn(pred, labels)
                 # need to free pred before bwd to avoid peaking memory
                 del pred
+                # with torch.autograd.detect_anomaly():
                 loss.backward()
 
         return loss
