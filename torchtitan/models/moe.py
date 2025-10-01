@@ -6,6 +6,8 @@
 
 from dataclasses import dataclass
 from typing import Literal
+import json
+import os
 
 import torch
 import torch.nn.functional as F
@@ -108,18 +110,65 @@ def _run_experts_grouped_mm(
     w3: torch.Tensor,
     x: torch.Tensor,
     num_tokens_per_expert: torch.Tensor,
+    layer_id: int = -1,
 ) -> torch.Tensor:
+    
     offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+    
     # grouped mm between a 2D tensor and a 3D tensor
     assert x.dim() == 2
 
+    m = torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets)
     h = F.silu(
-        torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets)
+        m
     )
-    h = h * torch._grouped_mm(
+    t = torch._grouped_mm(
         x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets
     )
-    out = torch._grouped_mm(h, w2.bfloat16().transpose(-2, -1), offs=offsets).type_as(x)
+
+    h = h * t
+    w2 = w2.bfloat16().transpose(-2, -1)
+    
+    out = torch._grouped_mm(h, w2, offs=offsets).type_as(x)
+    
+    # Only save for the last layer (layer 26, since DeepSeek has 27 layers 0-26)
+    print(f"[DEBUG] layer_id: {layer_id}")
+    if layer_id == 26:  # Changed from 26 to 23 to catch more layers for debugging
+        # Save inputs to JSON during forward pass
+        save_data = {
+            "layer_id": layer_id,
+            "forward_inputs": {
+                "h_data": h.detach().cpu().float().tolist(),  # Full tensor as list
+                "w2_data": w2.detach().cpu().float().tolist(),  # Full tensor as list
+                "offsets": offsets.tolist() if offsets is not None else None,
+            }
+        }
+        
+        # Save to file
+        os.makedirs("/tmp/grouped_mm_debug", exist_ok=True)
+        with open(f"/tmp/grouped_mm_debug/grouped_mm_data_layer_{layer_id}.json", "w") as f:
+            json.dump(save_data, f, indent=2)
+        
+        print(f"[GROUPED_MM FORWARD] Saved input data for layer {layer_id}")
+        
+        # Register backward hook to save gradient information
+        def save_gradient_hook(grad):
+            print(f"[GROUPED_MM BACKWARD] Saving output gradient for layer {layer_id}")
+            grad_data = {
+                "layer_id": layer_id,
+                "backward_gradient": {
+                    "grad_data": grad.detach().cpu().float().tolist(),  # Full tensor as list
+                }
+            }
+            
+            # Save gradient data
+            with open(f"/tmp/grouped_mm_debug/grouped_mm_gradient_layer_{layer_id}.json", "w") as f:
+                json.dump(grad_data, f, indent=2)
+            
+            return grad
+        
+        if out.requires_grad:
+            out.register_hook(save_gradient_hook)
 
     return out
 
@@ -131,13 +180,64 @@ class GroupedExperts(nn.Module):
         hidden_dim: int,
         num_experts: int,
         use_grouped_mm: bool,
+        layer_id: int = 0,
     ):
         super().__init__()
         self.num_experts = num_experts
+        self.layer_id = layer_id
         self.w1 = nn.Parameter(torch.empty(num_experts, hidden_dim, dim))
         self.w2 = nn.Parameter(torch.empty(num_experts, dim, hidden_dim))
         self.w3 = nn.Parameter(torch.empty(num_experts, hidden_dim, dim))
         self.use_grouped_mm = use_grouped_mm
+
+        # Register backward hook to monitor gradients
+        self.register_full_backward_hook(self._gradient_hook)
+
+    def _gradient_hook(self, module, grad_input, grad_output):
+        """Backward hook to monitor gradients of all parameters."""
+        print(f"[GRAD HOOK] Layer {self.layer_id} GroupedExperts backward pass")
+        
+        # Check gradients for expert weight parameters
+        for name, param in self.named_parameters():
+            if param.grad is not None:
+                if param.grad.dtype.is_floating_point or param.grad.dtype.is_complex:
+                    grad_norm = param.grad.norm().item()
+                    has_nan = torch.isnan(param.grad).any().item()
+                    has_inf = torch.isinf(param.grad).any().item()
+                    print(f"[GRAD] {name}: norm={grad_norm:.6f}, has_nan={has_nan}, has_inf={has_inf}")
+                    
+                    if has_nan:
+                        print(f"[GRAD NaN] Found NaN in gradient of {name}")
+                    if has_inf:
+                        print(f"[GRAD INF] Found Inf in gradient of {name}")
+                else:
+                    print(f"[GRAD] {name}: dtype={param.grad.dtype}, shape={param.grad.shape} (non-float grad)")
+            else:
+                print(f"[GRAD] {name}: grad is None")
+        
+        # Check input gradients
+        if grad_input is not None:
+            for i, grad in enumerate(grad_input):
+                if grad is not None:
+                    if grad.dtype.is_floating_point or grad.dtype.is_complex:
+                        grad_norm = grad.norm().item()
+                        has_nan = torch.isnan(grad).any().item()
+                        has_inf = torch.isinf(grad).any().item()
+                        print(f"[GRAD INPUT] input_{i}: norm={grad_norm:.6f}, has_nan={has_nan}, has_inf={has_inf}")
+                    else:
+                        print(f"[GRAD INPUT] input_{i}: dtype={grad.dtype}, shape={grad.shape} (non-float grad)")
+        
+        # Check output gradients
+        if grad_output is not None:
+            for i, grad in enumerate(grad_output):
+                if grad is not None:
+                    if grad.dtype.is_floating_point or grad.dtype.is_complex:
+                        grad_norm = grad.norm().item()
+                        has_nan = torch.isnan(grad).any().item()
+                        has_inf = torch.isinf(grad).any().item()
+                        print(f"[GRAD OUTPUT] output_{i}: norm={grad_norm:.6f}, has_nan={has_nan}, has_inf={has_inf}")
+                    else:
+                        print(f"[GRAD OUTPUT] output_{i}: dtype={grad.dtype}, shape={grad.shape} (non-float grad)")
 
     def forward(
         self,
@@ -146,7 +246,7 @@ class GroupedExperts(nn.Module):
     ) -> torch.Tensor:
         if self.use_grouped_mm:
             return _run_experts_grouped_mm(
-                self.w1, self.w2, self.w3, x, num_tokens_per_expert
+                self.w1, self.w2, self.w3, x, num_tokens_per_expert, layer_id=self.layer_id
             )
         else:
             return _run_experts_for_loop(
@@ -312,15 +412,17 @@ class TokenReorderer(nn.Module):
 
 
 class MoE(nn.Module):
-    def __init__(self, moe_args: MoEArgs, dim: int, hidden_dim: int):
+    def __init__(self, moe_args: MoEArgs, dim: int, hidden_dim: int, layer_id: int = 0):
         super().__init__()
 
         num_experts = moe_args.num_experts
+        self.layer_id = layer_id
         self.experts = GroupedExperts(
             dim=dim,
             hidden_dim=hidden_dim,
             num_experts=num_experts,
             use_grouped_mm=moe_args.use_grouped_mm,
+            layer_id=layer_id,
         )
         self.router = TokenChoiceTopKRouter(
             dim=dim,
@@ -358,6 +460,55 @@ class MoE(nn.Module):
             torch.zeros(num_experts, dtype=torch.float32),
             persistent=False,
         )
+
+        # Register backward hook to monitor gradients
+        self.register_full_backward_hook(self._gradient_hook)
+
+    def _gradient_hook(self, module, grad_input, grad_output):
+        """Backward hook to monitor gradients of all parameters."""
+        print(f"[GRAD HOOK] Layer {self.layer_id} MoE backward pass")
+        
+        # Check gradients for all named parameters (router, experts, shared_experts)
+        for name, param in self.named_parameters():
+            if param.grad is not None:
+                if param.grad.dtype.is_floating_point or param.grad.dtype.is_complex:
+                    grad_norm = param.grad.norm().item()
+                    has_nan = torch.isnan(param.grad).any().item()
+                    has_inf = torch.isinf(param.grad).any().item()
+                    print(f"[GRAD] {name}: norm={grad_norm:.6f}, has_nan={has_nan}, has_inf={has_inf}")
+                    
+                    if has_nan:
+                        print(f"[GRAD NaN] Found NaN in gradient of {name}")
+                    if has_inf:
+                        print(f"[GRAD INF] Found Inf in gradient of {name}")
+                else:
+                    print(f"[GRAD] {name}: dtype={param.grad.dtype}, shape={param.grad.shape} (non-float grad)")
+            else:
+                print(f"[GRAD] {name}: grad is None")
+        
+        # Check input gradients
+        if grad_input is not None:
+            for i, grad in enumerate(grad_input):
+                if grad is not None:
+                    if grad.dtype.is_floating_point or grad.dtype.is_complex:
+                        grad_norm = grad.norm().item()
+                        has_nan = torch.isnan(grad).any().item()
+                        has_inf = torch.isinf(grad).any().item()
+                        print(f"[GRAD INPUT] input_{i}: norm={grad_norm:.6f}, has_nan={has_nan}, has_inf={has_inf}")
+                    else:
+                        print(f"[GRAD INPUT] input_{i}: dtype={grad.dtype}, shape={grad.shape} (non-float grad)")
+        
+        # Check output gradients
+        if grad_output is not None:
+            for i, grad in enumerate(grad_output):
+                if grad is not None:
+                    if grad.dtype.is_floating_point or grad.dtype.is_complex:
+                        grad_norm = grad.norm().item()
+                        has_nan = torch.isnan(grad).any().item()
+                        has_inf = torch.isinf(grad).any().item()
+                        print(f"[GRAD OUTPUT] output_{i}: norm={grad_norm:.6f}, has_nan={has_nan}, has_inf={has_inf}")
+                    else:
+                        print(f"[GRAD OUTPUT] output_{i}: dtype={grad.dtype}, shape={grad.shape} (non-float grad)")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """

@@ -140,8 +140,9 @@ class Attention(nn.Module):
     Multi-head attention (MLA) module.
     """
 
-    def __init__(self, model_args: DeepSeekV3ModelArgs):
+    def __init__(self, model_args: DeepSeekV3ModelArgs, layer_id: int = 0):
         super().__init__()
+        self.layer_id = layer_id
         self.dim = model_args.dim
         self.n_heads = model_args.n_heads
         self.q_lora_rank = model_args.q_lora_rank
@@ -176,6 +177,51 @@ class Attention(nn.Module):
             self.softmax_scale = self.softmax_scale * mscale * mscale
 
         self.sdpa = build_attention(model_args.use_flex_attn, model_args.attn_mask_type)
+
+        # Register both forward and backward hooks to monitor execution
+        # self.register_forward_hook(self._forward_hook)
+        self.register_full_backward_hook(self._gradient_hook)
+        # print(f"[HOOK REGISTRATION] Layer {self.layer_id} DeepSeek Attention hooks registered")
+
+    # def _forward_hook(self, module, input, output):
+    #     """Forward hook to confirm module is being called."""
+
+    def _gradient_hook(self, module, grad_input, grad_output):
+        """Backward hook to monitor gradients of all parameters."""
+        print(f"[GRAD HOOK] Layer {self.layer_id} DeepSeek Attention backward pass")
+        
+        # Check gradients for all named parameters
+        for name, param in self.named_parameters():
+            if param.grad is not None:
+                grad_norm = param.grad.norm().item()
+                has_nan = torch.isnan(param.grad).any().item()
+                has_inf = torch.isinf(param.grad).any().item()
+                print(f"[GRAD] {name}: norm={grad_norm:.6f}, has_nan={has_nan}, has_inf={has_inf}")
+                
+                if has_nan:
+                    print(f"[GRAD NaN] Found NaN in gradient of {name}")
+                if has_inf:
+                    print(f"[GRAD INF] Found Inf in gradient of {name}")
+            else:
+                print(f"[GRAD] {name}: grad is None")
+        
+        # Check input gradients
+        if grad_input is not None:
+            for i, grad in enumerate(grad_input):
+                if grad is not None:
+                    grad_norm = grad.norm().item()
+                    has_nan = torch.isnan(grad).any().item()
+                    has_inf = torch.isinf(grad).any().item()
+                    print(f"[GRAD INPUT] input_{i}: norm={grad_norm:.6f}, has_nan={has_nan}, has_inf={has_inf}")
+        
+        # Check output gradients
+        if grad_output is not None:
+            for i, grad in enumerate(grad_output):
+                if grad is not None:
+                    grad_norm = grad.norm().item()
+                    has_nan = torch.isnan(grad).any().item()
+                    has_inf = torch.isinf(grad).any().item()
+                    print(f"[GRAD OUTPUT] output_{i}: norm={grad_norm:.6f}, has_nan={has_nan}, has_inf={has_inf}")
 
     def forward(
         self,
@@ -267,7 +313,7 @@ class TransformerBlock(nn.Module):
     def __init__(self, layer_id: int, model_args: DeepSeekV3ModelArgs):
 
         super().__init__()
-        self.attention = Attention(model_args)
+        self.attention = Attention(model_args, layer_id=layer_id)
         self.attention_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
         self.ffn_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
 
@@ -277,6 +323,7 @@ class TransformerBlock(nn.Module):
                 model_args.moe_args,
                 dim=model_args.dim,
                 hidden_dim=model_args.moe_inter_dim,
+                layer_id=layer_id,
             )
         else:
             self.feed_forward = FeedForward(model_args.dim, model_args.inter_dim)
