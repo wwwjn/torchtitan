@@ -134,36 +134,30 @@ def _run_experts_grouped_mm(
     # Only save for the last layer (layer 26, since DeepSeek has 27 layers 0-26)
     print(f"[DEBUG] layer_id: {layer_id}")
     if layer_id == 26:  # Changed from 26 to 23 to catch more layers for debugging
-        # Save inputs to JSON during forward pass
+        # Save inputs using torch.save (more robust for large tensors)
         save_data = {
             "layer_id": layer_id,
-            "forward_inputs": {
-                "h_data": h.detach().cpu().float().tolist(),  # Full tensor as list
-                "w2_data": w2.detach().cpu().float().tolist(),  # Full tensor as list
-                "offsets": offsets.tolist() if offsets is not None else None,
-            }
+            "h": h.detach().cpu().float(),
+            "w2": w2.detach().cpu().float(), 
+            "offsets": offsets.cpu() if offsets is not None else None,
         }
         
-        # Save to file
+        # Save to file using torch.save
         os.makedirs("/tmp/grouped_mm_debug", exist_ok=True)
-        with open(f"/tmp/grouped_mm_debug/grouped_mm_data_layer_{layer_id}.json", "w") as f:
-            json.dump(save_data, f, indent=2)
+        torch.save(save_data, f"/tmp/grouped_mm_debug/grouped_mm_data_layer_{layer_id}.pt")
         
         print(f"[GROUPED_MM FORWARD] Saved input data for layer {layer_id}")
         
         # Register backward hook to save gradient information
         def save_gradient_hook(grad):
             print(f"[GROUPED_MM BACKWARD] Saving output gradient for layer {layer_id}")
+            
+            # Save gradient data using torch.save
             grad_data = {
                 "layer_id": layer_id,
-                "backward_gradient": {
-                    "grad_data": grad.detach().cpu().float().tolist(),  # Full tensor as list
-                }
+                "grad": grad.detach().cpu().float(),
             }
-            
-            # Save gradient data
-            with open(f"/tmp/grouped_mm_debug/grouped_mm_gradient_layer_{layer_id}.json", "w") as f:
-                json.dump(grad_data, f, indent=2)
+            torch.save(grad_data, f"/tmp/grouped_mm_debug/grouped_mm_gradient_layer_{layer_id}.pt")
             
             return grad
         
