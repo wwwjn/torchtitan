@@ -288,13 +288,10 @@ class TorchTitanQwen3ForCausalLM(VLLMModelForCausalLM):
         # Get embeddings from 2D tokens
         h = self.model.tok_embeddings(tokens_2d)  # [1, total_tokens, hidden_size]
 
-        # Get RoPE cache
-        seqlen = h.shape[1]  # seq_len dimension
-        rope_cache = self.model.rope_cache[:seqlen]
-
         # Pass through transformer layers
         for layer in self.model.layers.values():
-            h = layer(h, rope_cache, attention_masks=None)
+            # we could as well use h = layer(h, self.model.rope_cache[positions], attention_masks=None)
+            h = layer(h, self.model.rope_cache, attention_masks=None, positions=positions)
 
         # Convert output format back to vLLM expectations
         # vLLM expects hidden_states in [total_tokens, hidden_size] format
