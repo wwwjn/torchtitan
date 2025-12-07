@@ -290,8 +290,7 @@ class TorchTitanQwen3ForCausalLM(VLLMModelForCausalLM):
 
         # Pass through transformer layers
         for layer in self.model.layers.values():
-            # we could as well use h = layer(h, self.model.rope_cache[positions], attention_masks=None)
-            h = layer(h, self.model.rope_cache, attention_masks=None, positions=positions)
+            h = layer(h, self.model.rope_cache, attention_masks=None, positions=positions_2d)
 
         # Convert output format back to vLLM expectations
         # vLLM expects hidden_states in [total_tokens, hidden_size] format

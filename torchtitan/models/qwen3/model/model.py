@@ -54,20 +54,28 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
-def reshape_for_broadcast(rope_cache: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+def reshape_for_broadcast(rope_cache: torch.Tensor, x: torch.Tensor, positions: torch.Tensor | None = None) -> torch.Tensor:
     """
-    Reshapes the RoPE frequency tensor to be broadcastable with the input tensor.
+    Reshape frequency tensor (represented by cos, sin) for broadcasting it with another tensor.
+
+    This function reshapes the frequency tensor to have the same shape as the target tensor 'x'
+    for the purpose of broadcasting the frequency tensor during element-wise operations.
+
+    The input freqs_cis tensor is assumed to be of shape (max_seqlen, head_dim * 2),
+    and the first seqlen elements will be sliced, but dim must match x.
 
     Args:
         rope_cache (torch.Tensor): RoPE tensor (cos and sin) to be reshaped.
-        x (torch.Tensor): Input tensor whose shape will determine the reshaping.
+        x (torch.Tensor): Target tensor for broadcasting compatibility.
+        positions (torch.Tensor | None): Position indices used to access/shuffle RoPE cache.
+            Shape is (1, seqlen) or (bz, seqlen). Defaults to None.
 
     Returns:
         torch.Tensor: Reshaped frequency tensor.
     """
     ndim = x.ndim
     assert ndim > 1
-    _, seqlen, _, head_dim = x.shape
+    bz, seqlen, _, head_dim = x.shape
 
     # Extend rope_cache if needed (e.g., during vLLM profiling with 2x max_seq_len)
     if seqlen > rope_cache.shape[0]:
@@ -104,21 +112,41 @@ def reshape_for_broadcast(rope_cache: torch.Tensor, x: torch.Tensor) -> torch.Te
         else:
             rope_cache = extended_cache
 
-    rope_cache = rope_cache[0:seqlen]
-    # The shape of rope_cache is (seqlen, head_dim * 2) because we concate cos and sin
-    assert rope_cache.shape == (seqlen, head_dim * 2)
-    shape = [-1, seqlen, 1, head_dim * 2]
-    return rope_cache.view(*shape)
+    if positions is None:
+        rope_cache = rope_cache[0:seqlen]
+        # The shape of rope_cache is (seqlen, head_dim * 2) because we concate cos and sin
+        assert rope_cache.shape == (seqlen, head_dim * 2)
+        shape = [-1, seqlen, 1, head_dim * 2]
+        return rope_cache.view(*shape)
+    elif positions.size(0) == 1:
+        assert positions.shape == (1, seqlen)
+        rope_cache = rope_cache[positions.squeeze(0)]
+        # The shape of rope_cache is (seqlen, head_dim * 2)
+        assert rope_cache.shape == (seqlen, head_dim * 2)
+        shape = [-1, seqlen, 1, head_dim * 2]
+        return rope_cache.view(*shape)
+    else:
+        assert positions.shape == (bz, seqlen)
+        rope_cache_expanded = rope_cache[None, :, None, :].expand(bz, -1, -1, -1)
+        rope_cache = torch.gather(
+            rope_cache_expanded,
+            dim=1,
+            index=positions.view(bz, seqlen, 1, 1).expand(
+                bz, seqlen, 1, head_dim * 2
+            ),
+        )
+        # The shape of rope_cache is (bz, seqlen, 1, head_dim * 2)
+        assert rope_cache.shape == (bz, seqlen, 1, head_dim * 2)
+        return rope_cache
 
 
 def apply_rotary_emb(
-    xq: torch.Tensor, xk: torch.Tensor, rope_cache: torch.Tensor
+    xq: torch.Tensor, xk: torch.Tensor, rope_cache: torch.Tensor, positions: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # input tensor x has shape [bsz, seq_len, num_heads, head_dim]
     head_dim = xq.shape[-1]
 
-    # reshape for broadcast
-    rope_cache = reshape_for_broadcast(rope_cache, xq)
+    rope_cache = reshape_for_broadcast(rope_cache, xq, positions)
 
     # [bsz, seq_len, 1, head_dim]
     cos = rope_cache[..., :head_dim].to(dtype=xq.dtype, device=xq.device)
@@ -250,9 +278,7 @@ class Attention(nn.Module):
             xk = self.k_norm(xk)
 
         # Apply rotary embedding
-        if positions is not None:
-            rope_cache = rope_cache[positions]
-        xq, xk = apply_rotary_emb(xq, xk, rope_cache)
+        xq, xk = apply_rotary_emb(xq, xk, rope_cache, positions)
 
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
