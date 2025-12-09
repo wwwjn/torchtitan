@@ -33,8 +33,8 @@ from transformers import AutoConfig, AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.model_executor.layers.batch_invariant import init_batch_invariance
 
-from torchtitan.experiments.deterministic_vllm_rl.models.attention import (
-    VLLMPagedFlashAttention,
+from torchtitan.experiments.deterministic_vllm_rl.models.utils import (
+    replace_with_vllm_paged_attention,
 )
 
 from torchtitan.experiments.deterministic_vllm_rl.weights.converter import (
@@ -72,7 +72,7 @@ class VLLMRolloutEngine:
         model_path: Path to HuggingFace model (for config/tokenizer)
         temp_checkpoint_dir: Directory to save temporary weight checkpoints
         use_unified_model:
-            If set to True, use the same Torchtitan modle for both training 
+            If set to True, use the same Torchtitan modle for both training
             and vLLM rollouts.
 
             Otherwise, use batch-invariant Torchtitan model for training and
@@ -390,7 +390,7 @@ def load_model(
         # layer uses torch.get_default_dtype() and it doesn't support float32
         torch.set_default_dtype(torch.bfloat16)
         # standard TorchTitan model with vllm paged flash attention
-        replace_with_vllm_paged_attention(model, model_args)
+        replace_with_vllm_paged_attention(model)
 
         # Load standard TorchTitan format directly
         model.load_state_dict(state_dict, strict=True)
@@ -414,30 +414,6 @@ def load_model(
     model.to(torch.bfloat16)
 
     return model
-
-
-def replace_with_vllm_paged_attention(model, model_args):
-    # The `vllm.Attention` module handles QKV projection, RoPE, etc., and calls `inner_attention`
-    if not hasattr(model, "layers"):
-        raise AttributeError(
-            f"Model {type(model).__name__} must have .layers attribute"
-        )
-
-    for layer_name, layer in model.layers.items():
-        if not hasattr(layer, "attention"):
-            raise ValueError(f"Layer {layer_name} must have .attention attribute")
-
-        vllm_attn = VLLMPagedFlashAttention(
-            hidden_size=model_args.dim,
-            num_heads=model_args.n_heads,  # 16 (8 when TP =2)
-            # NOTE(jianiw): Before feeding into inner_attention, the n_kv_heads has been replicated -> num_heads
-            num_kv_heads=model_args.n_heads,  # 16 (8 When TP=2)
-            head_dim=model_args.head_dim,
-            causal=True,
-        )
-
-        layer.attention.inner_attention = vllm_attn
-    print("Successfully replaced TorchTitan attention with vLLM PagedFlashAttention")
 
 
 def extract_numeric_answer(text: str) -> str | None:
@@ -940,9 +916,7 @@ def rl_update_step(
 
     # Update vLLM weights from current policy (only once per update)
     titan_state = model.state_dict()
-    # print(f"jessica: {titan_state.keys()=}")
     vllm_compat_state = torchtitan_to_vllm_compat(titan_state)
-    # print(f"jessica: {vllm_compat_state.keys()=}")
     vllm_engine.update_weights(vllm_compat_state)
 
     # Accumulate gradients over multiple rollout batches
@@ -1106,7 +1080,7 @@ def main():
     """Simple RL training loop using vLLM for fast rollouts."""
 
     # ========== Config ==========
-    model_name = "Qwen/Qwen3-0.6B"  # HuggingFace model name
+    model_name = "Qwen/Qwen3-1.7B"  # HuggingFace model name
     cache_dir = "./models"
     output_dir = "./converted"
 
