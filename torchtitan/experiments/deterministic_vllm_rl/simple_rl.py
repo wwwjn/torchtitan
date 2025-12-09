@@ -17,8 +17,11 @@ This demonstrates:
 7. Optional real dataset support (GSM8K math dataset)
 """
 
+import argparse
+import json
 import os
 import re
+from enum import Enum
 
 import torch
 import torch.nn.functional as F
@@ -29,6 +32,10 @@ from transformers import AutoConfig, AutoTokenizer
 
 from vllm import LLM, SamplingParams
 from vllm.model_executor.layers.batch_invariant import init_batch_invariance
+
+from torchtitan.experiments.deterministic_vllm_rl.models.attention import (
+    VLLMPagedFlashAttention,
+)
 
 from torchtitan.experiments.deterministic_vllm_rl.weights.converter import (
     torchtitan_to_vllm,
@@ -42,6 +49,16 @@ from torchtitan.models.qwen3.model.args import Qwen3ModelArgs
 
 init_batch_invariance()
 
+from torchtitan.experiments.deterministic_vllm_rl.register import register
+
+register()
+
+
+class ModelMode(str, Enum):
+    VLLM_COMPAT = "vllm_compat"
+    BATCH_INVARIANT = "batch_invariant"
+    STANDARD = "standard"
+
 
 class VLLMRolloutEngine:
     """
@@ -54,9 +71,20 @@ class VLLMRolloutEngine:
     Args:
         model_path: Path to HuggingFace model (for config/tokenizer)
         temp_checkpoint_dir: Directory to save temporary weight checkpoints
+        use_unified_model:
+            If set to True, use the same Torchtitan modle for both training 
+            and vLLM rollouts.
+
+            Otherwise, use batch-invariant Torchtitan model for training and
+            batch-invariant vLLM model for rollouts.
     """
 
-    def __init__(self, model_path: str, temp_checkpoint_dir: str = "./converted"):
+    def __init__(
+        self,
+        model_path: str,
+        temp_checkpoint_dir: str = "./converted",
+        use_unified_model: bool = False,
+    ):
         self.base_model_path = model_path
         self.temp_model_dir = os.path.abspath(
             os.path.join(temp_checkpoint_dir, "vllm_temp_model")
@@ -90,6 +118,18 @@ class VLLMRolloutEngine:
         index_file = os.path.join(model_path, "model.safetensors.index.json")
         if os.path.exists(index_file):
             shutil.copy2(index_file, self.temp_model_dir)
+
+        config_file = os.path.join(self.temp_model_dir, "config.json")
+
+        # Modify config.json to use our custom architecture
+        if use_unified_model:
+            if os.path.exists(config_file):
+                with open(config_file, "r") as f:
+                    config = json.load(f)
+                # TODO(acisseJZhong): need to generalize this to other models
+                config["architectures"] = ["Qwen3TorchTitanForCausalLM"]
+                with open(config_file, "w") as f:
+                    json.dump(config, f, indent=2)
 
         self.llm = None
         print("vLLM rollout engine initialized (will load on first use)")
@@ -299,14 +339,17 @@ def download_and_convert_model(
     return titan_checkpoint_path, model_path
 
 
-def load_model(checkpoint_path: str, model_path: str, use_vllm_compat: bool = True):
+def load_model(
+    checkpoint_path: str, model_path: str, model_mode: bool = ModelMode.BATCH_INVARIANT
+):
     """
     Load TorchTitan model from checkpoint.
 
     Args:
         checkpoint_path: Path to TorchTitan checkpoint
         model_path: Path to HuggingFace model (for config)
-        use_vllm_compat: If True, use vLLM-compatible model, else use standard model
+        model_mode: Inidcates which model to use. Batch invariant Torchtitan model,
+            VLLM compatible Torchtitan model, or plain Torchtitan model
 
     Returns:
         model: Loaded TorchTitan model
@@ -338,8 +381,21 @@ def load_model(checkpoint_path: str, model_path: str, use_vllm_compat: bool = Tr
     # state_dict is in standard TorchTitan format (w1, w2, w3)
     state_dict = load_file(checkpoint_path)
 
-    if use_vllm_compat:
-        # Create and load model (using vLLM-compat for bitwise determinism)
+    if model_mode == ModelMode.VLLM_COMPAT:
+        from torchtitan.models.qwen3 import Qwen3Model
+
+        model = Qwen3Model(model_args)
+
+        # Set global default dtype to bfloat16. This is needed because vLLM's Attention
+        # layer uses torch.get_default_dtype() and it doesn't support float32
+        torch.set_default_dtype(torch.bfloat16)
+        # standard TorchTitan model with vllm paged flash attention
+        replace_with_vllm_paged_attention(model, model_args)
+
+        # Load standard TorchTitan format directly
+        model.load_state_dict(state_dict, strict=True)
+    elif model_mode == ModelMode.BATCH_INVARIANT:
+        # Create and load model that has bitwise determinism between training and inference
         from torchtitan.experiments.deterministic_vllm_rl.models.qwen3 import (
             Qwen3VLLMCompatModel,
         )
@@ -355,10 +411,33 @@ def load_model(checkpoint_path: str, model_path: str, use_vllm_compat: bool = Tr
         model = Qwen3Model(model_args)
         # Load standard TorchTitan format directly
         model.load_state_dict(state_dict, strict=False)
-
     model.to(torch.bfloat16)
 
     return model
+
+
+def replace_with_vllm_paged_attention(model, model_args):
+    # The `vllm.Attention` module handles QKV projection, RoPE, etc., and calls `inner_attention`
+    if not hasattr(model, "layers"):
+        raise AttributeError(
+            f"Model {type(model).__name__} must have .layers attribute"
+        )
+
+    for layer_name, layer in model.layers.items():
+        if not hasattr(layer, "attention"):
+            raise ValueError(f"Layer {layer_name} must have .attention attribute")
+
+        vllm_attn = VLLMPagedFlashAttention(
+            hidden_size=model_args.dim,
+            num_heads=model_args.n_heads,  # 16 (8 when TP =2)
+            # NOTE(jianiw): Before feeding into inner_attention, the n_kv_heads has been replicated -> num_heads
+            num_kv_heads=model_args.n_heads,  # 16 (8 When TP=2)
+            head_dim=model_args.head_dim,
+            causal=True,
+        )
+
+        layer.attention.inner_attention = vllm_attn
+    print("Successfully replaced TorchTitan attention with vLLM PagedFlashAttention")
 
 
 def extract_numeric_answer(text: str) -> str | None:
@@ -829,7 +908,6 @@ def rl_update_step(
     group_size: int = 8,
     max_new_tokens: int = 20,
     temperature: float = 1.0,
-    use_vllm_compat: bool = True,
     num_rollout_batches: int = 1,
     reward_fn=None,
     grpo_beta: float = 0.1,
@@ -848,7 +926,6 @@ def rl_update_step(
         group_size: Number of samples per prompt for GRPO
         max_new_tokens: Max tokens to generate
         temperature: Sampling temperature
-        use_vllm_compat: Whether to use vLLM-compatible model
         num_rollout_batches: Number of rollout batches per update (more rollouts = more samples)
         reward_fn: Reward function (defaults to trivial_reward_function)
         grpo_beta: Beta parameter for GRPO exponential weighting (lower = more unstable)
@@ -863,7 +940,9 @@ def rl_update_step(
 
     # Update vLLM weights from current policy (only once per update)
     titan_state = model.state_dict()
+    # print(f"jessica: {titan_state.keys()=}")
     vllm_compat_state = torchtitan_to_vllm_compat(titan_state)
+    # print(f"jessica: {vllm_compat_state.keys()=}")
     vllm_engine.update_weights(vllm_compat_state)
 
     # Accumulate gradients over multiple rollout batches
@@ -1027,7 +1106,7 @@ def main():
     """Simple RL training loop using vLLM for fast rollouts."""
 
     # ========== Config ==========
-    model_name = "Qwen/Qwen3-1.7B"  # HuggingFace model name
+    model_name = "Qwen/Qwen3-0.6B"  # HuggingFace model name
     cache_dir = "./models"
     output_dir = "./converted"
 
@@ -1049,12 +1128,22 @@ def main():
     )
     num_dataset_samples = 10  # Number of prompts from dataset
 
+    # ========== Arguments ==========
+    parser = argparse.ArgumentParser(description="RL training with vLLM rollouts")
+    parser.add_argument(
+        "--use-unified-model",
+        action="store_true",
+        default=False,
+    )
+    args = parser.parse_args()
+    use_unified_model = args.use_unified_model
+
     # Check if batch invariance is enabled
     from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
 
-    use_vllm_compat = vllm_is_batch_invariant()
+    use_batch_invariant = vllm_is_batch_invariant()
 
-    if use_vllm_compat:
+    if use_batch_invariant:
         print("✓ Batch invariance detected - using vLLM-compatible model")
         # Add backward pass support to vLLM's batch_invariant mode
         print("  Adding gradient support to vLLM's batch_invariant mode...")
@@ -1081,9 +1170,16 @@ def main():
     # Load TorchTitan model for training
     print("\nLoading TorchTitan model for training...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = load_model(
-        titan_checkpoint_path, model_path, use_vllm_compat=use_vllm_compat
-    )
+    if use_unified_model:
+        # use Torchtitan model with VLLMPagedFlashAttention
+        model = load_model(
+            titan_checkpoint_path, model_path, model_mode=ModelMode.VLLM_COMPAT
+        )
+    else:
+        # use batch invariant Torchtitan model
+        model = load_model(
+            titan_checkpoint_path, model_path, model_mode=ModelMode.BATCH_INVARIANT
+        )
     model = model.to(device)
     model.train()
 
@@ -1095,7 +1191,7 @@ def main():
 
     # Initialize persistent vLLM engine for rollouts
     print("\nInitializing vLLM engine for rollouts...")
-    vllm_engine = VLLMRolloutEngine(model_path)
+    vllm_engine = VLLMRolloutEngine(model_path, use_unified_model=use_unified_model)
 
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -1168,7 +1264,6 @@ def main():
             group_size=group_size,
             max_new_tokens=20 if not use_real_dataset else 100,
             temperature=1.0,
-            use_vllm_compat=use_vllm_compat,
             num_rollout_batches=num_rollout_batches,
             reward_fn=reward_fn,
             grpo_beta=grpo_beta,
