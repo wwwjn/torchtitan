@@ -55,7 +55,7 @@ register()
 
 
 class ModelMode(str, Enum):
-    VLLM_COMPAT = "vllm_compat"
+    UNIFIED = "unified"
     BATCH_INVARIANT = "batch_invariant"
     STANDARD = "standard"
 
@@ -381,7 +381,7 @@ def load_model(
     # state_dict is in standard TorchTitan format (w1, w2, w3)
     state_dict = load_file(checkpoint_path)
 
-    if model_mode == ModelMode.VLLM_COMPAT:
+    if model_mode == ModelMode.UNIFIED:
         from torchtitan.models.qwen3 import Qwen3Model
 
         model = Qwen3Model(model_args)
@@ -1147,7 +1147,7 @@ def main():
     if use_unified_model:
         # use Torchtitan model with VLLMPagedFlashAttention
         model = load_model(
-            titan_checkpoint_path, model_path, model_mode=ModelMode.VLLM_COMPAT
+            titan_checkpoint_path, model_path, model_mode=ModelMode.UNIFIED
         )
     else:
         # use batch invariant Torchtitan model
