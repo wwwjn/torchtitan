@@ -25,7 +25,49 @@ from typing import Any, Dict, List
 import numpy as np
 
 import torch
+from torch.distributed.checkpoint import HuggingFaceStorageReader
+from torch.distributed.checkpoint.state_dict import (
+    get_model_state_dict,
+    set_model_state_dict,
+    StateDictOptions,
+)
+from torch.distributed.tensor import Replicate
+from torch.distributed.tensor.parallel import (
+    ColwiseParallel,
+    parallelize_module,
+    RowwiseParallel,
+)
 from torchtitan.experiments.rl import unified  # noqa: F401
+
+
+def apply_tp_minus_sp(model, tp_mesh):
+    """Apply tensor parallelism to model without sequence parallelism."""
+
+    parallelize_module(
+        model,
+        tp_mesh,
+        {
+            "tok_embeddings": RowwiseParallel(input_layouts=Replicate()),
+            "output": ColwiseParallel(output_layouts=Replicate()),
+        },
+    )
+
+    for _, transformer_block in model.layers.items():
+        layer_plan = {
+            "attention.wq": ColwiseParallel(),
+            "attention.wk": ColwiseParallel(),
+            "attention.wv": ColwiseParallel(),
+            "attention.wo": RowwiseParallel(),
+            "feed_forward.w1": ColwiseParallel(),
+            "feed_forward.w2": RowwiseParallel(),
+            "feed_forward.w3": ColwiseParallel(),
+        }
+
+        parallelize_module(
+            module=transformer_block,
+            device_mesh=tp_mesh,
+            parallelize_plan=layer_plan,
+        )
 
 
 @dataclass
@@ -56,6 +98,8 @@ class BenchmarkConfig:
     torchtitan_checkpoint_path: str
     prompts_file: str
     torchtitan_config_path: str = None  # Optional config path for TorchTitan
+    from_hf: bool = True  # Whether checkpoint is in HuggingFace format
+    tp: int = 1  # Tensor parallelism size
     batch_size: int = 1
     max_tokens: int = 512
     num_runs: int = 5
@@ -79,12 +123,15 @@ class VLLMNativeBenchmark:
 
             print("Loading vLLM with native Qwen3 model from HuggingFace...")
             print(f"Model: {self.config.model_path}")
+            print(f"Tensor Parallel Size: {self.config.tp}")
 
             self.engine = LLM(
                 model=self.config.model_path,
                 trust_remote_code=True,
                 dtype="bfloat16",
+                enforce_eager=True,  # Use eager mode for fair comparison
                 gpu_memory_utilization=0.9,
+                tensor_parallel_size=self.config.tp,
             )
             self.sampling_params = SamplingParams(
                 temperature=self.config.temperature,
@@ -163,6 +210,7 @@ class VLLMTorchTitanBenchmark:
 
             print("Loading vLLM with TorchTitan Qwen3 checkpoint...")
             print(f"Checkpoint: {self.config.torchtitan_checkpoint_path}")
+            print(f"Tensor Parallel Size: {self.config.tp}")
 
             # Initialize vLLM with TorchTitan model
             # This uses the registered Qwen3TorchTitanForCausalLM architecture
@@ -176,6 +224,7 @@ class VLLMTorchTitanBenchmark:
                 trust_remote_code=True,
                 enforce_eager=True,  # Use eager mode
                 gpu_memory_utilization=0.9,
+                tensor_parallel_size=self.config.tp,
             )
 
             self.sampling_params = SamplingParams(
@@ -258,12 +307,61 @@ class TorchTitanNativeBenchmark:
         try:
             print("Loading TorchTitan Qwen3 model directly (test_generate.py style)...")
 
+            import os
             import sys
             from pathlib import Path
 
+            import torch.distributed as dist
             import torch.distributed.checkpoint as dcp
             from torchtitan.config import ConfigManager
+            from torchtitan.distributed import ParallelDims
             from torchtitan.protocols.train_spec import get_train_spec
+
+            # Get world size and rank from environment (set by torchrun)
+            env_world_size = int(os.environ.get("WORLD_SIZE", 1))
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+            # Use config.tp as the intended TP size
+            # Validate that it matches torchrun's world_size when running distributed
+            if self.config.tp > 1:
+                if env_world_size == 1:
+                    raise RuntimeError(
+                        f"TP={self.config.tp} requested but running in single process mode. "
+                        f"Use: torchrun --nproc_per_node={self.config.tp} scripts/benchmark_inference.py ..."
+                    )
+                if env_world_size != self.config.tp:
+                    raise RuntimeError(
+                        f"TP={self.config.tp} but torchrun launched {env_world_size} processes. "
+                        f"Use: torchrun --nproc_per_node={self.config.tp} scripts/benchmark_inference.py ..."
+                    )
+
+            # world_size should equal TP size. Assume only TP is applied
+            world_size = self.config.tp
+
+            print(
+                f"TP={self.config.tp}, World Size: {world_size}, Local Rank: {local_rank}"
+            )
+
+            # Initialize distributed
+            if not dist.is_initialized():
+                if world_size > 1:
+                    # Multi-process mode (TP > 1) - should be launched with torchrun
+                    os.environ.setdefault("MASTER_ADDR", "localhost")
+                    os.environ.setdefault("MASTER_PORT", "29500")
+                    dist.init_process_group(
+                        backend="nccl" if torch.cuda.is_available() else "gloo",
+                        init_method="env://",
+                    )
+                else:
+                    # Single-process mode (TP == 1)
+                    os.environ.setdefault("MASTER_ADDR", "localhost")
+                    os.environ.setdefault("MASTER_PORT", "29500")
+                    os.environ.setdefault("RANK", "0")
+                    os.environ.setdefault("WORLD_SIZE", "1")
+                    dist.init_process_group(
+                        backend="gloo",
+                        init_method="env://",
+                    )
 
             # Add generate module to path
             generate_path = Path(__file__).parent.parent / "scripts" / "generate"
@@ -319,10 +417,42 @@ class TorchTitanNativeBenchmark:
             model_args = train_spec.model_args[self.tt_config.model.flavor]
             model_args.update_from_config(self.tt_config)
 
-            # Initialize model on device
-            device = torch.device(self.config.device)
-            with torch.device(device):
+            # Setup parallel dims
+            if world_size > 1:
+                parallel_dims = ParallelDims(
+                    dp_replicate=1,
+                    dp_shard=-1,
+                    cp=1,
+                    tp=world_size,
+                    pp=1,
+                    ep=1,
+                    etp=1,
+                    world_size=world_size,
+                )
+            else:
+                parallel_dims = ParallelDims(
+                    dp_replicate=1,
+                    dp_shard=1,
+                    cp=1,
+                    tp=1,
+                    pp=1,
+                    ep=1,
+                    etp=1,
+                    world_size=1,
+                )
+
+            # Initialize model on appropriate device
+            device = torch.device(f"{self.config.device}:{local_rank}")
+            init_device = "meta" if world_size > 1 else device
+
+            print(f"Initializing model on device: {init_device}")
+            with torch.device(init_device):
                 self.model = train_spec.model_cls(model_args)
+
+            # Apply TP if world_size > 1
+            if world_size > 1:
+                print(f"Applying tensor parallelism with TP={world_size}")
+                apply_tp_minus_sp(self.model, parallel_dims.get_mesh("tp"))
 
             # Materialize model
             self.model.to_empty(device=device)
@@ -338,21 +468,44 @@ class TorchTitanNativeBenchmark:
             # Check if checkpoint is a directory (DCP format) or a file (torch.save format)
             checkpoint_path = Path(self.config.torchtitan_checkpoint_path)
 
-            if checkpoint_path.is_dir():
-                # DCP format checkpoint
-                state_dict = self.model.state_dict()
-                dcp.load(state_dict, checkpoint_id=str(checkpoint_path))
-            elif checkpoint_path.is_file():
-                # Regular torch checkpoint file
-                checkpoint = torch.load(
-                    checkpoint_path, map_location=device, weights_only=False
-                )
-                state_dict = checkpoint.get("model", checkpoint)
-                self.model.load_state_dict(state_dict, strict=False)
-            else:
-                raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+            if self.config.from_hf:
+                # Load HuggingFace format checkpoint using state dict adapter
+                print("Loading from HuggingFace format using state dict adapter...")
+                sd_adapter = train_spec.state_dict_adapter(model_args, None)
+                assert (
+                    sd_adapter is not None
+                ), "Trying to load HF checkpoint, but sd_adapter is not available for this model."
 
-            print("✓ TorchTitan native Qwen3 model loaded successfully")
+                # Get state dict in torchtitan format using DTensor-aware function
+                # This handles DTensor models properly (like train.py does)
+                state_dict = get_model_state_dict(self.model)
+                # Convert to HF format so that HF weights can be loaded into it
+                hf_state_dict = sd_adapter.to_hf(state_dict)
+                # Load HF weights
+                dcp.load(
+                    hf_state_dict,
+                    storage_reader=HuggingFaceStorageReader(path=str(checkpoint_path)),
+                )
+                # Convert back from HF to torchtitan format
+                state_dict = sd_adapter.from_hf(hf_state_dict)
+                # Use set_model_state_dict for DTensor models (with strict=False for flexibility)
+                set_model_state_dict(
+                    self.model,
+                    model_state_dict=state_dict,
+                    options=StateDictOptions(strict=False),
+                )
+            else:
+                # Load DCP format checkpoint
+                state_dict = get_model_state_dict(self.model)
+                dcp.load(state_dict, checkpoint_id=str(checkpoint_path))
+                set_model_state_dict(
+                    self.model,
+                    model_state_dict=state_dict,
+                    options=StateDictOptions(strict=False),
+                )
+
+            if local_rank == 0:
+                print("✓ TorchTitan native Qwen3 model loaded successfully")
         except Exception as e:
             print(f"✗ Failed to load TorchTitan native model: {e}")
             import traceback
@@ -786,6 +939,18 @@ def main():
         action="store_true",
         help="Skip TorchTitan native benchmark",
     )
+    parser.add_argument(
+        "--from-hf",
+        action="store_true",
+        default=True,
+        help="Load checkpoint from HuggingFace format using state dict adapter (default: True)",
+    )
+    parser.add_argument(
+        "--tp",
+        type=int,
+        default=1,
+        help="Tensor parallelism size (default: 1). When TP > 1, use torchrun --nproc_per_node=TP",
+    )
 
     args = parser.parse_args()
 
@@ -794,6 +959,8 @@ def main():
         torchtitan_checkpoint_path=args.checkpoint,
         torchtitan_config_path=args.torchtitan_config,
         prompts_file=args.prompts,
+        from_hf=args.from_hf,
+        tp=args.tp,
         batch_size=args.batch_size,
         max_tokens=args.max_tokens,
         num_runs=args.num_runs,
@@ -802,19 +969,38 @@ def main():
 
     runner = BenchmarkRunner(config)
 
+    # Check if running with torchrun (multi-process)
+    import os
+
+    import torch.distributed as dist
+
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
     # Run selected benchmarks
+    # vLLM benchmarks run only on rank 0 because vLLM manages its own tensor parallelism
+    # vLLM will use tensor_parallel_size to handle multi-GPU internally
     if not args.skip_vllm_native:
-        runner.run_benchmark(VLLMNativeBenchmark, "vllm_native")
+        if local_rank == 0:
+            runner.run_benchmark(VLLMNativeBenchmark, "vllm_native")
+        # Synchronize all ranks after vLLM benchmark
+        if world_size > 1 and dist.is_initialized():
+            dist.barrier()
 
     if not args.skip_vllm_torchtitan:
-        runner.run_benchmark(VLLMTorchTitanBenchmark, "vllm_torchtitan")
+        if local_rank == 0:
+            runner.run_benchmark(VLLMTorchTitanBenchmark, "vllm_torchtitan")
+        # Synchronize all ranks after vLLM benchmark
+        if world_size > 1 and dist.is_initialized():
+            dist.barrier()
 
     if not args.skip_torchtitan_native:
         runner.run_benchmark(TorchTitanNativeBenchmark, "torchtitan_native")
 
-    # Print and save results
-    runner.print_summary()
-    runner.save_results(args.output)
+    # Print and save results (only on rank 0)
+    if local_rank == 0:
+        runner.print_summary()
+        runner.save_results(args.output)
 
 
 if __name__ == "__main__":
