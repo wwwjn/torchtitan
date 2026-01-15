@@ -8,8 +8,7 @@
 import math
 
 import torch
-from vllm.attention.utils.fa_utils import flash_attn_varlen_func
-
+from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
 
 class VLLMCompatibleFlashAttention(torch.nn.Module):
     """Wrapper around FlashAttention as used by VLLM"""

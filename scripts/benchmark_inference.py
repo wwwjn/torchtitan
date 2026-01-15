@@ -59,6 +59,11 @@ from torch.profiler import (
 from torchtitan.experiments.rl import unified  # noqa: F401
 
 
+
+# Must set spawn method before any CUDA operations or vLLM imports
+# CUDA cannot be re-initialized in forked subprocesses
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
 def apply_tp_minus_sp(model, tp_mesh):
     """Apply tensor parallelism to model without sequence parallelism."""
 
@@ -245,7 +250,7 @@ class VLLMNativeBenchmark:
             self.engine = LLM(
                 model=self.config.model_path,
                 trust_remote_code=True,
-                dtype="bfloat16",
+                dtype="bfloat16", 
                 enforce_eager=True,  # Use eager mode for fair comparison
                 gpu_memory_utilization=0.9,
                 tensor_parallel_size=self.config.tp,
@@ -339,14 +344,6 @@ class VLLMNativeBenchmark:
 
     def cleanup(self):
         """Cleanup resources."""
-        # Wait for profiler to finish writing traces (if profiling was enabled)
-        if self.profiling_enabled:
-            print(
-                f"  Waiting for profiler to finish writing traces to {self.profile_dir}..."
-            )
-            print("  This may take several minutes for large traces...")
-            time.sleep(120)  # Increased to 2 minutes for large traces
-            print(f"  Profiler cleanup complete. Check traces at: {self.profile_dir}")
         if self.engine is not None:
             del self.engine
             self.engine = None
@@ -479,14 +476,6 @@ class VLLMTorchTitanBenchmark:
 
     def cleanup(self):
         """Cleanup resources."""
-        # Wait for profiler to finish writing traces (if profiling was enabled)
-        if self.profiling_enabled:
-            print(
-                f"  Waiting for profiler to finish writing traces to {self.profile_dir}..."
-            )
-            print("  This may take several minutes for large traces...")
-            time.sleep(120)  # Increased to 2 minutes for large traces
-            print(f"  Profiler cleanup complete. Check traces at: {self.profile_dir}")
         if self.engine is not None:
             del self.engine
             self.engine = None

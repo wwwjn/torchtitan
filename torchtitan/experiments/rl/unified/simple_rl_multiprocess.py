@@ -63,7 +63,8 @@ async def main():
     trainer_tp_size = 1
     generator_tp_size = 1
 
-    init_batch_invariance()
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    init_batch_invariance(AttentionBackendEnum.FLASH_ATTN)
     batch_invariant = vllm_is_batch_invariant()
     mode = ModelMode.UNIFIED
 

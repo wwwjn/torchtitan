@@ -39,8 +39,9 @@ from transformers import AutoConfig, AutoTokenizer
 
 from vllm import LLM, SamplingParams
 from vllm.model_executor.layers.batch_invariant import init_batch_invariance
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-init_batch_invariance()
+init_batch_invariance(AttentionBackendEnum.FLASH_ATTN)
 
 
 class VLLMRolloutEngine:
