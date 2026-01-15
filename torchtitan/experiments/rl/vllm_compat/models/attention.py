@@ -9,10 +9,6 @@ import math
 
 import torch
 from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
-<<<<<<< HEAD
-=======
-
->>>>>>> 15569716 ([Experimental][rl][vllm compat] Update simple_rl example to work with vLLM nightly (#2219))
 
 class VLLMCompatibleFlashAttention(torch.nn.Module):
     """Wrapper around FlashAttention as used by VLLM"""

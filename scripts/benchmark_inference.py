@@ -64,7 +64,6 @@ from torchtitan.experiments.rl import unified  # noqa: F401
 # CUDA cannot be re-initialized in forked subprocesses
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-# NOTE(jianiw): This function is for Torchtitan Native 
 def apply_tp_minus_sp(model, tp_mesh):
     """Apply tensor parallelism to model without sequence parallelism."""
 

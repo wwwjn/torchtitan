@@ -97,7 +97,10 @@ class VLLMAttention(torch.nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
+<<<<<<< HEAD
         # TODO: reimplement as a 4d tensor once vLLM fix has landed
+=======
+>>>>>>> 7441d636 (using vllm nightly)
         # Then flatten batch and seq_len: (batch * seq_len, num_heads, head_dim)
         q = q.reshape(batch_size * seq_len, num_heads, head_dim)
         k = k.reshape(batch_size * seq_len, num_kv_heads, head_dim)
