@@ -252,9 +252,9 @@ class Attention(nn.Module):
 
         # Adding the q_norm and k_norm here
         # Last layer of adding q-k norm
-        if self.q_norm:
+        if self.q_norm:  # pyrefly: ignore[invalid-argument]
             xq = self.q_norm(xq)
-        if self.k_norm:
+        if self.k_norm:  # pyrefly: ignore[invalid-argument]
             xk = self.k_norm(xk)
 
         # Apply rotary embedding
@@ -652,7 +652,7 @@ class Qwen3Model(nn.Module, ModelProtocol):
             self._print_tensor_stats("rope_cache", self.rope_cache)
 
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
-        # pyrefly: ignore [not-callable]
+        # pyrefly: ignore[not-callable, invalid-argument]
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
         if self._debug_enabled:
             self._print_tensor_stats("After tok_embeddings", h)
@@ -667,12 +667,9 @@ class Qwen3Model(nn.Module, ModelProtocol):
                 if h.abs().max().item() > 1e6:
                     print(f"[DEBUG] WARNING: Values exploded at layer {layer_name}!")
 
-        # pyrefly: ignore [not-callable]
+        # pyrefly: ignore[not-callable, invalid-argument]
         h = self.norm(h) if self.norm else h
-        if self._debug_enabled:
-            self._print_tensor_stats("After final norm", h)
-
-        # pyrefly: ignore [not-callable]
+        # pyrefly: ignore[not-callable, invalid-argument]
         output = self.output(h) if self.output else h
         if self._debug_enabled:
             self._print_tensor_stats("Final output (logits)", output)
