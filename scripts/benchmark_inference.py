@@ -12,15 +12,28 @@ Benchmark script to compare inference performance across three approaches:
 3. Direct TorchTitan Qwen3 model inference
 
 Usage:
-    python benchmark_inference.py --config benchmark_config.toml --output results.json
+    python benchmark_inference.py --checkpoint /path/to/checkpoint --output results.json
+
+With profiling enabled:
+    python benchmark_inference.py --checkpoint /path/to/checkpoint --profile --profile-dir ./traces
+
+    Traces can be visualized using:
+    - https://ui.perfetto.dev/ (Chrome traces)
+    - TensorBoard (via tensorboard --logdir=./traces)
+
+Profiling tips:
+    - Only send a few requests through when profiling (use --num-runs 2)
+    - Use --warmup-runs 1 for faster profiling setup
+    - Traces can get large, consider using --max-tokens 64 for debugging
 """
 
 import argparse
 import json
+import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -36,6 +49,12 @@ from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     parallelize_module,
     RowwiseParallel,
+)
+from torch.profiler import (
+    profile,
+    ProfilerActivity,
+    schedule,
+    tensorboard_trace_handler,
 )
 from torchtitan.experiments.rl import unified  # noqa: F401
 
@@ -107,6 +126,92 @@ class BenchmarkConfig:
     temperature: float = 0.0
     top_p: float = 1.0
     device: str = "cuda"
+    # Profiling options
+    profile: bool = False
+    profile_dir: str = "./profiler_traces"
+    profile_wait: int = 1  # Steps to skip before profiling
+    profile_warmup: int = 1  # Warmup steps for profiler
+    profile_active: int = 2  # Active profiling steps
+    profile_repeat: int = 1  # Number of profiling cycles
+
+
+class ProfilerManager:
+    """Helper class to manage PyTorch profiler for benchmarks."""
+
+    def __init__(self, config: BenchmarkConfig, approach_name: str):
+        self.config = config
+        self.approach_name = approach_name
+        self.profiler: Optional[torch.profiler.profile] = None
+
+    def get_trace_dir(self) -> str:
+        """Get the trace directory for this approach."""
+        trace_dir = Path(self.config.profile_dir) / self.approach_name.lower().replace(
+            " ", "_"
+        )
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        return str(trace_dir)
+
+    def create_profiler(self) -> Optional[torch.profiler.profile]:
+        """Create a PyTorch profiler instance if profiling is enabled."""
+        if not self.config.profile:
+            return None
+
+        trace_dir = self.get_trace_dir()
+        print(f"  Profiler traces will be saved to: {trace_dir}")
+
+        # Create profiler with schedule for warmup/active phases
+        self.profiler = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=schedule(
+                wait=self.config.profile_wait,
+                warmup=self.config.profile_warmup,
+                active=self.config.profile_active,
+                repeat=self.config.profile_repeat,
+            ),
+            on_trace_ready=tensorboard_trace_handler(trace_dir),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            with_flops=True,
+        )
+        return self.profiler
+
+    def create_simple_profiler(self) -> Optional[torch.profiler.profile]:
+        """Create a simple profiler without scheduling (for single-run profiling)."""
+        if not self.config.profile:
+            return None
+
+        trace_dir = self.get_trace_dir()
+        print(f"  Profiler traces will be saved to: {trace_dir}")
+
+        self.profiler = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            with_flops=True,
+        )
+        return self.profiler
+
+    def export_chrome_trace(self, run_idx: int):
+        """Export Chrome trace file for visualization in Perfetto."""
+        if self.profiler is None:
+            return
+
+        trace_dir = self.get_trace_dir()
+        trace_file = Path(trace_dir) / f"trace_run_{run_idx}.json"
+        self.profiler.export_chrome_trace(str(trace_file))
+        print(f"  Exported Chrome trace to: {trace_file}")
+
+    def print_summary(self):
+        """Print profiler summary statistics."""
+        if self.profiler is None:
+            return
+
+        print(f"\n  === Profiler Summary for {self.approach_name} ===")
+        print(
+            self.profiler.key_averages().table(sort_by="cuda_time_total", row_limit=20)
+        )
 
 
 class VLLMNativeBenchmark:
@@ -115,6 +220,8 @@ class VLLMNativeBenchmark:
     def __init__(self, config: BenchmarkConfig):
         self.config = config
         self.engine = None
+        self.profiling_enabled = False
+        self.profile_dir = None
 
     def setup(self):
         """Initialize vLLM engine with native Qwen3 model."""
@@ -124,6 +231,16 @@ class VLLMNativeBenchmark:
             print("Loading vLLM with native Qwen3 model from HuggingFace...")
             print(f"Model: {self.config.model_path}")
             print(f"Tensor Parallel Size: {self.config.tp}")
+
+            # Set up profiling via environment variable (compatible with more vLLM versions)
+            if self.config.profile:
+                self.profile_dir = Path(self.config.profile_dir) / "vllm_native"
+                self.profile_dir.mkdir(parents=True, exist_ok=True)
+                os.environ["VLLM_TORCH_PROFILER_DIR"] = str(self.profile_dir)
+                self.profiling_enabled = True
+                print(
+                    f"Profiling ENABLED - traces will be saved to: {self.profile_dir}"
+                )
 
             self.engine = LLM(
                 model=self.config.model_path,
@@ -143,7 +260,9 @@ class VLLMNativeBenchmark:
             print(f"✗ Failed to load vLLM native model: {e}")
             raise
 
-    def run_inference(self, prompts: List[str]) -> BenchmarkMetrics:
+    def run_inference(
+        self, prompts: List[str], use_profiler: bool = False
+    ) -> BenchmarkMetrics:
         """Run inference and collect metrics."""
         if self.engine is None:
             raise RuntimeError("Engine not initialized. Call setup() first.")
@@ -151,10 +270,41 @@ class VLLMNativeBenchmark:
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.empty_cache()
 
+        # Try to use start_profile/stop_profile if available (newer vLLM versions)
+        # With VLLM_TORCH_PROFILER_DIR set, profiling may happen automatically
+        profile_started = False
+        if use_profiler and self.profiling_enabled:
+            print(f"  Starting vLLM profiler (traces will go to {self.profile_dir})...")
+            if hasattr(self.engine, "start_profile"):
+                try:
+                    self.engine.start_profile()
+                    profile_started = True
+                    print("  Profiler started successfully")
+                except Exception as e:
+                    print(f"  Warning: start_profile() failed: {e}")
+                    print(
+                        "  Profiling will rely on VLLM_TORCH_PROFILER_DIR environment variable"
+                    )
+            else:
+                print(
+                    "  Note: LLM.start_profile() not available, relying on VLLM_TORCH_PROFILER_DIR"
+                )
+
         # Measure prefill (first token) time separately
         start_time = time.perf_counter()
         outputs = self.engine.generate(prompts, self.sampling_params)
         end_time = time.perf_counter()
+
+        # Stop profiler if it was started
+        if profile_started:
+            print("  Stopping profiler...")
+            try:
+                self.engine.stop_profile()
+                print(
+                    f"  Profiler stopped. Traces should be written to: {self.profile_dir}"
+                )
+            except Exception as e:
+                print(f"  Warning: stop_profile() failed: {e}")
 
         total_time = end_time - start_time
         total_tokens = sum(len(output.outputs[0].token_ids) for output in outputs)
@@ -189,6 +339,14 @@ class VLLMNativeBenchmark:
 
     def cleanup(self):
         """Cleanup resources."""
+        # Wait for profiler to finish writing traces (if profiling was enabled)
+        if self.profiling_enabled:
+            print(
+                f"  Waiting for profiler to finish writing traces to {self.profile_dir}..."
+            )
+            print("  This may take several minutes for large traces...")
+            time.sleep(120)  # Increased to 2 minutes for large traces
+            print(f"  Profiler cleanup complete. Check traces at: {self.profile_dir}")
         if self.engine is not None:
             del self.engine
             self.engine = None
@@ -201,6 +359,8 @@ class VLLMTorchTitanBenchmark:
     def __init__(self, config: BenchmarkConfig):
         self.config = config
         self.engine = None
+        self.profiling_enabled = False
+        self.profile_dir = None
 
     def setup(self):
         """Initialize vLLM engine with TorchTitan Qwen3 model."""
@@ -212,8 +372,16 @@ class VLLMTorchTitanBenchmark:
             print(f"Checkpoint: {self.config.torchtitan_checkpoint_path}")
             print(f"Tensor Parallel Size: {self.config.tp}")
 
-            # Initialize vLLM with TorchTitan model
-            # This uses the registered Qwen3TorchTitanForCausalLM architecture
+            # Set up profiling via environment variable (compatible with more vLLM versions)
+            if self.config.profile:
+                self.profile_dir = Path(self.config.profile_dir) / "vllm_torchtitan"
+                self.profile_dir.mkdir(parents=True, exist_ok=True)
+                os.environ["VLLM_TORCH_PROFILER_DIR"] = str(self.profile_dir)
+                self.profiling_enabled = True
+                print(
+                    f"Profiling ENABLED - traces will be saved to: {self.profile_dir}"
+                )
+
             self.engine = LLM(
                 model=self.config.torchtitan_checkpoint_path,
                 hf_overrides={
@@ -240,7 +408,9 @@ class VLLMTorchTitanBenchmark:
             traceback.print_exc()
             raise
 
-    def run_inference(self, prompts: List[str]) -> BenchmarkMetrics:
+    def run_inference(
+        self, prompts: List[str], use_profiler: bool = False
+    ) -> BenchmarkMetrics:
         """Run inference and collect metrics."""
         if self.engine is None:
             raise RuntimeError("Engine not initialized. Call setup() first.")
@@ -248,9 +418,31 @@ class VLLMTorchTitanBenchmark:
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.empty_cache()
 
+        # Try to use start_profile/stop_profile if available (newer vLLM versions)
+        # With VLLM_TORCH_PROFILER_DIR set, profiling may happen automatically
+        profile_started = False
+        if use_profiler and self.profiling_enabled:
+            if hasattr(self.engine, "start_profile"):
+                try:
+                    self.engine.start_profile()
+                    profile_started = True
+                    print("Profiler started successfully")
+                except Exception as e:
+                    print(f"  Warning: start_profile() failed: {e}")
+                    print(
+                        "  Profiling will rely on VLLM_TORCH_PROFILER_DIR environment variable"
+                    )
+
         start_time = time.perf_counter()
         outputs = self.engine.generate(prompts, self.sampling_params)
         end_time = time.perf_counter()
+
+        # Stop profiler if it was started
+        if profile_started:
+            try:
+                self.engine.stop_profile()
+            except Exception as e:
+                print(f"  Warning: stop_profile() failed: {e}")
 
         total_time = end_time - start_time
         total_tokens = sum(len(output.outputs[0].token_ids) for output in outputs)
@@ -287,6 +479,14 @@ class VLLMTorchTitanBenchmark:
 
     def cleanup(self):
         """Cleanup resources."""
+        # Wait for profiler to finish writing traces (if profiling was enabled)
+        if self.profiling_enabled:
+            print(
+                f"  Waiting for profiler to finish writing traces to {self.profile_dir}..."
+            )
+            print("  This may take several minutes for large traces...")
+            time.sleep(120)  # Increased to 2 minutes for large traces
+            print(f"  Profiler cleanup complete. Check traces at: {self.profile_dir}")
         if self.engine is not None:
             del self.engine
             self.engine = None
@@ -563,7 +763,9 @@ class TorchTitanNativeBenchmark:
 
         return generated_tokens, prefill_time, decode_time
 
-    def run_inference(self, prompts: List[str]) -> BenchmarkMetrics:
+    def run_inference(
+        self, prompts: List[str], profiler: Optional[torch.profiler.profile] = None
+    ) -> BenchmarkMetrics:
         """Run inference and collect metrics."""
         if self.model is None or self.tokenizer is None:
             raise RuntimeError("Model not initialized. Call setup() first.")
@@ -578,38 +780,50 @@ class TorchTitanNativeBenchmark:
 
         start_time = time.perf_counter()
 
-        for prompt in prompts:
-            # Tokenize (using TorchTitan tokenizer API)
-            if hasattr(self.tokenizer, "encode"):
-                # For BaseTokenizer with encode method that takes add_bos/add_eos
-                try:
-                    input_ids = torch.tensor(
-                        self.tokenizer.encode(prompt, add_bos=True, add_eos=False),
-                        dtype=torch.long,
-                    )
-                except TypeError:
-                    # Fallback for HF tokenizers
+        # Define the inference loop
+        def run_generation():
+            nonlocal total_tokens, total_prefill_time, total_decode_time, first_token_latency
+
+            for prompt in prompts:
+                # Tokenize (using TorchTitan tokenizer API)
+                if hasattr(self.tokenizer, "encode"):
+                    # For BaseTokenizer with encode method that takes add_bos/add_eos
+                    try:
+                        input_ids = torch.tensor(
+                            self.tokenizer.encode(prompt, add_bos=True, add_eos=False),
+                            dtype=torch.long,
+                        )
+                    except TypeError:
+                        # Fallback for HF tokenizers
+                        input_ids = torch.tensor(
+                            self.tokenizer.encode(prompt), dtype=torch.long
+                        )
+                else:
+                    # Fallback
                     input_ids = torch.tensor(
                         self.tokenizer.encode(prompt), dtype=torch.long
                     )
-            else:
-                # Fallback
-                input_ids = torch.tensor(
-                    self.tokenizer.encode(prompt), dtype=torch.long
+
+                # Generate
+                output_tokens, prefill_time, decode_time = self.generate_with_timing(
+                    input_ids, self.config.max_tokens
                 )
 
-            # Generate
-            output_tokens, prefill_time, decode_time = self.generate_with_timing(
-                input_ids, self.config.max_tokens
-            )
+                if first_token_latency is None:
+                    first_token_latency = prefill_time * 1000  # Convert to ms
 
-            if first_token_latency is None:
-                first_token_latency = prefill_time * 1000  # Convert to ms
+                num_generated = output_tokens.size(1) - input_ids.size(0)
+                total_tokens += num_generated
+                total_prefill_time += prefill_time
+                total_decode_time += decode_time
 
-            num_generated = output_tokens.size(1) - input_ids.size(0)
-            total_tokens += num_generated
-            total_prefill_time += prefill_time
-            total_decode_time += decode_time
+        # Run with or without profiler
+        if profiler is not None:
+            with profiler:
+                run_generation()
+                profiler.step()
+        else:
+            run_generation()
 
         end_time = time.perf_counter()
         total_time = end_time - start_time
@@ -683,6 +897,10 @@ class BenchmarkRunner:
         """Run benchmark for a specific approach."""
         print(f"\n{'=' * 60}")
         print(f"Benchmarking: {key}")
+        if self.config.profile:
+            print(
+                f"Profiling ENABLED - traces will be saved to: {self.config.profile_dir}"
+            )
         print(f"{'=' * 60}")
 
         try:
@@ -691,7 +909,10 @@ class BenchmarkRunner:
 
             prompts = self.load_prompts()
 
-            # Warmup runs
+            # Determine if this is a vLLM benchmark (uses built-in profiler) or TorchTitan (uses external profiler)
+            is_vllm_benchmark = key.startswith("vllm_")
+
+            # Warmup runs (no profiling during warmup)
             print(f"Running {self.config.warmup_runs} warmup iterations...")
             for i in range(self.config.warmup_runs):
                 benchmark.run_inference(prompts)
@@ -699,14 +920,54 @@ class BenchmarkRunner:
 
             # Actual benchmark runs
             print(f"Running {self.config.num_runs} benchmark iterations...")
-            for i in range(self.config.num_runs):
-                metrics = benchmark.run_inference(prompts)
-                self.results[key].append(metrics)
-                print(
-                    f"  Run {i + 1}/{self.config.num_runs}: "
-                    f"{metrics.throughput_tokens_per_sec:.2f} tokens/s, "
-                    f"latency: {metrics.latency_per_token_ms:.2f} ms/token"
-                )
+
+            if self.config.profile:
+                if is_vllm_benchmark:
+                    # For vLLM benchmarks, use vLLM's built-in profiler API
+                    # Only run 1 iteration when profiling to avoid large trace files
+                    profile_runs = 1
+                    print(f"  (Profiling mode: running {profile_runs} iteration only)")
+                    for i in range(profile_runs):
+                        metrics = benchmark.run_inference(prompts, use_profiler=True)
+                        self.results[key].append(metrics)
+                        print(
+                            f"  Run {i + 1}/{profile_runs} (profiled): "
+                            f"{metrics.throughput_tokens_per_sec:.2f} tokens/s, "
+                            f"latency: {metrics.latency_per_token_ms:.2f} ms/token"
+                        )
+                else:
+                    # For TorchTitan Native, use external PyTorch profiler
+                    approach_name = key.replace("_", " ").title()
+                    profiler_manager = ProfilerManager(self.config, approach_name)
+                    profiler = profiler_manager.create_simple_profiler()
+
+                    if profiler is not None:
+                        profiler.__enter__()
+
+                    for i in range(self.config.num_runs):
+                        metrics = benchmark.run_inference(prompts)
+                        self.results[key].append(metrics)
+                        print(
+                            f"  Run {i + 1}/{self.config.num_runs}: "
+                            f"{metrics.throughput_tokens_per_sec:.2f} tokens/s, "
+                            f"latency: {metrics.latency_per_token_ms:.2f} ms/token"
+                        )
+                        if profiler is not None:
+                            profiler.step()
+
+                    if profiler is not None:
+                        profiler.__exit__(None, None, None)
+                        profiler_manager.export_chrome_trace(0)
+                        profiler_manager.print_summary()
+            else:
+                for i in range(self.config.num_runs):
+                    metrics = benchmark.run_inference(prompts)
+                    self.results[key].append(metrics)
+                    print(
+                        f"  Run {i + 1}/{self.config.num_runs}: "
+                        f"{metrics.throughput_tokens_per_sec:.2f} tokens/s, "
+                        f"latency: {metrics.latency_per_token_ms:.2f} ms/token"
+                    )
 
             benchmark.cleanup()
             print(f"✓ {key} benchmark completed")
@@ -858,6 +1119,11 @@ class BenchmarkRunner:
         print(f"  Max tokens: {self.config.max_tokens}")
         print(f"  Warmup runs: {self.config.warmup_runs}")
         print(f"  Benchmark runs: {self.config.num_runs}")
+        if self.config.profile:
+            print("  Profiling: ENABLED")
+            print(f"  Profile dir: {self.config.profile_dir}")
+        else:
+            print("  Profiling: disabled")
 
         # Run benchmarks
         self.run_benchmark(VLLMNativeBenchmark, "vllm_native")
@@ -891,7 +1157,7 @@ def main():
     parser.add_argument(
         "--prompts",
         type=str,
-        default="prompts.txt",
+        default="scripts/prompts.txt",
         help="File containing prompts (one per line)",
     )
     parser.add_argument(
@@ -951,6 +1217,36 @@ def main():
         default=1,
         help="Tensor parallelism size (default: 1). When TP > 1, use torchrun --nproc_per_node=TP",
     )
+    # Profiling options
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable PyTorch profiler to collect performance traces",
+    )
+    parser.add_argument(
+        "--profile-dir",
+        type=str,
+        default="./profiler_traces",
+        help="Directory to save profiler traces (default: ./profiler_traces)",
+    )
+    parser.add_argument(
+        "--profile-wait",
+        type=int,
+        default=1,
+        help="Number of steps to skip before profiling starts (default: 1)",
+    )
+    parser.add_argument(
+        "--profile-warmup",
+        type=int,
+        default=1,
+        help="Number of warmup steps for the profiler (default: 1)",
+    )
+    parser.add_argument(
+        "--profile-active",
+        type=int,
+        default=2,
+        help="Number of active profiling steps (default: 2)",
+    )
 
     args = parser.parse_args()
 
@@ -965,6 +1261,11 @@ def main():
         max_tokens=args.max_tokens,
         num_runs=args.num_runs,
         warmup_runs=args.warmup_runs,
+        profile=args.profile,
+        profile_dir=args.profile_dir,
+        profile_wait=args.profile_wait,
+        profile_warmup=args.profile_warmup,
+        profile_active=args.profile_active,
     )
 
     runner = BenchmarkRunner(config)

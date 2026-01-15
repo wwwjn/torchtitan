@@ -22,7 +22,11 @@ NUM_RUNS=5
 WARMUP_RUNS=2
 OUTPUT_DIR="benchmark_results"
 TORCHTITAN_CONFIG=""
-PROMPTS_FILE="prompts.txt"
+PROMPTS_FILE="scripts/prompts.txt"
+
+# Profiling options
+PROFILE=false
+PROFILE_DIR="./profiler_traces"
 
 # Benchmark selection (all enabled by default)
 RUN_VLLM_NATIVE=true
@@ -72,6 +76,14 @@ while [[ $# -gt 0 ]]; do
             PROMPTS_FILE="$2"
             shift 2
             ;;
+        --profile)
+            PROFILE=true
+            shift
+            ;;
+        --profile-dir)
+            PROFILE_DIR="$2"
+            shift 2
+            ;;
         --skip-vllm-native)
             RUN_VLLM_NATIVE=false
             shift
@@ -117,7 +129,11 @@ while [[ $# -gt 0 ]]; do
             echo "  --warmup-runs <int>        Number of warmup runs (default: 2)"
             echo "  --output-dir <path>        Output directory for results (default: benchmark_results)"
             echo "  --torchtitan-config <path> TorchTitan config file path"
-            echo "  --prompts <path>           Prompts file path (default: prompts.txt)"
+            echo "  --prompts <path>           Prompts file path (default: scripts/prompts.txt)"
+            echo ""
+            echo "Profiling options:"
+            echo "  --profile                  Enable PyTorch profiler for performance tracing"
+            echo "  --profile-dir <path>       Directory to save profiler traces (default: ./profiler_traces)"
             echo ""
             echo "Benchmark selection:"
             echo "  --skip-vllm-native         Skip vLLM native benchmark"
@@ -136,6 +152,12 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "  # Run only TorchTitan native with TP=4"
             echo "  $0 --checkpoint /path/to/checkpoint --tp 4 --only-torchtitan-native"
+            echo ""
+            echo "  # Run benchmarks with profiling enabled"
+            echo "  $0 --checkpoint /path/to/checkpoint --profile --profile-dir ./traces"
+            echo ""
+            echo "  # Profile only vLLM native benchmark"
+            echo "  $0 --checkpoint /path/to/checkpoint --only-vllm-native --profile --num-runs 2"
             exit 0
             ;;
         *)
@@ -166,6 +188,12 @@ if [ -n "$TORCHTITAN_CONFIG" ]; then
     COMMON_ARGS="$COMMON_ARGS --torchtitan-config $TORCHTITAN_CONFIG"
 fi
 
+# Add profiling arguments if enabled
+if [ "$PROFILE" = true ]; then
+    COMMON_ARGS="$COMMON_ARGS --profile --profile-dir $PROFILE_DIR"
+    mkdir -p "$PROFILE_DIR"
+fi
+
 echo "============================================================"
 echo "Benchmark Configuration"
 echo "============================================================"
@@ -177,6 +205,14 @@ echo "Max Tokens: $MAX_TOKENS"
 echo "Num Runs: $NUM_RUNS"
 echo "Warmup Runs: $WARMUP_RUNS"
 echo "Output Directory: $OUTPUT_DIR"
+if [ "$PROFILE" = true ]; then
+    echo ""
+    echo "Profiling: ENABLED"
+    echo "Profile Directory: $PROFILE_DIR"
+else
+    echo ""
+    echo "Profiling: disabled"
+fi
 echo ""
 echo "Benchmarks to run:"
 echo "  vLLM Native: $RUN_VLLM_NATIVE"
@@ -253,9 +289,23 @@ echo ""
 echo "============================================================"
 echo "All benchmarks completed!"
 echo "Results saved to: $OUTPUT_DIR/"
+if [ "$PROFILE" = true ]; then
+    echo "Profiler traces saved to: $PROFILE_DIR/"
+    echo ""
+    echo "To visualize traces:"
+    echo "  - Perfetto: https://ui.perfetto.dev/"
+    echo "  - TensorBoard: tensorboard --logdir=$PROFILE_DIR"
+fi
 echo "============================================================"
 
 # List all result files
 echo ""
 echo "Result files:"
 ls -la "$OUTPUT_DIR"/*.json 2>/dev/null || echo "No result files found"
+
+# List profiler trace directories if profiling was enabled
+if [ "$PROFILE" = true ]; then
+    echo ""
+    echo "Profiler trace directories:"
+    ls -la "$PROFILE_DIR"/ 2>/dev/null || echo "No profiler traces found"
+fi
