@@ -86,41 +86,25 @@ class VLLMAttention(torch.nn.Module):
             output: [batch, num_heads, seq_len, head_dim]
         """
         # Input is (batch, num_heads, seq_len, head_dim)
+        # TODO: may be good to use einops in future as we can explicitly reshape
+        # with dimension names - see https://github.com/arogozhnikov/einops
         batch_size, num_heads, seq_len, head_dim = q.shape
         _, num_kv_heads, _, _ = k.shape
 
-        if self._debug_enabled:
-            self._print_tensor_stats("Input Q", q)
-            self._print_tensor_stats("Input K", k)
-            self._print_tensor_stats("Input V", v)
-
-            # Debug: Check if forward context is set
-            from vllm.forward_context import get_forward_context
-            forward_ctx = get_forward_context()
-            print(f"[VLLMAttention DEBUG] Forward context exists: {forward_ctx is not None}")
-            if forward_ctx is not None:
-                print(f"[VLLMAttention DEBUG] attn_metadata type: {type(forward_ctx.attn_metadata)}")
-
-        # Transpose to (batch, seq_len, num_heads, head_dim) for vLLM
+        # vLLM expects (num_tokens, num_heads, head_dim) where num_tokens = batch * seq_len
+        # First transpose to (batch, seq_len, num_heads, head_dim)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
+        # TODO: reimplement as a 4d tensor once vLLM fix has landed
         # Then flatten batch and seq_len: (batch * seq_len, num_heads, head_dim)
         q = q.reshape(batch_size * seq_len, num_heads, head_dim)
         k = k.reshape(batch_size * seq_len, num_kv_heads, head_dim)
         v = v.reshape(batch_size * seq_len, num_kv_heads, head_dim)
 
-        if self._debug_enabled:
-            self._print_tensor_stats("Reshaped Q (to vLLM)", q)
-            self._print_tensor_stats("Reshaped K (to vLLM)", k)
-            self._print_tensor_stats("Reshaped V (to vLLM)", v)
-
         # vLLM attention returns (num_tokens, hidden_size) where hidden_size = num_heads * head_dim
         output_flat = self.vllm_attn(q, k, v)
-
-        if self._debug_enabled:
-            self._print_tensor_stats("vLLM attention output (flat)", output_flat)
 
         # Output is (batch * seq_len, num_heads * head_dim), reshape to (batch, seq_len, num_heads, head_dim)
         output = output_flat.view(batch_size, seq_len, num_heads, head_dim)
