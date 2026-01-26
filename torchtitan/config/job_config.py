@@ -343,6 +343,8 @@ class Parallelism:
     tensor_parallel_degree: int = 1
     """Tensor Parallelism degree. 1 means disabled."""
 
+    disable_sequence_parallel: bool = False
+
     disable_loss_parallel: bool = False
     """Whether to apply loss parallel when sequence parallel is enabled"""
 

@@ -42,6 +42,7 @@ def parallelize_qwen3(
             loss_parallel=not job_config.parallelism.disable_loss_parallel,
             enable_float8_tensorwise_tp=False,
             enable_async_tp=job_config.parallelism.enable_async_tensor_parallel,
+            tp_only=not job_config.parallelism.disable_sequence_parallel,
         )
 
     return model
@@ -53,6 +54,7 @@ def apply_non_moe_tp(
     loss_parallel: bool,
     enable_float8_tensorwise_tp: bool,
     enable_async_tp: bool,
+    tp_only: bool,
 ):
     """Apply tensor parallelism to the Qwen3 dense model.
 
@@ -61,24 +63,35 @@ def apply_non_moe_tp(
     region, this separate plan should be removed.
     """
 
+    tp_plan = {
+        "tok_embeddings": RowwiseParallel(
+            input_layouts=Replicate(),
+            output_layouts=Shard(1),
+            use_local_output=False,
+        ),
+        "norm": SequenceParallel(
+            use_local_output=False,
+        ),
+        "output": ColwiseParallel(
+            input_layouts=Shard(1),
+            output_layouts=Replicate(),
+            use_local_output=True,  # return logits and plain tensor
+        ),
+    } if not tp_only else {
+        "tok_embeddings": RowwiseParallel(
+            input_layouts=Replicate(),
+            use_local_output=False,
+        ),
+        "output": ColwiseParallel(
+            output_layouts=Replicate(),
+            use_local_output=True,  # return logits and plain tensor
+        ),
+    }
+    
     parallelize_module(
         model,
         tp_mesh,
-        {
-            "tok_embeddings": RowwiseParallel(
-                input_layouts=Replicate(),
-                output_layouts=Shard(1),
-                use_local_output=False,
-            ),
-            "norm": SequenceParallel(
-                use_local_output=False,
-            ),
-            "output": ColwiseParallel(
-                input_layouts=Shard(1),
-                output_layouts=Replicate(),
-                use_local_output=True,  # return logits and plain tensor
-            ),
-        },
+        tp_plan,
     )
 
     # Apply tensor + sequence parallelism to every transformer block
@@ -124,23 +137,46 @@ def apply_non_moe_tp(
             "ffn_norm": SequenceParallel(
                 use_local_output=False,
             ),
+        } if not tp_only else {
+            "attention.wq": ColwiseParallel(use_local_output=False),
+            "attention.wk": ColwiseParallel(use_local_output=False),
+            "attention.wv": ColwiseParallel(use_local_output=False),
+            # Apply on vllm.Attention() module to use local tensor
+            "attention.inner_attention": PrepareModuleInputOutput(
+                input_layouts=(Shard(1), Shard(1), Shard(1)),  # xq, xk, xv
+                desired_input_layouts=(None, None, None),
+                use_local_input=True,  # use local tensor for attention calculation
+                output_layouts=(Shard(1)),  # output
+                desired_output_layouts=(Shard(1)),
+                use_local_output=False,
+            ),
+            "attention.wo": RowwiseParallel(use_local_output=False),
         }
 
         # pyrefly: ignore [missing-attribute]
         if not transformer_block.moe_enabled:
-            layer_plan.update(
-                {
-                    "feed_forward": PrepareModuleInput(
-                        input_layouts=(Shard(1),),
-                        desired_input_layouts=(Replicate(),),
-                    ),
-                    "feed_forward.w1": ColwiseParallel(use_local_output=False),
-                    "feed_forward.w2": RowwiseParallel(
-                        output_layouts=Shard(1), use_local_output=False
-                    ),
-                    "feed_forward.w3": ColwiseParallel(use_local_output=False),
-                }
-            )
+            if not tp_only:
+                layer_plan.update(
+                    {
+                        "feed_forward": PrepareModuleInput( # all-gather
+                            input_layouts=(Shard(1),),
+                            desired_input_layouts=(Replicate(),),
+                        ),
+                        "feed_forward.w1": ColwiseParallel(use_local_output=False),
+                        "feed_forward.w2": RowwiseParallel(
+                            output_layouts=Shard(1), use_local_output=False  # reduce-scatter from P to S(1)
+                        ),
+                        "feed_forward.w3": ColwiseParallel(use_local_output=False),
+                    }
+                )
+            else:
+                layer_plan.update(
+                    {
+                        "feed_forward.w1": ColwiseParallel(use_local_output=False),
+                        "feed_forward.w2": RowwiseParallel(use_local_output=False),
+                        "feed_forward.w3": ColwiseParallel(use_local_output=False),
+                    }
+                )
         else:
             raise ValueError(
                 "Running vLLM inference with torchtitan Qwen3 MoE model is not supported yet."

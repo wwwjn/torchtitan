@@ -11,8 +11,6 @@ This module provides TorchTitanVLLMModel: Core model class that adapts
 TorchTitan models for vLLM.
 """
 
-import os
-import time
 from functools import partial
 
 import torch
@@ -39,77 +37,6 @@ from vllm.logger import init_logger
 
 
 logger = init_logger(__name__)
-
-# Enable timing instrumentation via environment variable
-# Check at runtime to handle worker process spawning
-def _is_timing_enabled() -> bool:
-    return os.environ.get("TORCHTITAN_VLLM_TIMING", "0") == "1"
-
-
-# Global timing stats accumulator for TorchTitan model
-_tt_timing_stats: dict[str, list[float]] = {}
-
-
-def _log_timing(name: str, elapsed_ms: float, phase: str = ""):
-    """Log timing information.
-
-    Args:
-        name: The operation name
-        elapsed_ms: Time in milliseconds
-        phase: Optional phase identifier (prefill/decode)
-    """
-    if _is_timing_enabled():
-        full_name = f"{phase}.{name}" if phase else name
-        logger.info(f"[TORCHTITAN_TIMING] {full_name}: {elapsed_ms:.3f} ms")
-        # Accumulate stats
-        if full_name not in _tt_timing_stats:
-            _tt_timing_stats[full_name] = []
-        _tt_timing_stats[full_name].append(elapsed_ms)
-
-
-def get_torchtitan_timing_stats() -> dict[str, dict[str, float]]:
-    """Get aggregated timing statistics for TorchTitan model."""
-    result = {}
-    for name, times in _tt_timing_stats.items():
-        if times:
-            result[name] = {
-                "count": len(times),
-                "total_ms": sum(times),
-                "avg_ms": sum(times) / len(times),
-                "min_ms": min(times),
-                "max_ms": max(times),
-            }
-    return result
-
-
-def reset_torchtitan_timing_stats():
-    """Reset all TorchTitan timing statistics."""
-    global _tt_timing_stats
-    _tt_timing_stats = {}
-
-
-def print_torchtitan_timing_summary():
-    """Print a summary of TorchTitan timing statistics."""
-    stats = get_torchtitan_timing_stats()
-    if not stats:
-        logger.info("[TORCHTITAN_TIMING] No timing data collected")
-        return
-
-    logger.info("\n" + "=" * 80)
-    logger.info("[TORCHTITAN_TIMING] TIMING SUMMARY")
-    logger.info("=" * 80)
-    logger.info(
-        f"{'Operation':<50} {'Count':>8} {'Total(ms)':>12} {'Avg(ms)':>10} {'Min(ms)':>10} {'Max(ms)':>10}"
-    )
-    logger.info("-" * 100)
-
-    # Sort by total time descending
-    for name, data in sorted(stats.items(), key=lambda x: -x[1]["total_ms"]):
-        logger.info(
-            f"{name:<50} {data['count']:>8} {data['total_ms']:>12.2f} "
-            f"{data['avg_ms']:>10.3f} {data['min_ms']:>10.3f} {data['max_ms']:>10.3f}"
-        )
-    logger.info("=" * 80)
 
 
 class TorchTitanVLLMModelWrapper(nn.Module):
@@ -169,6 +96,7 @@ class TorchTitanVLLMModelWrapper(nn.Module):
         self.parallel_config = create_job_config_from_vllm_config(
             vllm_config=vllm_config,
         )
+        self.parallel_config.parallelism.disable_sequence_parallel = True
         # Replace attention with vLLM paged attention
         tp_size = self.parallel_dims.tp
         if tp_size > 1:
@@ -257,6 +185,17 @@ class TorchTitanVLLMModelWrapper(nn.Module):
         """Convert input token IDs to embeddings (deprecated vLLM interface)."""
         return self.embed_input_ids(input_ids)
 
+    def _print_tensor_stats(self, name: str, tensor: torch.Tensor) -> None:
+        """Print tensor statistics for debugging."""
+        if isinstance(tensor, DTensor):
+            t = tensor.to_local()
+        else:
+            t = tensor
+        print(f"[DEBUG] {name}: shape={tuple(t.shape)}, dtype={t.dtype}, "
+              f"min={t.min().item():.6f}, max={t.max().item():.6f}, "
+              f"mean={t.float().mean().item():.6f}, std={t.float().std().item():.6f}, "
+              f"has_nan={t.isnan().any().item()}, has_inf={t.isinf().any().item()}")
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -276,31 +215,24 @@ class TorchTitanVLLMModelWrapper(nn.Module):
         Returns:
             hidden_states: Final hidden states [total_tokens, hidden_size]
         """
-        forward_start = time.perf_counter()
-
         if inputs_embeds is not None:
             raise NotImplementedError("inputs_embeds not yet supported")
 
         if input_ids is None:
             raise ValueError("Either input_ids or inputs_embeds must be provided")
 
-        # Determine phase: prefill if num_tokens > 1, decode otherwise
-        num_tokens = input_ids.shape[0]
-        phase = "prefill" if num_tokens > 1 else "decode"
-        if _is_timing_enabled():
-            logger.info(f"[TORCHTITAN_TIMING] Phase: {phase}, num_tokens: {num_tokens}")
+        print(f"\n[DEBUG] ===== TorchTitan forward() start =====")
+        print(f"[DEBUG] input_ids: shape={tuple(input_ids.shape)}, min={input_ids.min().item()}, max={input_ids.max().item()}")
+        if positions is not None:
+            print(f"[DEBUG] positions: shape={tuple(positions.shape)}, min={positions.min().item()}, max={positions.max().item()}")
 
         # Convert vLLM interface to TorchTitan interface
         # vLLM: [total_tokens] → TorchTitan: [batch_size, seq_len]
         tokens_2d = input_ids.unsqueeze(0)
 
         # Get embeddings
-        embed_start = time.perf_counter()
         h = self.model.tok_embeddings(tokens_2d)
-        torch.cuda.synchronize()
-        _log_timing(
-            "forward.tok_embeddings", (time.perf_counter() - embed_start) * 1000, phase
-        )
+        self._print_tensor_stats("After tok_embeddings", h)
 
         # Get RoPE cache (handle model-specific attribute names)
         # Use hasattr to avoid ambiguous boolean value error with tensors
@@ -318,51 +250,36 @@ class TorchTitanVLLMModelWrapper(nn.Module):
             max_position = 0
 
         rope_cache = self._extend_rope_cache_if_needed(rope_attr, max_position)
+        if rope_cache is not None:
+            self._print_tensor_stats("rope_cache", rope_cache)
         positions = positions.unsqueeze(0)
 
         # Pass through transformer layers
-        layers_start = time.perf_counter()
-        for i, layer in enumerate(self.model.layers.values()):
-            layer_start = time.perf_counter()
+        for layer_idx, (layer_name, layer) in enumerate(self.model.layers.items()):
             h = layer(h, rope_cache, attention_masks=None, positions=positions)
-            if (
-                _is_timing_enabled() and i < 3
-            ):  # Only log first 3 layers to avoid too much output
-                torch.cuda.synchronize()
-                _log_timing(
-                    f"forward.layer_{i}",
-                    (time.perf_counter() - layer_start) * 1000,
-                    phase,
-                )
-        torch.cuda.synchronize()
-        _log_timing(
-            "forward.transformer_layers",
-            (time.perf_counter() - layers_start) * 1000,
-            phase,
-        )
+            self._print_tensor_stats(f"After layer {layer_name}", h)
+            # Check for explosion early
+            if isinstance(h, DTensor):
+                t = h.to_local()
+            else:
+                t = h
+            if t.abs().max().item() > 1e6:
+                print(f"[DEBUG] WARNING: Values exploded at layer {layer_name}!")
 
         # When parallelism is applied, get full tensor before return to vLLM Engine
         # The original placement is Shard(1) (shard on sequence dimension, as it will prepare for sequence parallel in `self.norm`).
         # vLLM's engine expects plain, non-distributed tensors to slice the last token for each request.
         if isinstance(h, DTensor):
-            dtensor_start = time.perf_counter()
             h = h.full_tensor()
-            torch.cuda.synchronize()
-            _log_timing(
-                "forward.dtensor_to_full",
-                (time.perf_counter() - dtensor_start) * 1000,
-                phase,
-            )
 
         # Convert to vLLM format: [total_tokens, hidden_size]
         if h.dim() == 3:
             batch_size, seq_len, hidden_size = h.shape
             h = h.view(batch_size * seq_len, hidden_size)
 
-        torch.cuda.synchronize()
-        _log_timing(
-            "forward.total", (time.perf_counter() - forward_start) * 1000, phase
-        )
+        self._print_tensor_stats("Final output (before compute_logits)", h)
+        print(f"[DEBUG] ===== TorchTitan forward() end =====\n")
+
         return h
 
     def compute_logits(
@@ -371,18 +288,13 @@ class TorchTitanVLLMModelWrapper(nn.Module):
         sampling_metadata=None,
     ) -> torch.Tensor | None:
         """Compute logits from hidden states."""
-        compute_logits_start = time.perf_counter()
-
-        # Determine phase based on hidden states size
-        # For compute_logits, typically 1 token per request for decode, more for prefill
-        num_tokens = hidden_states.shape[0]
-        phase = "prefill" if num_tokens > 1 else "decode"
+        print(f"\n[DEBUG] ===== TorchTitan compute_logits() start =====")
+        self._print_tensor_stats("Input hidden_states", hidden_states)
 
         # When TP is applied, we return the full tensor (plain tensor) to vLLM engine
         # at the end of TorchTitanVLLMModelWrapper.forward().
         # We need to wrap the input from vLLM engine back to DTensor with Replicate() placement.
         if self.parallel_dims.tp_enabled:
-            dtensor_start = time.perf_counter()
             hidden_states = DTensor.from_local(
                 hidden_states,
                 device_mesh=self.parallel_dims.get_mesh("tp"),
@@ -390,31 +302,15 @@ class TorchTitanVLLMModelWrapper(nn.Module):
                     Replicate(),
                 ],
             )
-            _log_timing(
-                "compute_logits.dtensor_from_local",
-                (time.perf_counter() - dtensor_start) * 1000,
-                phase,
-            )
 
-        norm_start = time.perf_counter()
         h = self.model.norm(hidden_states)
-        torch.cuda.synchronize()
-        _log_timing(
-            "compute_logits.norm", (time.perf_counter() - norm_start) * 1000, phase
-        )
+        self._print_tensor_stats("After norm", h)
 
-        output_start = time.perf_counter()
         logits = self.model.output(h)
-        torch.cuda.synchronize()
-        _log_timing(
-            "compute_logits.output", (time.perf_counter() - output_start) * 1000, phase
-        )
+        self._print_tensor_stats("Final logits", logits)
 
-        _log_timing(
-            "compute_logits.total",
-            (time.perf_counter() - compute_logits_start) * 1000,
-            phase,
-        )
+        print(f"[DEBUG] ===== TorchTitan compute_logits() end =====\n")
+
         return logits
 
     def load_weights(self, weights_iter):
