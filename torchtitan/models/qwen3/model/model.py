@@ -670,6 +670,10 @@ class Qwen3Model(ModelProtocol):
         # pyrefly: ignore[not-callable, invalid-argument]
         h = self.norm(h) if self.norm else h
         # pyrefly: ignore[not-callable, invalid-argument]
+        if self._debug_enabled:
+            self._print_tensor_stats("After final norm", h)
+
+        # pyrefly: ignore [not-callable]
         output = self.output(h) if self.output else h
         if self._debug_enabled:
             self._print_tensor_stats("Final output (logits)", output)

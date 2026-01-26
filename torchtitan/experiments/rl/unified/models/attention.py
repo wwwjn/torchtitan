@@ -93,21 +93,39 @@ class VLLMAttention(torch.nn.Module):
 
         # vLLM expects (num_tokens, num_heads, head_dim) where num_tokens = batch * seq_len
         # First transpose to (batch, seq_len, num_heads, head_dim)
+        if self._debug_enabled:
+            self._print_tensor_stats("Input Q", q)
+            self._print_tensor_stats("Input K", k)
+            self._print_tensor_stats("Input V", v)
+
+            # Debug: Check if forward context is set
+            from vllm.forward_context import get_forward_context
+            forward_ctx = get_forward_context()
+            print(f"[VLLMAttention DEBUG] Forward context exists: {forward_ctx is not None}")
+            if forward_ctx is not None:
+                print(f"[VLLMAttention DEBUG] attn_metadata type: {type(forward_ctx.attn_metadata)}")
+
+        # Transpose to (batch, seq_len, num_heads, head_dim) for vLLM
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-<<<<<<< HEAD
         # TODO: reimplement as a 4d tensor once vLLM fix has landed
-=======
->>>>>>> 7441d636 (using vllm nightly)
         # Then flatten batch and seq_len: (batch * seq_len, num_heads, head_dim)
         q = q.reshape(batch_size * seq_len, num_heads, head_dim)
         k = k.reshape(batch_size * seq_len, num_kv_heads, head_dim)
         v = v.reshape(batch_size * seq_len, num_kv_heads, head_dim)
 
+        if self._debug_enabled:
+            self._print_tensor_stats("Reshaped Q (to vLLM)", q)
+            self._print_tensor_stats("Reshaped K (to vLLM)", k)
+            self._print_tensor_stats("Reshaped V (to vLLM)", v)
+
         # vLLM attention returns (num_tokens, hidden_size) where hidden_size = num_heads * head_dim
         output_flat = self.vllm_attn(q, k, v)
+
+        if self._debug_enabled:
+            self._print_tensor_stats("vLLM attention output (flat)", output_flat)
 
         # Output is (batch * seq_len, num_heads * head_dim), reshape to (batch, seq_len, num_heads, head_dim)
         output = output_flat.view(batch_size, seq_len, num_heads, head_dim)
