@@ -13,9 +13,6 @@ class VLLMAttention(torch.nn.Module):
     Wrapper around vLLM's Attention. Compatible with TorchTitan input shape.
     """
 
-    # Debug flag
-    _debug_enabled = False
-
     def __init__(
         self,
         hidden_size: int,
@@ -52,18 +49,9 @@ class VLLMAttention(torch.nn.Module):
             head_size=head_dim,
             scale=self.scale,
             num_kv_heads=num_kv_heads,
-            cache_config=cache_config,
             quant_config=None,
             prefix=f"model.layers.{layer_name}.attention.inner_attention",
         )
-
-    def _print_tensor_stats(self, name: str, tensor: torch.Tensor) -> None:
-        """Print tensor statistics for debugging."""
-        if not self._debug_enabled:
-            return
-        print(f"[VLLMAttention DEBUG] {name}: shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
-              f"min={tensor.min().item():.6f}, max={tensor.max().item():.6f}, "
-              f"mean={tensor.float().mean().item():.6f}")
 
     def forward(
         self,
@@ -91,20 +79,6 @@ class VLLMAttention(torch.nn.Module):
         batch_size, num_heads, seq_len, head_dim = q.shape
         _, num_kv_heads, _, _ = k.shape
 
-        # vLLM expects (num_tokens, num_heads, head_dim) where num_tokens = batch * seq_len
-        # First transpose to (batch, seq_len, num_heads, head_dim)
-        if self._debug_enabled:
-            self._print_tensor_stats("Input Q", q)
-            self._print_tensor_stats("Input K", k)
-            self._print_tensor_stats("Input V", v)
-
-            # Debug: Check if forward context is set
-            from vllm.forward_context import get_forward_context
-            forward_ctx = get_forward_context()
-            print(f"[VLLMAttention DEBUG] Forward context exists: {forward_ctx is not None}")
-            if forward_ctx is not None:
-                print(f"[VLLMAttention DEBUG] attn_metadata type: {type(forward_ctx.attn_metadata)}")
-
         # Transpose to (batch, seq_len, num_heads, head_dim) for vLLM
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
@@ -116,24 +90,13 @@ class VLLMAttention(torch.nn.Module):
         k = k.reshape(batch_size * seq_len, num_kv_heads, head_dim)
         v = v.reshape(batch_size * seq_len, num_kv_heads, head_dim)
 
-        if self._debug_enabled:
-            self._print_tensor_stats("Reshaped Q (to vLLM)", q)
-            self._print_tensor_stats("Reshaped K (to vLLM)", k)
-            self._print_tensor_stats("Reshaped V (to vLLM)", v)
-
-        # vLLM attention returns (num_tokens, hidden_size) where hidden_size = num_heads * head_dim
+        # vLLM attention returns (num_tokens, num_heads, head_dim)
         output_flat = self.vllm_attn(q, k, v)
-
-        if self._debug_enabled:
-            self._print_tensor_stats("vLLM attention output (flat)", output_flat)
 
         # Output is (batch * seq_len, num_heads * head_dim), reshape to (batch, seq_len, num_heads, head_dim)
         output = output_flat.view(batch_size, seq_len, num_heads, head_dim)
 
         # Transpose back to TorchTitan format: (batch, num_heads, seq_len, head_dim)
         output = output.transpose(1, 2)
-
-        if self._debug_enabled:
-            self._print_tensor_stats("Final output", output)
 
         return output

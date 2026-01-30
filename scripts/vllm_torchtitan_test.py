@@ -9,8 +9,6 @@ Tests for vLLM integration with TorchTitan models.
 
 This script tests vLLM running TorchTitan model vs vLLM running native Qwen3 model.
 Both models use vLLM's attention and forward context, and we compare their outputs.
-
-Similar pattern to sixlib's vllm_test.py.
 """
 
 import os
@@ -52,6 +50,14 @@ BLOCK_SIZE = 32
 _distributed_initialized = False
 
 
+def get_distributed_info():
+    """Get distributed environment info from environment variables."""
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    return world_size, rank, local_rank
+
+
 def ensure_distributed_initialized():
     """Initialize distributed environment if not already done."""
     global _distributed_initialized
@@ -60,19 +66,24 @@ def ensure_distributed_initialized():
     if model_parallel_is_initialized() or _distributed_initialized:
         return
 
+    world_size, rank, local_rank = get_distributed_info()
+
     temp_file = tempfile.mkstemp()[1]
     os.environ["DIST_INIT_METHOD"] = f"file://{temp_file}"
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
     init_distributed_environment(
-        world_size=1,
-        rank=0,
+        world_size=world_size,
+        rank=rank,
         distributed_init_method=os.environ["DIST_INIT_METHOD"],
-        local_rank=0,
+        local_rank=local_rank,
         backend="nccl",
     )
-    initialize_model_parallel(1, 1)
+    initialize_model_parallel(world_size, 1)  # TP=world_size, PP=1
     _distributed_initialized = True
+
+    if rank == 0:
+        print(f"Initialized distributed environment: TP={world_size}")
 
 
 @dataclass
@@ -118,13 +129,17 @@ def setup_models_and_inputs(
     # Setup distributed environment
     ensure_distributed_initialized()
 
+    # Get world size for tensor parallel
+    world_size, rank, local_rank = get_distributed_info()
+    device = f"cuda:{local_rank}"
+
     # Create vLLM EngineArgs for native Qwen3 model
     engine_args = EngineArgs(
         model=model_name,
         skip_tokenizer_init=True,
         enforce_eager=True,
         gpu_memory_utilization=0.1,
-        tensor_parallel_size=1,
+        tensor_parallel_size=world_size,
         dtype="bfloat16",
     )
 
@@ -140,10 +155,11 @@ def setup_models_and_inputs(
     head_dim = getattr(hf_config, "head_dim", model_dim // num_heads)
     hidden_dim = hf_config.intermediate_size
 
-    print(f"\n=== Model dimensions from {model_name} ===")
-    print(f"model_dim={model_dim}, vocab_size={vocab_size}, num_heads={num_heads}, "
-          f"num_kv_heads={num_kv_heads}, num_layers={num_layers}, hidden_dim={hidden_dim}, "
-          f"head_dim={head_dim}")
+    if rank == 0:
+        print(f"\n=== Model dimensions from {model_name} ===")
+        print(f"model_dim={model_dim}, vocab_size={vocab_size}, num_heads={num_heads}, "
+              f"num_kv_heads={num_kv_heads}, num_layers={num_layers}, hidden_dim={hidden_dim}, "
+              f"head_dim={head_dim}")
 
     # Create TorchTitan model args matching vLLM model config
     model_args = Qwen3ModelArgs(
@@ -164,13 +180,16 @@ def setup_models_and_inputs(
     )
 
     # Load vLLM native Qwen3 model
-    print("\n=== Loading vLLM native Qwen3 model ===")
+    if rank == 0:
+        print("\n=== Loading vLLM native Qwen3 model ===")
     loader = get_model_loader(vllm_config.load_config)
     vllm_native_model = loader.load_model(vllm_config, vllm_config.model_config)
-    print(f"vLLM native model: {type(vllm_native_model)}")
+    if rank == 0:
+        print(f"vLLM native model: {type(vllm_native_model)}")
 
     # Create TorchTitan model with vLLM wrapper
-    print("\n=== Creating TorchTitan model with vLLM wrapper ===")
+    if rank == 0:
+        print("\n=== Creating TorchTitan model with vLLM wrapper ===")
     with set_current_vllm_config(vllm_config):
         torchtitan_vllm_model = TorchTitanVLLMModelWrapper(
             model_cls=Qwen3Model,
@@ -179,14 +198,15 @@ def setup_models_and_inputs(
             parallelize_fn=parallelize_qwen3,
             vllm_config=vllm_config,
         )
-    torchtitan_vllm_model.to(device="cuda", dtype=torch.bfloat16)
+    torchtitan_vllm_model.to(device=device, dtype=torch.bfloat16)
     torchtitan_vllm_model.eval()
 
     # Replace TorchTitan's RMSNorm with vLLM's RMSNorm for numerical equivalence
-    replace_rmsnorm_with_vllm(torchtitan_vllm_model.model, vllm_config)
+    replace_rmsnorm_with_vllm(torchtitan_vllm_model.model, vllm_config, rank)
 
     # Copy weights from vLLM native model to TorchTitan model
-    print("\n=== Copying weights from vLLM native to TorchTitan ===")
+    if rank == 0:
+        print("\n=== Copying weights from vLLM native to TorchTitan ===")
 
     # Calculate sizes for splitting qkv_proj
     q_size = num_heads * head_dim
@@ -195,10 +215,12 @@ def setup_models_and_inputs(
     # Convert vLLM native model state dict to HF format
     hf_state_dict = {}
     param_names = [name for name, _ in vllm_native_model.named_parameters()]
-    print(f"Sample vLLM native model parameter names: {param_names[:5]}")
+    if rank == 0:
+        print(f"Sample vLLM native model parameter names: {param_names[:5]}")
 
     has_lm_head = any("lm_head" in name for name in param_names)
-    print(f"Has lm_head in vLLM native model: {has_lm_head}")
+    if rank == 0:
+        print(f"Has lm_head in vLLM native model: {has_lm_head}")
 
     for name, param in vllm_native_model.named_parameters():
         tensor = param.data.clone()
@@ -211,7 +233,8 @@ def setup_models_and_inputs(
         if "qkv_proj" in name:
             expected_size = q_size + kv_size + kv_size
             actual_size = tensor.shape[0]
-            print(f"  {name}: shape={tuple(tensor.shape)}, expected_size={expected_size}, actual_size={actual_size}")
+            if rank == 0:
+                print(f"  {name}: shape={tuple(tensor.shape)}, expected_size={expected_size}, actual_size={actual_size}")
             if actual_size != expected_size:
                 raise ValueError(
                     f"QKV tensor size mismatch for {name}: expected {expected_size} "
@@ -239,12 +262,14 @@ def setup_models_and_inputs(
         else:
             hf_state_dict[ensure_model_prefix(name)] = tensor
 
-    print(f"\nConverted {len(hf_state_dict)} weight keys to HF format")
+    if rank == 0:
+        print(f"\nConverted {len(hf_state_dict)} weight keys to HF format")
 
-    # Handle weight tying
+    # Handle weight tying: Because vLLM's native model might not explicitly have lm_head.weight in its parameters (it's tied)
     if "lm_head.weight" not in hf_state_dict and "model.embed_tokens.weight" in hf_state_dict:
         hf_state_dict["lm_head.weight"] = hf_state_dict["model.embed_tokens.weight"].clone()
-        print("Applied weight tying: copied model.embed_tokens.weight -> lm_head.weight")
+        if rank == 0:
+            print("Applied weight tying: copied model.embed_tokens.weight -> lm_head.weight")
 
     # Use the adapter to convert HF weights to TorchTitan format
     adapter = Qwen3StateDictAdapter(
@@ -261,13 +286,14 @@ def setup_models_and_inputs(
     missing_in_converted = model_keys - converted_keys
     extra_in_converted = converted_keys - model_keys
 
-    print(f"\n=== Weight key analysis ===")
-    print(f"TorchTitan model has {len(model_keys)} parameters")
-    print(f"Converted state dict has {len(converted_keys)} keys")
-    if missing_in_converted:
-        print(f"Missing keys (in model but not in converted): {sorted(missing_in_converted)}")
-    if extra_in_converted:
-        print(f"Extra keys (in converted but not in model): {sorted(extra_in_converted)}")
+    if rank == 0:
+        print(f"\n=== Weight key analysis ===")
+        print(f"TorchTitan model has {len(model_keys)} parameters")
+        print(f"Converted state dict has {len(converted_keys)} keys")
+        if missing_in_converted:
+            print(f"Missing keys (in model but not in converted): {sorted(missing_in_converted)}")
+        if extra_in_converted:
+            print(f"Extra keys (in converted but not in model): {sorted(extra_in_converted)}")
 
     copied_count = 0
     for name, param in torchtitan_state_dict.items():
@@ -275,34 +301,39 @@ def setup_models_and_inputs(
             torchtitan_params[name].data.copy_(param.to(torchtitan_params[name].device))
             copied_count += 1
         else:
-            print(f"Warning: Key '{name}' in converted state dict not found in model")
+            if rank == 0:
+                print(f"Warning: Key '{name}' in converted state dict not found in model")
 
-    print(f"Successfully copied {copied_count}/{len(torchtitan_state_dict)} weights")
+    if rank == 0:
+        print(f"Successfully copied {copied_count}/{len(torchtitan_state_dict)} weights")
 
     # Create input tokens
     torch.manual_seed(42)
-    tokens = torch.randint(0, vocab_size, (seq_len,), device="cuda")
-    positions = torch.arange(seq_len, device="cuda")
-    print(f"\nInput tokens shape: {tokens.shape}")
+    tokens = torch.randint(0, vocab_size, (seq_len,), device=device)
+    positions = torch.arange(seq_len, device=device)
+    if rank == 0:
+        print(f"\nInput tokens shape: {tokens.shape}")
 
     # Build attention metadata
-    attn_metadata = build_attn_metadata(seq_len)
+    attn_metadata = build_attn_metadata(seq_len, local_rank)
 
     # Bind KV caches for all attention layers in static_forward_context
     num_blocks = 30
     static_ctx = vllm_config.compilation_config.static_forward_context
-    print(f"\n=== Setting up KV caches ===")
+    if rank == 0:
+        print(f"\n=== Setting up KV caches ===")
 
     for layer_name, layer in static_ctx.items():
         if hasattr(layer, 'kv_cache'):
             kv_cache = torch.zeros(
                 (2, num_blocks, BLOCK_SIZE, num_kv_heads, head_dim),
                 dtype=torch.bfloat16,
-                device="cuda",
+                device=device,
             )
             layer.kv_cache = [kv_cache]
 
-    print("=== Setup complete ===\n")
+    if rank == 0:
+        print("=== Setup complete ===\n")
 
     return TestContext(
         vllm_native_model=vllm_native_model,
@@ -338,7 +369,7 @@ def print_tensor_stats(name: str, tensor: torch.Tensor, prefix: str = "") -> Non
     print(f"{prefix}  first_10={[f'{x:.6f}' for x in first_10]}")
 
 
-def replace_rmsnorm_with_vllm(model: torch.nn.Module, vllm_config) -> None:
+def replace_rmsnorm_with_vllm(model: torch.nn.Module, vllm_config, rank: int = 0) -> None:
     """
     Replace all torch.nn.RMSNorm in the model with vLLM's RMSNorm.
 
@@ -376,14 +407,13 @@ def replace_rmsnorm_with_vllm(model: torch.nn.Module, vllm_config) -> None:
                 # Replace the module
                 setattr(parent_module, name, vllm_norm)
                 replaced_count += 1
-                print(f"  Replaced {full_name}: torch.nn.RMSNorm -> VLLMRMSNorm")
+                if rank == 0:
+                    print(f"  Replaced {full_name}: torch.nn.RMSNorm -> VLLMRMSNorm")
             else:
                 # Recurse into child modules
                 replace_in_module(child, full_name)
 
-    print("Replacing torch.nn.RMSNorm with vLLM RMSNorm...")
     replace_in_module(model)
-    print(f"Replaced {replaced_count} RMSNorm modules")
 
 
 def compare_tensors(name: str, t1: torch.Tensor, t2: torch.Tensor,
@@ -493,13 +523,13 @@ def create_common_attn_metadata(
     )
 
 
-def build_attn_metadata(num_tokens: int) -> FlashAttentionMetadata:
+def build_attn_metadata(num_tokens: int, local_rank: int = 0) -> FlashAttentionMetadata:
     """Build FlashAttentionMetadata for a given number of tokens."""
     batch_spec = BatchSpec(seq_lens=[num_tokens], query_lens=[num_tokens])
     common_attn_metadata = create_common_attn_metadata(
         batch_spec,
         block_size=BLOCK_SIZE,
-        device=torch.device("cuda:0"),
+        device=torch.device(f"cuda:{local_rank}"),
         arange_block_indices=True,
     )
     return FlashAttentionMetadata(
@@ -606,6 +636,12 @@ class TestVLLMTorchTitan:
 
         # Compare outputs
         print("\n=== Comparing outputs ===")
+
+        # Debug: Compare lm_head weights
+        print("\n=== Comparing lm_head weights ===")
+        print("vLLM lm_head:", ctx.vllm_native_model.lm_head.weight[:5, :5])
+        print("TorchTitan output:", ctx.torchtitan_vllm_model.model.output.weight[:5, :5])
+
         print(f"vLLM native hidden stats: min={vllm_native_hidden.min():.4f}, "
               f"max={vllm_native_hidden.max():.4f}, mean={vllm_native_hidden.float().mean():.4f}")
         print(f"TorchTitan hidden stats: min={torchtitan_hidden.min():.4f}, "
@@ -636,8 +672,8 @@ class TestVLLMTorchTitan:
         print("=" * 70)
 
         # Enable debug printing
-        enable_qwen3_debug()
-        ctx.torchtitan_vllm_model.model.enable_debug(True)
+        # enable_qwen3_debug()
+        # ctx.torchtitan_vllm_model.model.enable_debug(True)
 
         # Run vLLM native embedding + first layer
         print("\n--- vLLM Native Model ---")
@@ -809,7 +845,7 @@ class TestVLLMTorchTitan:
         print("\n--- TorchTitan Attention Step-by-Step ---")
 
         # Enable debug for VLLMAttention
-        tt_attn.inner_attention._debug_enabled = True
+        # tt_attn.inner_attention._debug_enabled = True
 
         # Clear KV cache before TorchTitan forward
         for layer_name, layer in static_ctx.items():

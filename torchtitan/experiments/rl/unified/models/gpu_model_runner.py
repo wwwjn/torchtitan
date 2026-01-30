@@ -3112,6 +3112,65 @@ class GPUModelRunner(
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
+
+        # Debug: Print attention metadata before setting forward context
+        # Enable with: GPUModelRunner._debug_attn_metadata = True
+        if getattr(self, '_debug_attn_metadata', False):
+            print(f"\n[GPUModelRunner DEBUG] === set_forward_context metadata ===")
+            print(f"[GPUModelRunner DEBUG] attn_metadata type: {type(attn_metadata)}")
+            print(f"[GPUModelRunner DEBUG] num_tokens_padded: {num_tokens_padded}")
+            print(f"[GPUModelRunner DEBUG] num_tokens_across_dp: {num_tokens_across_dp}")
+            print(f"[GPUModelRunner DEBUG] cudagraph_mode: {cudagraph_mode}")
+
+            if attn_metadata is not None:
+                # Print common fields
+                if hasattr(attn_metadata, 'num_actual_tokens'):
+                    print(f"[GPUModelRunner DEBUG]   num_actual_tokens: {attn_metadata.num_actual_tokens}")
+                if hasattr(attn_metadata, 'max_seq_len'):
+                    print(f"[GPUModelRunner DEBUG]   max_seq_len: {attn_metadata.max_seq_len}")
+                if hasattr(attn_metadata, 'max_query_len'):
+                    print(f"[GPUModelRunner DEBUG]   max_query_len: {attn_metadata.max_query_len}")
+                if hasattr(attn_metadata, 'seq_lens'):
+                    seq_lens = attn_metadata.seq_lens
+                    if seq_lens is not None:
+                        if hasattr(seq_lens, 'shape'):
+                            print(f"[GPUModelRunner DEBUG]   seq_lens: shape={seq_lens.shape}, vals={seq_lens[:min(10, len(seq_lens))]}")
+                        else:
+                            print(f"[GPUModelRunner DEBUG]   seq_lens: {seq_lens[:min(10, len(seq_lens))] if len(seq_lens) > 0 else seq_lens}")
+
+                # Check for causal flag
+                if hasattr(attn_metadata, 'causal'):
+                    print(f"[GPUModelRunner DEBUG]   causal: {attn_metadata.causal}")
+
+                # Check common metadata
+                if hasattr(attn_metadata, 'common'):
+                    common = attn_metadata.common
+                    print(f"[GPUModelRunner DEBUG]   common type: {type(common)}")
+                    if hasattr(common, 'causal'):
+                        print(f"[GPUModelRunner DEBUG]   common.causal: {common.causal}")
+                    if hasattr(common, 'query_start_loc'):
+                        ql = common.query_start_loc
+                        if ql is not None:
+                            print(f"[GPUModelRunner DEBUG]   common.query_start_loc: {ql[:min(10, len(ql))] if hasattr(ql, '__len__') else ql}")
+                    if hasattr(common, 'seq_lens'):
+                        sl = common.seq_lens
+                        if sl is not None:
+                            print(f"[GPUModelRunner DEBUG]   common.seq_lens: {sl[:min(10, len(sl))] if hasattr(sl, '__len__') else sl}")
+                    if hasattr(common, 'num_computed_tokens_cpu'):
+                        print(f"[GPUModelRunner DEBUG]   common.num_computed_tokens_cpu: {common.num_computed_tokens_cpu}")
+
+                # Check if it's a dict (per-layer metadata)
+                if isinstance(attn_metadata, dict):
+                    print(f"[GPUModelRunner DEBUG]   dict keys: {list(attn_metadata.keys())[:5]}...")
+                    for key in list(attn_metadata.keys())[:2]:  # Show first 2 layers
+                        layer_meta = attn_metadata[key]
+                        print(f"[GPUModelRunner DEBUG]   [{key}] type: {type(layer_meta)}")
+                        if hasattr(layer_meta, 'causal'):
+                            print(f"[GPUModelRunner DEBUG]   [{key}] causal: {layer_meta.causal}")
+                        if hasattr(layer_meta, 'common') and hasattr(layer_meta.common, 'causal'):
+                            print(f"[GPUModelRunner DEBUG]   [{key}] common.causal: {layer_meta.common.causal}")
+            print(f"[GPUModelRunner DEBUG] === end metadata ===\n")
+
         with (
             set_forward_context(
                 attn_metadata,
@@ -4313,8 +4372,6 @@ class GPUModelRunner(
         # like `inf` or `nan`.
         # To avoid breaking the sampler, we use a random tensor here instead.
         hidden_states = torch.rand_like(hidden_states)
-
-        print("[jianiw] Before calling compute_logits in _dummy_sampler_run")
 
         logits = self.model.compute_logits(hidden_states)
         num_reqs = logits.size(0)

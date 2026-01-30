@@ -395,18 +395,6 @@ class TransformerBlock(nn.Module):
         else:
             self.weight_init_std = 0.02 / (2 * model_args.n_layers) ** 0.5
 
-        # Debug flag
-        self._debug_enabled = False
-
-    def _print_tensor_stats(self, name: str, tensor: torch.Tensor) -> None:
-        """Print tensor statistics for debugging."""
-        if not self._debug_enabled:
-            return
-        print(f"[DEBUG] Layer {self.layer_id} {name}: shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
-              f"min={tensor.min().item():.6f}, max={tensor.max().item():.6f}, "
-              f"mean={tensor.float().mean().item():.6f}, std={tensor.float().std().item():.6f}, "
-              f"has_nan={tensor.isnan().any().item()}, has_inf={tensor.isinf().any().item()}")
-
     def forward(
         self,
         x: torch.Tensor,
@@ -427,41 +415,27 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        if self._debug_enabled:
-            self._print_tensor_stats("input x", x)
 
         # Attention norm
         x_normed = self.attention_norm(x)
-        if self._debug_enabled:
-            self._print_tensor_stats("after attention_norm", x_normed)
 
         # Attention
         attn_out = self.attention(x_normed, rope_cache, attention_masks, positions)
-        if self._debug_enabled:
-            self._print_tensor_stats("attention output", attn_out)
 
         # Residual
         x = x + attn_out
-        if self._debug_enabled:
-            self._print_tensor_stats("after attention residual", x)
 
         # FFN norm
         x_ffn_normed = self.ffn_norm(x)
-        if self._debug_enabled:
-            self._print_tensor_stats("after ffn_norm", x_ffn_normed)
 
         # FFN or MoE
         if self.moe_enabled:
             ffn_out = self.moe(x_ffn_normed)
         else:
             ffn_out = self.feed_forward(x_ffn_normed)
-        if self._debug_enabled:
-            self._print_tensor_stats("ffn output", ffn_out)
 
         # Residual
         x = x + ffn_out
-        if self._debug_enabled:
-            self._print_tensor_stats("after ffn residual (layer output)", x)
 
         return x
 
@@ -514,24 +488,6 @@ class Qwen3Model(ModelProtocol):
         self.norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
 
         self.output = nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
-
-        # Debug flag
-        self._debug_enabled = False
-
-    def enable_debug(self, enabled: bool = True) -> None:
-        """Enable or disable debug printing for forward pass."""
-        self._debug_enabled = enabled
-        for layer in self.layers.values():
-            layer._debug_enabled = enabled
-
-    def _print_tensor_stats(self, name: str, tensor: torch.Tensor) -> None:
-        """Print tensor statistics for debugging."""
-        if not self._debug_enabled:
-            return
-        print(f"[DEBUG] {name}: shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
-              f"min={tensor.min().item():.6f}, max={tensor.max().item():.6f}, "
-              f"mean={tensor.float().mean().item():.6f}, std={tensor.float().std().item():.6f}, "
-              f"has_nan={tensor.isnan().any().item()}, has_inf={tensor.isinf().any().item()}")
 
     def init_weights(
         self,
@@ -644,39 +600,17 @@ class Qwen3Model(ModelProtocol):
             torch.Tensor: Output logits after applying the Transformer model.
 
         """
-        if self._debug_enabled:
-            print(f"\n[DEBUG] ===== Qwen3Model forward() start =====")
-            print(f"[DEBUG] tokens: shape={tuple(tokens.shape)}, min={tokens.min().item()}, max={tokens.max().item()}")
-            if positions is not None:
-                print(f"[DEBUG] positions: shape={tuple(positions.shape)}, min={positions.min().item()}, max={positions.max().item()}")
-            self._print_tensor_stats("rope_cache", self.rope_cache)
-
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         # pyrefly: ignore[not-callable, invalid-argument]
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
-        if self._debug_enabled:
-            self._print_tensor_stats("After tok_embeddings", h)
 
         for layer_name, layer in self.layers.items():
-            if self._debug_enabled:
-                print(f"\n[DEBUG] --- Layer {layer_name} ---")
             h = layer(h, self.rope_cache, attention_masks, positions)
-            if self._debug_enabled:
-                self._print_tensor_stats(f"After layer {layer_name}", h)
-                # Check for explosion
-                if h.abs().max().item() > 1e6:
-                    print(f"[DEBUG] WARNING: Values exploded at layer {layer_name}!")
 
         # pyrefly: ignore[not-callable, invalid-argument]
         h = self.norm(h) if self.norm else h
-        # pyrefly: ignore[not-callable, invalid-argument]
-        if self._debug_enabled:
-            self._print_tensor_stats("After final norm", h)
 
         # pyrefly: ignore [not-callable]
         output = self.output(h) if self.output else h
-        if self._debug_enabled:
-            self._print_tensor_stats("Final output (logits)", output)
-            print(f"[DEBUG] ===== Qwen3Model forward() end =====\n")
 
         return output

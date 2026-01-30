@@ -15,7 +15,7 @@ from functools import partial
 
 import torch
 import torch.nn as nn
-from torch.distributed._tensor import DTensor, Replicate
+from torch.distributed._tensor import distribute_tensor, DTensor, Replicate
 from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,
     StateDictOptions,
@@ -115,6 +115,27 @@ class TorchTitanVLLMModelWrapper(nn.Module):
             job_config=self.parallel_config,
         )
 
+        # Pre-extend RoPE cache to max_model_len * 2 to avoid runtime extension
+        # which would break CUDA graph capture (due to .item() calls)
+        self._pre_extend_rope_cache(vllm_config.model_config.max_model_len * 2)
+
+    def _pre_extend_rope_cache(self, max_len: int) -> None:
+        """Pre-extend RoPE cache during initialization to avoid runtime extension."""
+        if hasattr(self.model, "rope_cache"):
+            rope_attr = self.model.rope_cache
+        elif hasattr(self.model, "freqs_cis"):
+            rope_attr = self.model.freqs_cis
+        else:
+            return
+
+        if rope_attr is not None and self.rope_cache_extension_fn is not None:
+            if rope_attr.shape[0] < max_len:
+                extended_cache = self._extend_rope_cache_if_needed(rope_attr, max_len - 1)
+                if hasattr(self.model, "rope_cache"):
+                    self.model.rope_cache = extended_cache
+                elif hasattr(self.model, "freqs_cis"):
+                    self.model.freqs_cis = extended_cache
+
     def _extend_rope_cache_if_needed(
         self, rope_cache: torch.Tensor, max_position: int
     ) -> torch.Tensor:
@@ -185,17 +206,6 @@ class TorchTitanVLLMModelWrapper(nn.Module):
         """Convert input token IDs to embeddings (deprecated vLLM interface)."""
         return self.embed_input_ids(input_ids)
 
-    def _print_tensor_stats(self, name: str, tensor: torch.Tensor) -> None:
-        """Print tensor statistics for debugging."""
-        if isinstance(tensor, DTensor):
-            t = tensor.to_local()
-        else:
-            t = tensor
-        print(f"[DEBUG] {name}: shape={tuple(t.shape)}, dtype={t.dtype}, "
-              f"min={t.min().item():.6f}, max={t.max().item():.6f}, "
-              f"mean={t.float().mean().item():.6f}, std={t.float().std().item():.6f}, "
-              f"has_nan={t.isnan().any().item()}, has_inf={t.isinf().any().item()}")
-
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -215,16 +225,14 @@ class TorchTitanVLLMModelWrapper(nn.Module):
         Returns:
             hidden_states: Final hidden states [total_tokens, hidden_size]
         """
+        print(f"[TorchTitanVLLMModelWrapper.forward] input_ids shape: {input_ids.shape if input_ids is not None else None}")
+        print(f"[TorchTitanVLLMModelWrapper.forward] positions shape: {positions.shape if positions is not None else None}")
+
         if inputs_embeds is not None:
             raise NotImplementedError("inputs_embeds not yet supported")
 
         if input_ids is None:
             raise ValueError("Either input_ids or inputs_embeds must be provided")
-
-        print(f"\n[DEBUG] ===== TorchTitan forward() start =====")
-        print(f"[DEBUG] input_ids: shape={tuple(input_ids.shape)}, min={input_ids.min().item()}, max={input_ids.max().item()}")
-        if positions is not None:
-            print(f"[DEBUG] positions: shape={tuple(positions.shape)}, min={positions.min().item()}, max={positions.max().item()}")
 
         # Convert vLLM interface to TorchTitan interface
         # vLLM: [total_tokens] → TorchTitan: [batch_size, seq_len]
@@ -232,40 +240,24 @@ class TorchTitanVLLMModelWrapper(nn.Module):
 
         # Get embeddings
         h = self.model.tok_embeddings(tokens_2d)
-        self._print_tensor_stats("After tok_embeddings", h)
 
         # Get RoPE cache (handle model-specific attribute names)
-        # Use hasattr to avoid ambiguous boolean value error with tensors
+        # RoPE cache is pre-extended during __init__ to avoid .item() calls
+        # which break CUDA graph capture
         if hasattr(self.model, "rope_cache"):
-            rope_attr = self.model.rope_cache
+            rope_cache = self.model.rope_cache
         elif hasattr(self.model, "freqs_cis"):
-            rope_attr = self.model.freqs_cis
+            rope_cache = self.model.freqs_cis
         else:
-            rope_attr = None
+            rope_cache = None
 
-        # Extend RoPE cache if needed (vLLM profiling may use 2x max_seq_len)
-        if positions is not None:
-            max_position = positions.max().item()
-        else:
-            max_position = 0
-
-        rope_cache = self._extend_rope_cache_if_needed(rope_attr, max_position)
-        if rope_cache is not None:
-            self._print_tensor_stats("rope_cache", rope_cache)
         positions = positions.unsqueeze(0)
 
         # Pass through transformer layers
         for layer_idx, (layer_name, layer) in enumerate(self.model.layers.items()):
             h = layer(h, rope_cache, attention_masks=None, positions=positions)
-            self._print_tensor_stats(f"After layer {layer_name}", h)
-            # Check for explosion early
-            if isinstance(h, DTensor):
-                t = h.to_local()
-            else:
-                t = h
-            if t.abs().max().item() > 1e6:
-                print(f"[DEBUG] WARNING: Values exploded at layer {layer_name}!")
 
+        h = self.model.norm(h)
         # When parallelism is applied, get full tensor before return to vLLM Engine
         # The original placement is Shard(1) (shard on sequence dimension, as it will prepare for sequence parallel in `self.norm`).
         # vLLM's engine expects plain, non-distributed tensors to slice the last token for each request.
@@ -277,9 +269,6 @@ class TorchTitanVLLMModelWrapper(nn.Module):
             batch_size, seq_len, hidden_size = h.shape
             h = h.view(batch_size * seq_len, hidden_size)
 
-        self._print_tensor_stats("Final output (before compute_logits)", h)
-        print(f"[DEBUG] ===== TorchTitan forward() end =====\n")
-
         return h
 
     def compute_logits(
@@ -288,8 +277,7 @@ class TorchTitanVLLMModelWrapper(nn.Module):
         sampling_metadata=None,
     ) -> torch.Tensor | None:
         """Compute logits from hidden states."""
-        print(f"\n[DEBUG] ===== TorchTitan compute_logits() start =====")
-        self._print_tensor_stats("Input hidden_states", hidden_states)
+        print(f"[TorchTitanVLLMModelWrapper.compute_logits] hidden_states shape: {hidden_states.shape if hidden_states is not None else None}")
 
         # When TP is applied, we return the full tensor (plain tensor) to vLLM engine
         # at the end of TorchTitanVLLMModelWrapper.forward().
@@ -303,13 +291,7 @@ class TorchTitanVLLMModelWrapper(nn.Module):
                 ],
             )
 
-        h = self.model.norm(hidden_states)
-        self._print_tensor_stats("After norm", h)
-
-        logits = self.model.output(h)
-        self._print_tensor_stats("Final logits", logits)
-
-        print(f"[DEBUG] ===== TorchTitan compute_logits() end =====\n")
+        logits = self.model.output(hidden_states)
 
         return logits
 
@@ -334,7 +316,6 @@ class TorchTitanVLLMModelWrapper(nn.Module):
             model_args=self.config,
             hf_assets_path=None,
         )
-
         torchtitan_state_dict = adapter.from_hf(hf_state_dict)
         model_state_dict = {k: v for k, v in self.model.state_dict().items()}
 
@@ -343,11 +324,13 @@ class TorchTitanVLLMModelWrapper(nn.Module):
             if name in model_state_dict and isinstance(model_state_dict[name], DTensor):
                 target_dtensor = model_state_dict[name]
                 device_mesh = target_dtensor.device_mesh
+                target_placement = target_dtensor.placements
                 torchtitan_state_dict[name] = DTensor.from_local(
                     tensor.to(device_mesh.device_type),
                     device_mesh=device_mesh,
-                    placements=[Replicate()],
-                )
+                    placements=[Replicate()] * device_mesh.ndim,
+                ).redistribute(device_mesh=device_mesh, placements=target_placement)
+
 
         # Load state dict
         set_model_state_dict(

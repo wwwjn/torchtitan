@@ -28,6 +28,9 @@ PROMPTS_FILE="scripts/prompts.txt"
 PROFILE=false
 PROFILE_DIR="./profiler_traces"
 
+# CUDA graph option
+USE_CUDA_GRAPH=false
+
 # Benchmark selection (all enabled by default)
 RUN_VLLM_NATIVE=true
 RUN_VLLM_TORCHTITAN=true
@@ -84,6 +87,10 @@ while [[ $# -gt 0 ]]; do
             PROFILE_DIR="$2"
             shift 2
             ;;
+        --use-cuda-graph)
+            USE_CUDA_GRAPH=true
+            shift
+            ;;
         --skip-vllm-native)
             RUN_VLLM_NATIVE=false
             shift
@@ -134,6 +141,9 @@ while [[ $# -gt 0 ]]; do
             echo "Profiling options:"
             echo "  --profile                  Enable PyTorch profiler for performance tracing"
             echo "  --profile-dir <path>       Directory to save profiler traces (default: ./profiler_traces)"
+            echo ""
+            echo "Compilation options:"
+            echo "  --use-cuda-graph           Enable CUDA graph via compilation config (default: eager mode)"
             echo ""
             echo "Benchmark selection:"
             echo "  --skip-vllm-native         Skip vLLM native benchmark"
@@ -194,6 +204,11 @@ if [ "$PROFILE" = true ]; then
     mkdir -p "$PROFILE_DIR"
 fi
 
+# Add CUDA graph argument if enabled
+if [ "$USE_CUDA_GRAPH" = true ]; then
+    COMMON_ARGS="$COMMON_ARGS --use-cuda-graph"
+fi
+
 echo "============================================================"
 echo "Benchmark Configuration"
 echo "============================================================"
@@ -212,6 +227,11 @@ if [ "$PROFILE" = true ]; then
 else
     echo ""
     echo "Profiling: disabled"
+fi
+if [ "$USE_CUDA_GRAPH" = true ]; then
+    echo "CUDA Graph: ENABLED"
+else
+    echo "CUDA Graph: disabled (eager mode)"
 fi
 echo ""
 echo "Benchmarks to run:"

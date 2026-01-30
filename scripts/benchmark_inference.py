@@ -132,6 +132,8 @@ class BenchmarkConfig:
     temperature: float = 0.0
     top_p: float = 1.0
     device: str = "cuda"
+    # CUDA graph / compile options
+    use_cuda_graph: bool = False  # Enable CUDA graph via compilation config
     # Profiling options
     profile: bool = False
     profile_dir: str = "./profiler_traces"
@@ -237,6 +239,7 @@ class VLLMNativeBenchmark:
             print("Loading vLLM with native Qwen3 model from HuggingFace...")
             print(f"Model: {self.config.model_path}")
             print(f"Tensor Parallel Size: {self.config.tp}")
+            print(f"CUDA Graph: {'Enabled' if self.config.use_cuda_graph else 'Disabled (eager mode)'}")
 
             # Set up profiling via environment variable (compatible with more vLLM versions)
             if self.config.profile:
@@ -248,13 +251,22 @@ class VLLMNativeBenchmark:
                     f"Profiling ENABLED - traces will be saved to: {self.profile_dir}"
                 )
 
+            # Configure compilation based on use_cuda_graph setting
+            if self.config.use_cuda_graph:
+                compilation_config = {"cudagraph_mode": "FULL_AND_PIECEWISE"}
+                enforce_eager = False
+            else:
+                compilation_config = None
+                enforce_eager = True
+
             self.engine = LLM(
                 model=self.config.model_path,
                 trust_remote_code=True,
-                dtype="bfloat16", 
-                enforce_eager=True,  # Use eager mode for fair comparison
+                dtype="bfloat16",
                 gpu_memory_utilization=0.9,
                 tensor_parallel_size=self.config.tp,
+                compilation_config=compilation_config,
+                enforce_eager=enforce_eager,
             )
             self.sampling_params = SamplingParams(
                 temperature=self.config.temperature,
@@ -369,6 +381,7 @@ class VLLMTorchTitanBenchmark:
             print("Loading vLLM with TorchTitan Qwen3 checkpoint...")
             print(f"Checkpoint: {self.config.torchtitan_checkpoint_path}")
             print(f"Tensor Parallel Size: {self.config.tp}")
+            print(f"CUDA Graph: {'Enabled' if self.config.use_cuda_graph else 'Disabled (eager mode)'}")
 
             # Set up profiling via environment variable (compatible with more vLLM versions)
             if self.config.profile:
@@ -380,6 +393,14 @@ class VLLMTorchTitanBenchmark:
                     f"Profiling ENABLED - traces will be saved to: {self.profile_dir}"
                 )
 
+            # Configure compilation based on use_cuda_graph setting
+            if self.config.use_cuda_graph:
+                compilation_config = {"cudagraph_mode": "FULL_AND_PIECEWISE"}
+                enforce_eager = False
+            else:
+                compilation_config = None
+                enforce_eager = True
+
             self.engine = LLM(
                 model=self.config.torchtitan_checkpoint_path,
                 hf_overrides={
@@ -388,9 +409,10 @@ class VLLMTorchTitanBenchmark:
                 },
                 dtype="bfloat16",
                 trust_remote_code=True,
-                enforce_eager=True,  # Use eager mode
+                enforce_eager=enforce_eager,
                 gpu_memory_utilization=0.9,
                 tensor_parallel_size=self.config.tp,
+                compilation_config=compilation_config,
             )
 
             self.sampling_params = SamplingParams(
@@ -1237,6 +1259,11 @@ def main():
         default=2,
         help="Number of active profiling steps (default: 2)",
     )
+    parser.add_argument(
+        "--use-cuda-graph",
+        action="store_true",
+        help="Enable CUDA graph via compilation config. If not set, uses eager mode (default: eager)",
+    )
 
     args = parser.parse_args()
 
@@ -1256,6 +1283,7 @@ def main():
         profile_wait=args.profile_wait,
         profile_warmup=args.profile_warmup,
         profile_active=args.profile_active,
+        use_cuda_graph=args.use_cuda_graph,
     )
 
     runner = BenchmarkRunner(config)
