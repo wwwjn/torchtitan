@@ -66,7 +66,7 @@ jobs:
         pip install uv
 
         # 1. Install Monarch and TorchStore
-        uv pip install torchmonarch==0.3.0
+        uv pip install torchmonarch==0.4.1
         uv pip install --no-deps "git+https://github.com/meta-pytorch/torchstore.git@main"
         uv pip install pygtrie portpicker
 
@@ -90,6 +90,9 @@ jobs:
 
         sudo mkdir -p "$RUNNER_TEMP/artifacts-to-be-uploaded"
         sudo chown -R $(id -u):$(id -g) "$RUNNER_TEMP/artifacts-to-be-uploaded"
+
+        # Disable FlashInfer JIT sampler — CI image lacks nvcc (vllm-project/vllm#40376)
+        export VLLM_USE_FLASHINFER_SAMPLER=0
 
         # Run E2E RL integration tests (TP=2 on 4 GPUs)
         python -m torchtitan.experiments.rl.tests.integration_tests \
