@@ -348,18 +348,40 @@ class VLLMGenerator(Actor, Configurable):
         from monarch.rdma import is_rdma_available
 
         model_sd = self._get_model().model.state_dict()
+
+        # DEBUG: log weight fingerprints BEFORE pull
+        for name, param in list(model_sd.items())[:3]:
+            p = param.full_tensor() if hasattr(param, "full_tensor") else param
+            logger.info(
+                f"[PULL-BEFORE] {name}: shape={tuple(p.shape)}, "
+                f"sum={p.float().sum().item():.6f}, "
+                f"abs_mean={p.float().abs().mean().item():.6f}, "
+                f"data_ptr={p.data_ptr()}"
+            )
+
         await ts.get_state_dict(
             "model_state_dict",
             user_state_dict=model_sd,
             strict=False,
             direct_rdma=is_rdma_available(),
         )
+
+        # DEBUG: log weight fingerprints AFTER pull
+        for name, param in list(model_sd.items())[:3]:
+            p = param.full_tensor() if hasattr(param, "full_tensor") else param
+            logger.info(
+                f"[PULL-AFTER] {name}: shape={tuple(p.shape)}, "
+                f"sum={p.float().sum().item():.6f}, "
+                f"abs_mean={p.float().abs().mean().item():.6f}, "
+                f"data_ptr={p.data_ptr()}"
+            )
+
         self.policy_version = version
         # Invalidate the KV prefix cache so stale values computed with the
         # old weights are never reused for new generations.
         self._engine.reset_prefix_cache()
-        logger.debug(
-            f"{os.getpid()=} Generator pulled model state dict for policy v{version}"
+        logger.info(
+            f"[PULL] Generator pulled model state dict for policy v{version}"
         )
 
     def __del__(self):

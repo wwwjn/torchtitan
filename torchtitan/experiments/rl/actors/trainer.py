@@ -391,9 +391,21 @@ class PolicyTrainer(Actor, Configurable):
         """
         from monarch.rdma import is_rdma_available
 
+        sd = self.model.state_dict()
+        # DEBUG: log weight fingerprints before push
+        for name, param in list(sd.items())[:3]:
+            p = param.full_tensor() if hasattr(param, "full_tensor") else param
+            logger.info(
+                f"[PUSH] {name}: shape={tuple(p.shape)}, "
+                f"sum={p.float().sum().item():.6f}, "
+                f"abs_mean={p.float().abs().mean().item():.6f}, "
+                f"data_ptr={p.data_ptr()}"
+            )
+
         await ts.put_state_dict(
-            self.model.state_dict(),
+            sd,
             "model_state_dict",
             direct_rdma=is_rdma_available(),
             transfer_dtype=self._transfer_dtype,
         )
+        logger.info("[PUSH] push_model_state_dict complete")
