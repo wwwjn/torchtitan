@@ -56,6 +56,10 @@ _TOOL_OUTPUT_LIMIT = int(os.environ.get("SWE_TOOL_OUTPUT_LIMIT", "16000"))
 # Hard ceiling on agent turns (a turn = one LLM call). Mirrors the in-sandbox
 # Claude Code budget; the wall-clock ``time_budget_sec`` is the real guard.
 _MAX_TURNS = int(os.environ.get("SWE_MAX_TURNS", "60"))
+# Max consecutive "your message was truncated; continue" nudges before stopping.
+# Near a full context every retry truncates again; without this cap (and the
+# empty-turn break below) the loop spins zero-token turns up to _MAX_TURNS.
+_MAX_TRUNCATION_NUDGES = int(os.environ.get("SWE_MAX_TRUNCATION_NUDGES", "2"))
 
 _SYSTEM_PROMPT = os.environ.get(
     "SWE_HOST_SYSTEM_PROMPT",
@@ -316,6 +320,7 @@ async def run_host_loop(
     url = adapter_url.rstrip("/") + "/v1/messages"
     deadline = time.time() + time_budget_sec
     turns = 0
+    consecutive_truncations = 0
 
     # trust_env=False: the loopback adapter call must ignore the box's fwdproxy.
     async with aiohttp.ClientSession(trust_env=False) as http:
@@ -377,9 +382,29 @@ async def run_host_loop(
                 b for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"
             ]
             if not tool_uses:
-                # No tool call -> the agent is done (or a length-capped text turn).
+                # No tool call -> the agent is done, or its turn was length-capped.
                 if stop_reason == "max_tokens":
-                    # Nudge it to continue rather than ending on a truncated thought.
+                    # A truncated turn with NO text means the context window is full:
+                    # there is no room left to generate, so a nudge just yields another
+                    # empty turn, spinning to the turn cap. Break instead. Also cap the
+                    # number of consecutive nudges for the non-empty (real thought was
+                    # cut) case.
+                    text = "".join(
+                        b.get("text", "")
+                        for b in blocks
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    ).strip()
+                    consecutive_truncations += 1
+                    if not text or consecutive_truncations > _MAX_TRUNCATION_NUDGES:
+                        logger.info(
+                            "[host_loop] %s: stopping on truncated turn "
+                            "(empty=%s, consecutive=%d)",
+                            session_id,
+                            not text,
+                            consecutive_truncations,
+                        )
+                        break
+                    # A non-empty truncated thought with room left: nudge to finish it.
                     messages.append(
                         {
                             "role": "user",
@@ -389,6 +414,7 @@ async def run_host_loop(
                     continue
                 break
 
+            consecutive_truncations = 0
             results: list[dict] = []
             for tu in tool_uses:
                 name = tu.get("name", "")

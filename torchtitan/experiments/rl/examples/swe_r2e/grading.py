@@ -41,7 +41,13 @@ async def evaluate_r2e(
     ``git checkout <base_sha> -f``) re-align the baseline, the agent's diff is
     applied as root (R2E images run everything as root with the repo interpreter
     on PATH), then the hidden tests run and are compared to the expected statuses.
+
+    An empty diff scores 0: these are bug-fix tasks, so making no change is never a
+    solution. Grading the untouched baseline would hand reward=1 to any task whose
+    baseline already passes the hidden tests, rewarding inaction.
     """
+    if not diff_text.strip():
+        return 0.0, False, False
     async with make_sandbox(image) as ev:
         if pre_commands:
             await apply_pre_commands(ev, workdir, pre_commands, user="root")
@@ -55,8 +61,8 @@ async def evaluate_r2e(
 async def _apply_diff(
     ev: Sandbox, workdir: str, diff_text: str, *, user: str = "root"
 ) -> bool:
-    if not diff_text.strip():
-        return True
+    # Callers gate empty diffs before this point (evaluate_r2e), so diff_text is
+    # always a real patch here.
     await ev.write_file(_PATCH, diff_text, user=user)
     for cmd in [
         f"cd {workdir} && git apply --3way --whitespace=nowarn {_PATCH}",
