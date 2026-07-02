@@ -244,19 +244,34 @@ def _tool_input(arguments: Any) -> dict:
 # id-level parser misses them and the agent loop ends with no action even though
 # the model did request a tool. This regex recovers such calls from decoded text.
 _TEXT_TOOLCALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+# Hermes XML tool body: ``<function=NAME><parameter=KEY>VALUE</parameter>...</function>``.
+# This model emits the XML body (not a JSON object) for every tool call, so the
+# text fallback must parse it -- a JSON-only fallback recovers nothing here.
+_TEXT_FUNCTION_RE = re.compile(r"<function=([^>\s]+)\s*>(.*?)</function>", re.DOTALL)
+_TEXT_PARAMETER_RE = re.compile(r"<parameter=([^>\s]+)\s*>(.*?)</parameter>", re.DOTALL)
 
 
 def _tool_calls_from_text(text: str) -> list[tuple[str, Any]]:
-    """Best-effort recover Hermes ``<tool_call>{...}</tool_call>`` calls from text.
+    """Best-effort recover ``<tool_call>...</tool_call>`` calls from decoded text.
 
-    Returns ``(name, arguments)`` pairs for well-formed JSON objects carrying a
-    ``name``; silently skips malformed blocks (the caller treats none-found as no
-    tool call, exactly as before).
+    Handles both the JSON body (``{"name": .., "arguments": ..}``) and the Hermes
+    XML body (``<function=NAME><parameter=KEY>VALUE</parameter>...</function>``,
+    the form this model actually emits). Returns ``(name, arguments)`` pairs and
+    silently skips malformed blocks (the caller treats none-found as no tool call).
     """
     out: list[tuple[str, Any]] = []
     for m in _TEXT_TOOLCALL_RE.finditer(text):
+        body = m.group(1).strip()
+        fn = _TEXT_FUNCTION_RE.search(body)
+        if fn is not None:
+            args = {
+                key.strip(): value.strip()
+                for key, value in _TEXT_PARAMETER_RE.findall(fn.group(2))
+            }
+            out.append((fn.group(1).strip(), args))
+            continue
         try:
-            obj = json.loads(m.group(1))
+            obj = json.loads(body)
         except json.JSONDecodeError:
             continue
         if isinstance(obj, dict) and obj.get("name"):
