@@ -914,6 +914,28 @@ class Controller(Configurable):
                     rollout_group=rollout_group
                 )
 
+            # Stale-drop (take-any safety). take_finalized returns groups in completion
+            # order, so a slow straggler generated many steps ago can surface later than
+            # the off-policy window allows. Drop it here (release its slot, do not train)
+            # instead of letting compute_policy_age_metrics trip its hard freshness
+            # assertion. This is open-instruct's max_result_age_steps. Strict FIFO never
+            # hit this: its head-of-line stall pinned the trainer version until the
+            # oldest group was consumed -- the very stall we traded away for throughput.
+            samples = training_sample_group.training_samples
+            if samples:
+                # NOTE: checked at the CURRENT trainer version, but the batch is
+                # consumed later; with the 1-deep training_batch_queue the trainer can
+                # advance one step in between, so use >= (leave a 1-step margin) to keep
+                # the consume-time age <= max_offpolicy_steps and never trip the hard
+                # freshness assertion in compute_policy_age_metrics.
+                group_age = self._trainer_policy_version - min(
+                    ts.min_policy_version for ts in samples
+                )
+                if group_age >= self.config.async_loop.max_offpolicy_steps:
+                    await group_buffer.release_active_groups(1, reason="stale_dropped")
+                    sl.log_trace_scalar({"rollout_buffer/dropped/stale": 1.0})
+                    continue
+
             if not training_sample_group.training_samples:
                 await group_buffer.release_active_groups(1, reason="untrainable_group")
 

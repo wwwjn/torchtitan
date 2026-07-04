@@ -176,6 +176,26 @@ def test_take_finalized_does_not_release_active_slot() -> None:
     asyncio.run(run())
 
 
+def test_take_finalized_skips_inflight_straggler() -> None:
+    """take-any: a still-INFLIGHT head must NOT block taking a later FINALIZED group."""
+
+    async def run() -> None:
+        buffer = RolloutGroupWorkBuffer.Config().build(max_active_rollout_groups=2)
+        for gid in (0, 1):
+            if not await buffer.wait_for_slot():
+                raise RuntimeError("buffer closed unexpectedly")
+            await buffer.add_work(RolloutGroupWork(group_id=gid, sample=object()))
+        # Claim both (WAITING -> INFLIGHT); finalize only the SECOND. The head g0
+        # stays INFLIGHT -- strict FIFO would stall here; take-any returns g1.
+        assert (await buffer.claim_next()).group_id == 0
+        assert (await buffer.claim_next()).group_id == 1
+        await buffer.finalize_work(RolloutGroup(group_id=1, rollouts=[]))
+        taken = await buffer.take_finalized()
+        assert taken is not None and taken.group_id == 1
+
+    asyncio.run(run())
+
+
 def test_untrainable_group_releases_before_training() -> None:
     async def run() -> None:
         buffer = RolloutGroupWorkBuffer.Config().build(max_active_rollout_groups=1)

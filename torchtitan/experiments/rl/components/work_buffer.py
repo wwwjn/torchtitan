@@ -55,8 +55,8 @@ class RolloutGroupWorkBuffer(Configurable):
     """Run-ahead buffer of RolloutGroupWork shared by the data-input, rollout, and batcher loops.
 
     Each entry is a RolloutGroupWork moving WAITING -> INFLIGHT -> FINALIZED. An active-slot budget caps
-    run-ahead at `max_active_rollout_groups` active slots; the batcher always takes the OLDEST
-    finalized group (strict FIFO), stalling if it is still in flight.
+    run-ahead at `max_active_rollout_groups` active slots; the batcher takes ANY finalized group in
+    completion order (take-any), skipping still-INFLIGHT stragglers, so a slow head does not stall it.
 
     For details on the buffer's callers, check the diagram in the controller.py file.
 
@@ -163,25 +163,32 @@ class RolloutGroupWorkBuffer(Configurable):
 
     @sl.log_trace_span("take_finalized")
     async def take_finalized(self) -> RolloutGroup | None:
-        """Batcher loop: strict FIFO — return the OLDEST group once it is FINALIZED, else stall.
+        """Batcher loop: take-any -- return the first FINALIZED group (completion
+        order), skipping any still-INFLIGHT groups; wait only if NONE is finalized.
+
+        This is take-any, NOT strict FIFO: a slow straggler at the head no longer
+        head-of-line-blocks the batcher. It consumes whichever groups finished
+        first, exactly like open-instruct's accumulate_inference_batches pulling
+        from the completion queue -- which is what removes the ~tens-of-min stall
+        (and the KV drain) where each step waited on the single slowest rollout.
+        Staleness stays bounded: a skipped straggler keeps holding its active slot,
+        so the pipeline never exceeds max_active_rollout_groups (off-policy window),
+        and the trainer still computes policy_age at consumption time.
 
         Example:
-            # head g0 still INFLIGHT, g1 FINALIZED -> WAITS for g0 (no skipping)
+            # head g0 still INFLIGHT, g1 FINALIZED -> returns g1 (no stall on g0)
             await buffer.take_finalized()
         """
         async with self._condition:
             while True:
                 if self._closed:
                     return None
-                if self._work_by_group_id:
-                    oldest_group_id, oldest_work = next(
-                        iter(self._work_by_group_id.items())
-                    )
-                    if oldest_work.state is _RolloutGroupWorkState.FINALIZED:
-                        del self._work_by_group_id[oldest_group_id]
+                for group_id, work in self._work_by_group_id.items():
+                    if work.state is _RolloutGroupWorkState.FINALIZED:
+                        del self._work_by_group_id[group_id]
                         self._condition.notify_all()
-                        return oldest_work.rollout_group
-                await self._condition.wait()  # head still INFLIGHT -> STALL
+                        return work.rollout_group
+                await self._condition.wait()  # nothing FINALIZED yet -> wait
 
     async def release_active_groups(self, count: int, *, reason: str) -> None:
         """Free active slots: the trainer releases trained slots after its weight pull; the batcher
