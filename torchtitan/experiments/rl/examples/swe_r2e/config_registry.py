@@ -378,7 +378,11 @@ def rl_grpo_qwen3_5_27b_swe_r2e() -> Controller.Config:
     config = rl_grpo_qwen3_32b_swe_r2e()
     config.model_spec = _qwen3_5_rl_model_registry("27B", attn_backend="varlen")
     # GDN default context is 262144; cap RoPE (== vLLM max_model_len) to the SWE len
-    # so the generator does not allocate a 256k-token KV cache.
+    # so the generator does not allocate a 256k-token KV cache. Kept at 24576: an
+    # eval showed 40960 nearly triples the host_loop solve rate (rollouts stop
+    # running out of context mid-task), but the trainer OOMs on the longer sequence
+    # at step 2 even with FullAC + chunked loss -- 40960 needs trainer memory work
+    # (finer AC / seq-len cap / HSDP) before it can be enabled.
     _set_max_seq_len(config.model_spec, _SWE_MAX_MODEL_LEN)
     config.hf_assets_path = f"{_CKPT_DIR}/Qwen3.6-27B"
     # GDN is not torch.compile-clean; run eager (matches the qwen3_5 alphabet recipe).
@@ -412,6 +416,55 @@ def rl_grpo_qwen3_5_27b_swe_r2e() -> Controller.Config:
         backend="vllm_native",
         vllm_additional_config={"gdn_prefill_backend": "triton"},
         cudagraph=VLLMCudagraphConfig(enable=False),
+        parallelism=dataclasses.replace(
+            config.generator.parallelism, tensor_parallel_degree=4
+        ),
+    )
+    return config
+
+
+def rl_grpo_qwen3_5_9b_swe_r2e() -> Controller.Config:
+    """Qwen3.5-9B (Gated DeltaNet hybrid, text-only) SWE-R2E base recipe.
+
+    Mirrors ``rl_grpo_qwen3_5_27b_swe_r2e`` (bf16 master/Adam + FullAC + chunked DAPO
+    loss, off-policy 2, drop_zero_std False, 8x8, host_loop) with the 9B flavor: the
+    HF checkpoint is the multimodal ``Qwen3_5ForConditionalGeneration`` but the
+    torchtitan ``qwen3_5`` "9B" flavor is text-only (the vision tower is a separate
+    component not built here), so generation/training run text-only. The generator
+    uses TP-4 (same as the proven 27B GDN config, which ran 100 steps stable): TP>1
+    parallelizes the long-context (22K) prefill + decode so each host_loop turn is
+    fast -- TP-1 made generation the per-turn bottleneck. Used as the base for the
+    tmax terminal-agent config.
+    """
+    config = rl_grpo_qwen3_32b_swe_r2e()
+    config.model_spec = _qwen3_5_rl_model_registry("9B", attn_backend="varlen")
+    _set_max_seq_len(config.model_spec, _SWE_MAX_MODEL_LEN)
+    config.hf_assets_path = f"{_CKPT_DIR}/Qwen3.5-9B"
+    config.compile = CompileConfig(enable=False, backend="aot_eager")
+    config.renderer = RendererConfig(name="qwen3.5")
+    config.async_loop = dataclasses.replace(
+        config.async_loop,
+        num_training_steps=100,
+        num_groups_per_train_step=8,
+        group_size=8,
+        max_offpolicy_steps=2,
+        training_sample_builder=TrainingSampleBuilder.Config(
+            drop_zero_std_reward_groups=False,
+        ),
+    )
+    config.trainer = dataclasses.replace(
+        config.trainer,
+        parallelism=dataclasses.replace(
+            config.trainer.parallelism,
+            data_parallel_shard_degree=8,
+            tensor_parallel_degree=1,
+        ),
+    )
+    config.generator = dataclasses.replace(
+        config.generator,
+        backend="vllm_native",
+        vllm_additional_config={"gdn_prefill_backend": "triton"},
+        cudagraph=VLLMCudagraphConfig(enable=True, mode="FULL_DECODE_ONLY"),  # 3x decode (smoke-validated GDN)
         parallelism=dataclasses.replace(
             config.generator.parallelism, tensor_parallel_degree=4
         ),

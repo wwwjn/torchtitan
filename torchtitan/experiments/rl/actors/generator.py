@@ -862,6 +862,16 @@ class VLLMGenerator(Actor, Configurable):
             # extra engine config (e.g. gdn_prefill_backend for the GDN kernel).
             if config.vllm_additional_config:
                 engine_kwargs["additional_config"] = config.vllm_additional_config
+            # Forward our cudagraph config on the native path too. Without this, vLLM
+            # defaults to O2 (inductor VLLM_COMPILE + FULL_AND_PIECEWISE); we want the
+            # cheaper, #3668-safe FULL_DECODE_ONLY (mode=NONE, no inductor, decode-only
+            # graphs). Local smoke: FULL_DECODE_ONLY = 2.5x decode with fast init and
+            # no inductor, vs FULL_AND_PIECEWISE 3.0x but slow inductor compile.
+            vllm_compilation_config = config.cudagraph.get_vllm_compilation_config(
+                max_num_seqs=self._max_num_seqs,
+            )
+            if vllm_compilation_config is not None:
+                engine_kwargs["compilation_config"] = vllm_compilation_config
         else:
             # torchtitan_wrapper: build PretrainedConfig from ModelSpec (no
             # config.json read) + pin the attention backend for the wrapper, and

@@ -75,14 +75,19 @@ _BOOT_SEM: asyncio.Semaphore | None = None
 
 
 @asynccontextmanager
-async def boot_agent_sandbox(image: str) -> AsyncIterator[Sandbox]:
-    """Boot a fresh sandbox and install the Claude Code toolchain.
+async def boot_agent_sandbox(
+    image: str, *, install_claude: bool = True
+) -> AsyncIterator[Sandbox]:
+    """Boot a fresh sandbox, optionally installing the Claude Code toolchain.
 
     Creates the sandbox from the task image (backend chosen by
-    ``TT_SANDBOX_BACKEND``) and installs the Claude Code CLI by downloading the
-    self-contained binary from its CDN INSIDE the sandbox (the sandbox's own fast
-    egress), retries transient boot failures, and closes the sandbox when the
-    caller leaves the context.
+    ``TT_SANDBOX_BACKEND``), retries transient boot failures, and closes the
+    sandbox when the caller leaves the context. When ``install_claude`` is True
+    (the default, for the in-sandbox Claude Code agent) it also installs the
+    Claude Code CLI by downloading the self-contained binary from its CDN INSIDE
+    the sandbox. host_loop agents drive the sandbox with bash directly and never
+    invoke the CLI, so they pass ``install_claude=False`` -- this skips the curl
+    download, which fails on images without curl (e.g. the tmax task images).
     """
     global _BOOT_SEM
     if _BOOT_SEM is None:
@@ -96,7 +101,8 @@ async def boot_agent_sandbox(image: str) -> AsyncIterator[Sandbox]:
             async with _BOOT_SEM:
                 await cand.__aenter__()
                 try:
-                    await install_toolchain(cand)
+                    if install_claude:
+                        await install_toolchain(cand)
                 except BaseException:
                     await cand.__aexit__(None, None, None)
                     raise

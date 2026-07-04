@@ -301,8 +301,19 @@ class DaytonaSandbox:
         async def poll():
             # Daytona briefly returns an empty exit_code mid-command; the SDK then
             # raises "convert exit code to int". Treat only that as "still running".
+            # A single status query returns in seconds, so wrap it in a hard per-call
+            # cap: a hung host->daytona HTTP call would otherwise block here forever
+            # (the outer deadline is only checked between polls), stranding this
+            # rollout and, under strict-FIFO batching, its whole group. On a hung
+            # call, report "still running" so the outer deadline fires the clean
+            # TimeoutError path instead.
             try:
-                return await self._sb.process.get_session_command(sid, cid)
+                return await asyncio.wait_for(
+                    self._sb.process.get_session_command(sid, cid),
+                    timeout=60.0,
+                )
+            except asyncio.TimeoutError:
+                return None
             except Exception as e:
                 if "convert exit code" in str(e):
                     return None
@@ -320,7 +331,10 @@ class DaytonaSandbox:
             cmd = await poll()
             polls += 1
 
-        logs = await self._sb.process.get_session_command_logs(sid, cid)
+        logs = await asyncio.wait_for(
+            self._sb.process.get_session_command_logs(sid, cid),
+            timeout=60.0,
+        )
         out = getattr(logs, "stdout", "") or ""
         err = getattr(logs, "stderr", "") or ""
         return int(cmd.exit_code), out + err
