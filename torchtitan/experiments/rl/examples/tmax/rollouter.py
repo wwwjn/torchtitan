@@ -156,7 +156,7 @@ class TMaxRollouter(Rollouter):
         self._shim_host = os.environ.get("SHIM_BIND_HOST", "127.0.0.1")
         self._shim_port = _env_int("SHIM_PORT", 18001)
         self._time_budget_sec = _env_int("SWE_TIME_BUDGET_SEC", 1200)
-        self._eval_timeout_sec = _env_int("TMAX_EVAL_TIMEOUT_SEC", 900)
+        self._eval_timeout_sec = _env_int("TMAX_EVAL_TIMEOUT_SEC", 600)
         self._max_context_tokens = _env_int("SWE_MAX_CONTEXT_LEN", 32768)
         # Whole-rollout wall-clock guard: agent budget + eval + boot buffer.
         self._guard_sec = self._time_budget_sec + self._eval_timeout_sec + 300

@@ -69,18 +69,19 @@ _MAX_TURNS = int(
 )
 # Per-turn generation length is governed by the generator SamplingConfig.max_tokens
 # (the AnthropicAdapter ignores the HTTP body's max_tokens); we still send a value
-# for a well-formed request. tmax prod uses per_turn_max_tokens 16384; under our
-# 24576 model ceiling the SamplingConfig cap (8192) leaves room for multiple turns.
-_TURN_MAX_TOKENS = 8192
+# for a well-formed request. Matches the config's per_turn_max_tokens 16384 (tmax
+# prod), which leaves room for multiple turns under the 65536 model context.
+_TURN_MAX_TOKENS = 16384
 # Consecutive no-bash-call turns tolerated (with a format-error reminder) before
 # stopping, so a misformatting policy cannot spin to the turn cap.
 _MAX_FORMAT_ERRORS = int(os.environ.get("TMAX_MAX_FORMAT_ERRORS", "3"))
 # Per-bash-command wall-clock cap. A hung command (e.g. the model runs something
 # interactive/infinite) otherwise blocks the whole rollout until the much larger
-# whole-rollout guard, and a single such straggler stalls the strict-FIFO training
-# batch. Cap it tight (5 min) so hung commands are reclaimed fast; the verifier's
-# own longer timeout (TMAX_EVAL_TIMEOUT_SEC) governs test.sh grading separately.
-_EXEC_TIMEOUT = int(os.environ.get("TMAX_EXEC_TIMEOUT_SEC", "300"))
+# whole-rollout guard. Cap each bash command at 120s to match the official TMax env
+# (SWERLVanilluxSandboxEnv default timeout=120): a hung command is killed at 2 min
+# so slow turns do not drag the episode. The verifier's own timeout
+# (TMAX_EVAL_TIMEOUT_SEC) governs test.sh grading separately.
+_EXEC_TIMEOUT = int(os.environ.get("TMAX_EXEC_TIMEOUT_SEC", "120"))
 # Per-turn generation HTTP timeout. A legit turn emits a short bash call plus
 # thinking (observed <=700 tokens), so even under heavy batching at high concurrency
 # it returns in well under this cap; a request that runs much longer is a hung

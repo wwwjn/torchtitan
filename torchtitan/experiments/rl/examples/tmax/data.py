@@ -70,9 +70,22 @@ class TMaxDataset(Configurable):
         shuffle: bool = True
         """Shuffle row order (reshuffling on each wrap). Set False for validation."""
 
+        holdout_n: int = 0
+        """Reserve the LAST ``holdout_n`` rows (file order) as a held-out validation slice,
+        disjoint from training. 0 = no split (whole file). Both the train and validation
+        instances must pass the same ``holdout_n`` so the split matches."""
+
+        split: str = "train"
+        """Which slice this instance serves: ``train`` (rows[:-holdout_n]) or ``validation``
+        (rows[-holdout_n:]). Ignored when ``holdout_n == 0``."""
+
     def __init__(self, config: Config) -> None:
         if not config.data_path:
             raise ValueError("TMaxDataset.Config.data_path is required")
+        if config.split not in ("train", "validation"):
+            raise ValueError(
+                f"TMaxDataset.Config.split must be 'train' or 'validation', got {config.split!r}"
+            )
         samples: list[TMaxSample] = []
         with open(config.data_path) as f:
             for line in f:
@@ -104,6 +117,20 @@ class TMaxDataset(Configurable):
                 )
         if not samples:
             raise ValueError(f"no rows found in {config.data_path}")
+
+        # Held-out split: the last holdout_n rows (in file order) form the validation slice,
+        # disjoint from the training slice, so periodic validation measures generalization
+        # rather than training-set recall. Deterministic (file order), no separate file.
+        if config.holdout_n > 0:
+            if config.holdout_n >= len(samples):
+                raise ValueError(
+                    f"holdout_n={config.holdout_n} >= dataset size {len(samples)}"
+                )
+            samples = (
+                samples[-config.holdout_n :]
+                if config.split == "validation"
+                else samples[: -config.holdout_n]
+            )
         self._samples = samples
 
         self._rng = random.Random(config.seed)

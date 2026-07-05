@@ -140,12 +140,17 @@ logger = logging.getLogger(__name__)
 
 @dataclass(kw_only=True, slots=True)
 class ValidationConfig:
-    """Held-out validation that runs at the start and end of training"""
-
-    # TODO: enable periodic validation with proper overlapping
+    """Held-out validation that runs at the start and end of training, and
+    optionally every ``interval`` steps in between."""
 
     num_samples: int = 20
     """Held-out prompts scored greedily (temp=0, n=1) per validation pass. 0 skips validation."""
+
+    interval: int = 0
+    """Run a mid-training validation pass every ``interval`` optimizer steps (in addition to
+    the start/end passes). 0 = only start/end. The pass reuses idle generator capacity and
+    disjoint (negative) group ids, so it overlaps ongoing training-rollout collection; it does
+    add its own wall time to the step it runs on (one greedy validation rollout's latency)."""
 
 
 @dataclass(kw_only=True, slots=True)
@@ -1105,3 +1110,15 @@ class Controller(Configurable):
                 await self.trainer.save_checkpoint.call(
                     step, last_step=(step == num_training_steps)
                 )
+
+            # Periodic held-out validation. Skip the final step -- run() does a post-training
+            # pass right after the loop. Runs on this step's just-pulled weights, overlapping
+            # the background rollout collection (disjoint negative group ids), so the curve
+            # tracks the live policy without a separate eval job or checkpoint download.
+            validation = self.config.async_loop.validation
+            if (
+                validation.interval > 0
+                and step % validation.interval == 0
+                and step != num_training_steps
+            ):
+                await self._validate_and_log(step=step)
