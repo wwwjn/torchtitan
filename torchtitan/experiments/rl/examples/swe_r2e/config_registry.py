@@ -464,9 +464,23 @@ def rl_grpo_qwen3_5_9b_swe_r2e() -> Controller.Config:
         config.generator,
         backend="vllm_native",
         vllm_additional_config={"gdn_prefill_backend": "triton"},
-        cudagraph=VLLMCudagraphConfig(enable=True, mode="FULL_DECODE_ONLY"),  # 3x decode (smoke-validated GDN)
+        cudagraph=VLLMCudagraphConfig(
+            enable=True, mode="FULL_DECODE_ONLY"
+        ),  # 3x decode (smoke-validated GDN)
+        # Force prefix caching on: GDN's default is OFF (is_prefix_caching_supported
+        # is False), so multi-turn rollouts re-prefill the full growing prompt every
+        # turn (0% hit). vLLM runs GDN in experimental 'align' mode; a local smoke
+        # measured ~2x prefill with byte-identical outputs vs no caching.
+        enable_prefix_caching=True,
+        # DP-8 x TP-1 = 8 TP-1 engines per 8-GPU host (matches the paper's
+        # vllm_num_engines 48 across 6 gen hosts). TP-4 used only 4 of 8 GPUs/host
+        # (world_size 4) -- half idle. TP-1 fits the 9B (~18GB) on one GPU and gives
+        # 8x the engines: far more concurrent rollout collection AND fewer rollouts
+        # per engine, so prefix-cache blocks are evicted less (higher hit rate).
         parallelism=dataclasses.replace(
-            config.generator.parallelism, tensor_parallel_degree=4
+            config.generator.parallelism,
+            data_parallel_degree=8,
+            tensor_parallel_degree=1,
         ),
     )
     return config

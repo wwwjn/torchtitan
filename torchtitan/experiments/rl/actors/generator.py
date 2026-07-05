@@ -691,6 +691,14 @@ class VLLMGenerator(Actor, Configurable):
         """Extra engine ``additional_config`` forwarded to vLLM on the
         ``vllm_native`` path, e.g. ``{"gdn_prefill_backend": "triton"}``."""
 
+        enable_prefix_caching: bool | None = None
+        """vLLM prefix caching. ``None`` uses vLLM's default, which is OFF for
+        hybrid GDN models (``is_prefix_caching_supported`` is False). Set ``True``
+        to force it on: for the multi-turn coding agent (context grows each turn)
+        this reuses the shared prefix across turns instead of re-prefilling the full
+        prompt every turn. For GDN, vLLM runs it in experimental ``align`` mode; a
+        local smoke measured ~2x prefill with byte-identical outputs vs no caching."""
+
         max_engine_steps_between_decisions: int = 16
         """Controls how many `engine.step()` calls the `engine_loop` performs before processing a new decision.
         Every generation call is queued for execution by the `engine_loop`. A higher value enables buffering
@@ -847,6 +855,10 @@ class VLLMGenerator(Actor, Configurable):
         )
         engine_kwargs["max_model_len"] = model_spec.model.max_seq_len
         engine_kwargs["max_num_seqs"] = self._max_num_seqs
+        # None -> vLLM default (OFF for hybrid GDN); True forces experimental
+        # 'align'-mode prefix caching so multi-turn rollouts reuse the shared prefix.
+        if config.enable_prefix_caching is not None:
+            engine_kwargs["enable_prefix_caching"] = config.enable_prefix_caching
         # Continuous batching requires FCFS scheduling: admission order must equal the
         # broadcast order on every rank
         engine_kwargs["scheduling_policy"] = "fcfs"
