@@ -130,6 +130,15 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
     config = _swe_9b()
     config.rollouter = _tmax_rollouter()
     _set_max_seq_len(config.model_spec, _TMAX_9B_CONTEXT)
+    # Interleaved thinking: keep each turn's <think> in later prompts (the tmax
+    # recipe's preserve_thinking, shown to help agentic RL). The qwen3.5 renderer
+    # defaults to preserve_all_thinking=False, which strips prior-turn reasoning;
+    # tmax's single-user + tool-loop structure makes preserve_all_thinking the
+    # clean match (every past turn stays in the current cycle). Trade-off: prompts
+    # grow with retained thinking, so the 65536 context fills sooner.
+    config.renderer = dataclasses.replace(
+        config.renderer, preserve_all_thinking=True
+    )
     config.async_loop = dataclasses.replace(
         config.async_loop,
         num_groups_per_train_step=8,
