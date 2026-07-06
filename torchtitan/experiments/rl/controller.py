@@ -99,11 +99,12 @@ from dataclasses import dataclass, field, replace
 # and in train.py; see the note there.
 import torch  # noqa: F401
 import torchstore as ts
-from monarch.actor import ProcMesh
+from monarch.actor import ProcMesh, this_host
 from monarch.spmd import setup_torch_elastic_env_async
 
 from torchtitan.config import CompileConfig, Configurable
 from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGenerator
+from torchtitan.experiments.rl.actors.rollout_worker import RolloutWorker
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 from torchtitan.experiments.rl.components.batcher import Batcher
 from torchtitan.experiments.rl.components.training_sample_builder import (
@@ -248,6 +249,16 @@ class Controller(Configurable):
         ``num_generators * generator_world_size``.
         """
 
+        num_rollout_workers: int = 0
+        """CPU RolloutWorker processes to run group rollouts off the controller GIL.
+
+        0 (default) runs rollouts in-process on the controller (the original
+        path). N > 0 spawns N single-proc CPU actors on the controller host; the
+        controller dispatches each group to a worker round-robin, so the agent
+        orchestration (adapter, Daytona HTTP, grading) runs across N GILs. The
+        global ``SWE_ROLLOUT_CONCURRENCY`` target is split evenly across workers.
+        """
+
         generator_router: InterGeneratorRouter.Config = field(
             default_factory=InterGeneratorRouter.Config
         )
@@ -346,6 +357,8 @@ class Controller(Configurable):
         self.config = config
         self.trainer: PolicyTrainer | None = None
         self.generator_router: InterGeneratorRouter | None = None
+        # CPU RolloutWorker actors (num_rollout_workers > 0); empty = in-process.
+        self._rollout_workers: list = []
         # Resume step (0 = fresh); set in setup_async from the loaded checkpoint.
         self.start_step = 0
         self._proc_meshes = []
@@ -557,6 +570,39 @@ class Controller(Configurable):
                 generators.append(generator)
             self.generator_router = config.generator_router.build(generators=generators)
 
+        # Spawn the CPU RolloutWorker pool on the controller host: each worker runs
+        # group rollouts (agent orchestration + adapter + Daytona HTTP + grading) in
+        # its own process, off the controller GIL. One single-proc CPU mesh per
+        # worker (like the generators, so each is individually addressable for
+        # round-robin dispatch). The global SWE_ROLLOUT_CONCURRENCY target is split
+        # evenly across the pool; each worker sets its own share before its rollouter
+        # builds its lazy semaphore.
+        num_workers = config.num_rollout_workers
+        if num_workers > 0:
+            global_conc = int(os.environ.get("SWE_ROLLOUT_CONCURRENCY", "16"))
+            per_worker_conc = max(1, math.ceil(global_conc / num_workers))
+            with sl.log_trace_span("rollout_worker_spawn"):
+                host = this_host()
+                for worker_id in range(num_workers):
+                    worker_mesh = host.spawn_procs(per_host={"rollout_workers": 1})
+                    self._proc_meshes.append(worker_mesh)
+                    self._rollout_workers.append(
+                        worker_mesh.spawn(
+                            f"rollout_worker_{worker_id}",
+                            RolloutWorker,
+                            config,
+                            rollout_concurrency=per_worker_conc,
+                        )
+                    )
+                # Each worker builds its own generate-only router over the shared generators.
+                await asyncio.gather(
+                    *(w.setup.call(generators) for w in self._rollout_workers)
+                )
+            logger.info(
+                f"Spawned {num_workers} RolloutWorker(s), {per_worker_conc} "
+                f"concurrency each (global target {global_conc})"
+            )
+
         # Initialize TorchStore for weight sync between trainer and generator.
         # StorageVolumes are spawned on the trainer mesh so they are colocated
         # with the weight source for faster data access in the non-RDMA path.
@@ -721,14 +767,23 @@ class Controller(Configurable):
         # rollout_loop
         generate_fn = self._make_generate_fn(metrics_prefix="generator")
 
-        # One rollout worker per active buffer slot: lets generation fill the whole off-policy window,
+        # One rollout loop task per active buffer slot: lets generation fill the whole off-policy window,
         # including the cold start (step 0 fills every active slot, not just num_groups_per_train_step per wave).
+        # With a RolloutWorker pool, each loop task is pinned to a worker round-robin so groups spread
+        # across the worker processes (dispatch is non-blocking on the controller; the CPU work runs in the
+        # worker). Without a pool (num_rollout_workers=0), worker=None keeps the in-process path.
         # TODO: support warm start
+        num_workers = len(self._rollout_workers)
         rollout_tasks = [
             asyncio.create_task(
                 self._rollout_loop(
                     group_buffer=self._group_buffer,
                     generate_fn=generate_fn,
+                    worker=(
+                        self._rollout_workers[group_worker_id % num_workers]
+                        if num_workers
+                        else None
+                    ),
                 ),
                 name=f"rollout_worker_{group_worker_id}",
             )
@@ -842,9 +897,18 @@ class Controller(Configurable):
         logger.info("Buffer closed; data input loop stopping")
 
     async def _rollout_loop(
-        self, *, group_buffer: RolloutGroupWorkBuffer, generate_fn: GenerateFn
+        self,
+        *,
+        group_buffer: RolloutGroupWorkBuffer,
+        generate_fn: GenerateFn,
+        worker=None,
     ) -> None:
         """Generate + score one group at a time; a failed group becomes an empty group + a failure metric.
+
+        When ``worker`` is a RolloutWorker actor, the group is run in that worker
+        process (off the controller GIL) and returned; otherwise it runs in-process
+        via ``self._rollouter``. Either way the controller records the raw group and
+        finalizes it into the buffer.
 
         Staleness is bounded by the buffer's active-slot budget. Raw rollouts are recorded before any drop,
         so dropped groups stay inspectable on disk.
@@ -863,17 +927,26 @@ class Controller(Configurable):
                 return
             try:
                 with sl.log_trace_span("rollout_group"):
-                    group = await self._rollouter.run_group_rollouts(
-                        generate_fn=generate_fn,
-                        sample=work.sample,
-                        group_id=work.group_id,
-                        group_size=self.config.async_loop.group_size,
-                        sampling=self._sampling,
-                        renderer=self.renderer,
-                    )
-                group.metrics = compute_rollout_metrics(
-                    prefix="rollout", rollouts=group.rollouts
-                )
+                    if worker is not None:
+                        # Dispatch to a RolloutWorker process; it runs run_group_rollouts
+                        # + compute_rollout_metrics and returns the finalized group.
+                        group = self._get_rank_0_value(
+                            await worker.run_group.call(
+                                sample=work.sample, group_id=work.group_id
+                            )
+                        )
+                    else:
+                        group = await self._rollouter.run_group_rollouts(
+                            generate_fn=generate_fn,
+                            sample=work.sample,
+                            group_id=work.group_id,
+                            group_size=self.config.async_loop.group_size,
+                            sampling=self._sampling,
+                            renderer=self.renderer,
+                        )
+                        group.metrics = compute_rollout_metrics(
+                            prefix="rollout", rollouts=group.rollouts
+                        )
 
                 # save rollout for inspection
                 self.rollout_recorder.record(

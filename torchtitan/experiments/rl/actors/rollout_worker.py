@@ -25,6 +25,7 @@ Only two payloads cross the Monarch RPC boundary: the raw ``sample`` in, and the
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -58,10 +59,19 @@ class RolloutWorker(Actor):
             ``generator``, ``generator_router``, ``async_loop``, and
             ``hf_assets_path`` fields are reused verbatim so a worker's rollouts
             are identical to the in-controller path).
+        rollout_concurrency: This worker's own rollout-concurrency cap (the
+            controller splits the global ``SWE_ROLLOUT_CONCURRENCY`` target across
+            the pool). Set into the env before the rollouter builds its lazy
+            semaphore, so each worker process caps its own concurrent rollouts.
     """
 
-    def __init__(self, config: "Controller.Config") -> None:
+    def __init__(self, config: "Controller.Config", *, rollout_concurrency: int) -> None:
         self.config = config
+        # Per-worker concurrency: the rollouter's semaphore is built lazily on the
+        # first rollout (reads SWE_ROLLOUT_CONCURRENCY), so setting it here -- one
+        # process per worker -- gives each worker its own cap; the pool total is
+        # num_workers * rollout_concurrency.
+        os.environ["SWE_ROLLOUT_CONCURRENCY"] = str(rollout_concurrency)
         self.renderer = config.renderer.build(tokenizer_path=config.hf_assets_path)
         # Same sampling config the controller builds (seed + renderer stop tokens);
         # the rollouter offsets the seed per sample.

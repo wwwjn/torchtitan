@@ -167,6 +167,12 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
             interval=20,
         ),
     )
+    # RolloutWorker pool: run group rollouts across N CPU processes on the
+    # controller host, off the controller GIL (the per-turn agent orchestration --
+    # adapter, Daytona HTTP, grading -- otherwise serializes on one GIL and caps
+    # throughput). SWE_NUM_ROLLOUT_WORKERS=0 keeps the in-process path; default 8.
+    # The global SWE_ROLLOUT_CONCURRENCY is split across the pool.
+    config.num_rollout_workers = int(os.environ.get("SWE_NUM_ROLLOUT_WORKERS", "8"))
     config.generator = dataclasses.replace(
         config.generator,
         sampling=dataclasses.replace(
