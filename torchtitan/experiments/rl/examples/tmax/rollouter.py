@@ -153,8 +153,6 @@ class TMaxRollouter(Rollouter):
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
-        self._shim_host = os.environ.get("SHIM_BIND_HOST", "127.0.0.1")
-        self._shim_port = _env_int("SHIM_PORT", 18001)
         self._time_budget_sec = _env_int("SWE_TIME_BUDGET_SEC", 1200)
         self._eval_timeout_sec = _env_int("TMAX_EVAL_TIMEOUT_SEC", 600)
         self._max_context_tokens = _env_int("SWE_MAX_CONTEXT_LEN", 32768)
@@ -167,11 +165,11 @@ class TMaxRollouter(Rollouter):
         if self._adapter is None:
             async with self._adapter_lock:
                 if self._adapter is None:
-                    adapter = AnthropicAdapter(
-                        renderer=renderer, host=self._shim_host, port=self._shim_port
-                    )
-                    await adapter.start()
-                    self._adapter = adapter
+                    # Direct in-process use: build the adapter for its Anthropic
+                    # translation + TITO turn capture, but do NOT start() an HTTP
+                    # server -- the vanillux loop calls adapter.complete() directly
+                    # (no loopback HTTP, no per-worker port).
+                    self._adapter = AnthropicAdapter(renderer=renderer)
         return self._adapter
 
     async def run_group_rollouts(
@@ -264,7 +262,7 @@ class TMaxRollouter(Rollouter):
                         root_sb,
                         task=sample.problem_statement,
                         session_id=rollout_id,
-                        adapter_url=adapter.url,
+                        adapter=adapter,
                         time_budget_sec=self._time_budget_sec,
                     )
                     # tmax runs the verifier only on the submit marker; a rollout that

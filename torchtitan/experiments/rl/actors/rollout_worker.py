@@ -25,11 +25,10 @@ Only two payloads cross the Monarch RPC boundary: the raw ``sample`` in, and the
 
 from __future__ import annotations
 
-import os
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
-from monarch.actor import Actor, current_rank, endpoint
+from monarch.actor import Actor, endpoint
 
 from torchtitan.experiments.rl.actors.generator import SamplingConfig
 from torchtitan.experiments.rl.controller_metrics import compute_rollout_metrics
@@ -59,22 +58,10 @@ class RolloutWorker(Actor):
             ``generator``, ``generator_router``, ``async_loop``, and
             ``hf_assets_path`` fields are reused verbatim so a worker's rollouts
             are identical to the in-controller path).
-        shim_port_base: Base port for this worker's local Anthropic->generate
-            shim; the actual port is ``shim_port_base + this worker's rank`` so
-            co-located workers do not collide.
     """
 
-    def __init__(self, config: "Controller.Config", *, shim_port_base: int) -> None:
+    def __init__(self, config: "Controller.Config") -> None:
         self.config = config
-        # Distinct LOCAL shim port per worker. The Anthropic->generate shim binds
-        # 127.0.0.1:port and is hit only by this worker's own in-process vanillux
-        # loop (the remote sandbox never calls it -- it only receives bash over
-        # Daytona HTTP), so a per-rank port avoids collisions when several workers
-        # share a host, with no cross-host networking involved. Must be set before
-        # building the rollouter: TMaxRollouter reads SHIM_PORT in its __init__.
-        rank = current_rank().rank
-        os.environ["SHIM_PORT"] = str(shim_port_base + rank)
-
         self.renderer = config.renderer.build(tokenizer_path=config.hf_assets_path)
         # Same sampling config the controller builds (seed + renderer stop tokens);
         # the rollouter offsets the seed per sample.

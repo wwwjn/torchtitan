@@ -34,13 +34,11 @@ never submits is scored 0, matching the env (tests only run on submit).
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import shlex
 import time
-
-import aiohttp
+from typing import TYPE_CHECKING
 
 from torchtitan.experiments.rl.examples.tmax.vanillux_prompts import (
     FORMAT_ERROR_TEMPLATE,
@@ -52,6 +50,9 @@ from torchtitan.experiments.rl.examples.tmax.vanillux_prompts import (
     SYSTEM_TEMPLATE,
 )
 from torchtitan.experiments.rl.harness.sandbox import Sandbox
+
+if TYPE_CHECKING:
+    from torchtitan.experiments.rl.harness.adapters.anthropic import AnthropicAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -82,23 +83,6 @@ _MAX_FORMAT_ERRORS = int(os.environ.get("TMAX_MAX_FORMAT_ERRORS", "3"))
 # so slow turns do not drag the episode. The verifier's own timeout
 # (TMAX_EVAL_TIMEOUT_SEC) governs test.sh grading separately.
 _EXEC_TIMEOUT = int(os.environ.get("TMAX_EXEC_TIMEOUT_SEC", "120"))
-# Per-turn generation HTTP timeout. A legit turn emits a short bash call plus
-# thinking (observed <=700 tokens), so even under heavy batching at high concurrency
-# it returns in well under this cap; a request that runs much longer is a hung
-# generator, and a hung one produces no output so cutting it costs nothing. Keeping
-# it tight (was exec_timeout+300=600s x4 retries = 40min) means a hung generation is
-# reclaimed in minutes, not tens of minutes: under strict-FIFO a single hung-
-# generation rollout otherwise stalls its whole group until the 32min whole-rollout
-# guard. Independent of exec_timeout (that governs bash, not decode).
-_GEN_TIMEOUT = int(os.environ.get("TMAX_GEN_TIMEOUT_SEC", "180"))
-# Per-turn generation HTTP timeout. A legit turn generates a short bash call plus
-# thinking (observed <=700 tokens, <~35s), so a request that runs much longer is a
-# hung generator, not slow decode -- and a hung one produces no output, so cutting
-# it costs nothing. Keeping it tight (was exec_timeout+300=600s x4 retries = 40min)
-# means a hung generation is reclaimed in seconds, not minutes: under strict-FIFO a
-# single hung-generation rollout otherwise stalls its whole group until the 32min
-# whole-rollout guard. Independent of exec_timeout (that governs bash, not decode).
-_GEN_TIMEOUT = int(os.environ.get("TMAX_GEN_TIMEOUT_SEC", "120"))
 
 # Persistent-shell wrapper (ported verbatim in spirit from
 # SWERLVanilluxSandboxEnv._BASH_WRAPPER): source saved env, cd to saved cwd, run the
@@ -214,163 +198,133 @@ async def run_vanillux_loop(
     *,
     task: str,
     session_id: str,
-    adapter_url: str,
+    adapter: "AnthropicAdapter",
     time_budget_sec: int,
     max_turns: int = _MAX_TURNS,
     exec_timeout: int = _EXEC_TIMEOUT,
 ) -> tuple[int, bool]:
-    """Drive the faithful Vanillux bash-only ReAct agent against the on-box adapter.
+    """Drive the faithful Vanillux bash-only ReAct agent against the adapter.
 
     ``task`` is the instruction text (rendered into the vanillux instance template).
     The agent starts in /app and navigates as the instruction directs (the env uses
     no per-task workdir). Returns ``(turns, submitted)``; the rollouter grades only
     when ``submitted`` is True (tests run on the submit marker, matching the env).
-    Never raises for a bad turn -- transport/format errors are surfaced to the agent
-    as observations.
+    Never raises for a bad turn -- format errors are surfaced to the agent as
+    observations.
+
+    Each turn calls ``adapter.complete`` directly in-process (no loopback HTTP):
+    the shim does the Anthropic<->renderers translation + TITO turn capture, and
+    returns the same Anthropic message dict the HTTP path would.
     """
     await _prepare_runtime(sb)
 
     messages: list[dict] = [{"role": "user", "content": render_instance(task)}]
-    headers = {
-        "Authorization": f"Bearer {session_id}",
-        "Content-Type": "application/json",
-        "anthropic-version": "2023-06-01",
-    }
-    url = adapter_url.rstrip("/") + "/v1/messages"
     deadline = time.time() + time_budget_sec
     turns = 0
     submitted = False
     consecutive_format_errors = 0
 
-    # trust_env=False: the loopback adapter call must ignore the box's fwdproxy.
-    async with aiohttp.ClientSession(trust_env=False) as http:
-        while turns < max_turns and time.time() < deadline:
-            payload = {
-                "model": ADAPTER_MODEL_NAME,
-                "system": SYSTEM_TEMPLATE,
-                "messages": messages,
-                "tools": _BASH_TOOL,
-                "max_tokens": _TURN_MAX_TOKENS,
-                "stream": False,
-            }
-            data = None
-            for attempt in range(4):
-                try:
-                    async with http.post(
-                        url,
-                        json=payload,
-                        headers=headers,
-                        timeout=aiohttp.ClientTimeout(total=_GEN_TIMEOUT),
-                    ) as resp:
-                        if resp.status != 200:
-                            body = await resp.text()
-                            logger.warning(
-                                "[vanillux] %s: adapter %d: %s",
-                                session_id,
-                                resp.status,
-                                body[:200],
-                            )
-                            break  # non-200 (e.g. session closed) is not retryable
-                        data = await resp.json()
-                    break
-                except Exception as e:
-                    if attempt == 3:
-                        logger.warning(
-                            "[vanillux] %s: adapter call failed after retries: %r",
-                            session_id,
-                            e,
-                        )
-                    else:
-                        await asyncio.sleep(0.5 * (attempt + 1))
-            if data is None:
+    while turns < max_turns and time.time() < deadline:
+        payload = {
+            "model": ADAPTER_MODEL_NAME,
+            "system": SYSTEM_TEMPLATE,
+            "messages": messages,
+            "tools": _BASH_TOOL,
+            "max_tokens": _TURN_MAX_TOKENS,
+            "stream": False,
+        }
+        # Direct in-process call: complete() returns None only when the session is
+        # closed or the generator yields nothing -> end the trajectory.
+        data = await adapter.complete(session_id, payload)
+        if data is None:
+            break
+
+        turns += 1
+        blocks = data.get("content") or []
+        stop_reason = data.get("stop_reason")
+        # Echo the assistant turn verbatim so the next request hash-matches and
+        # the adapter TITO-appends (one packed episode).
+        messages.append({"role": "assistant", "content": blocks})
+
+        tool_uses = [
+            b for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"
+        ]
+        if not tool_uses:
+            # No bash call: at a full context the truncated turn is empty and a
+            # reminder just yields another empty turn -> stop. Otherwise return
+            # the vanillux format-error reminder and continue (bounded).
+            text = "".join(
+                b.get("text", "")
+                for b in blocks
+                if isinstance(b, dict) and b.get("type") == "text"
+            ).strip()
+            consecutive_format_errors += 1
+            if (
+                stop_reason == "max_tokens" and not text
+            ) or consecutive_format_errors > _MAX_FORMAT_ERRORS:
+                logger.info(
+                    "[vanillux] %s: stopping (empty_trunc=%s, format_errors=%d)",
+                    session_id,
+                    stop_reason == "max_tokens" and not text,
+                    consecutive_format_errors,
+                )
                 break
+            messages.append(
+                {
+                    "role": "user",
+                    "content": _format_error(
+                        "Your last response did not include a valid `bash` tool call."
+                    ),
+                }
+            )
+            continue
 
-            turns += 1
-            blocks = data.get("content") or []
-            stop_reason = data.get("stop_reason")
-            # Echo the assistant turn verbatim so the next request hash-matches and
-            # the adapter TITO-appends (one packed episode).
-            messages.append({"role": "assistant", "content": blocks})
-
-            tool_uses = [
-                b for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"
-            ]
-            if not tool_uses:
-                # No bash call: at a full context the truncated turn is empty and a
-                # reminder just yields another empty turn -> stop. Otherwise return
-                # the vanillux format-error reminder and continue (bounded).
-                text = "".join(
-                    b.get("text", "")
-                    for b in blocks
-                    if isinstance(b, dict) and b.get("type") == "text"
-                ).strip()
-                consecutive_format_errors += 1
-                if (
-                    stop_reason == "max_tokens" and not text
-                ) or consecutive_format_errors > _MAX_FORMAT_ERRORS:
-                    logger.info(
-                        "[vanillux] %s: stopping (empty_trunc=%s, format_errors=%d)",
-                        session_id,
-                        stop_reason == "max_tokens" and not text,
-                        consecutive_format_errors,
-                    )
-                    break
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": _format_error(
-                            "Your last response did not include a valid `bash` tool call."
-                        ),
-                    }
-                )
-                continue
-
-            consecutive_format_errors = 0
-            # The env executes EXACTLY ONE action per step (tool_calls[0]); the SFT
-            # distribution is one bash call per turn. Execute only the first tool_use
-            # and return an "ignored" note for any extras (keeps the tool_result <->
-            # tool_use pairing valid for TITO re-rendering).
-            results: list[dict] = []
-            action = tool_uses[0]
-            name = action.get("name", "")
-            inp = action.get("input") if isinstance(action.get("input"), dict) else {}
-            obs = ""
-            if name != "bash":
-                obs = _format_error(
-                    f"Unknown tool '{name}'. The only available tool is `bash`."
-                )
+        consecutive_format_errors = 0
+        # The env executes EXACTLY ONE action per step (tool_calls[0]); the SFT
+        # distribution is one bash call per turn. Execute only the first tool_use
+        # and return an "ignored" note for any extras (keeps the tool_result <->
+        # tool_use pairing valid for TITO re-rendering).
+        results: list[dict] = []
+        action = tool_uses[0]
+        name = action.get("name", "")
+        inp = action.get("input") if isinstance(action.get("input"), dict) else {}
+        obs = ""
+        if name != "bash":
+            obs = _format_error(
+                f"Unknown tool '{name}'. The only available tool is `bash`."
+            )
+        else:
+            command = str(inp.get("command", "")).strip()
+            if not command:
+                obs = _format_error("'command' parameter is required.")
             else:
-                command = str(inp.get("command", "")).strip()
-                if not command:
-                    obs = _format_error("'command' parameter is required.")
+                raw, ec = await _run_bash(sb, command, exec_timeout)
+                if SUBMIT_MARKER in raw:
+                    submitted = True
                 else:
-                    raw, ec = await _run_bash(sb, command, exec_timeout)
-                    if SUBMIT_MARKER in raw:
-                        submitted = True
-                    else:
-                        body = truncate_observation(raw) if raw else "(no output)"
-                        obs = f"{body}\n\n(exit_code={ec})"
-            if submitted:
-                break
+                    body = truncate_observation(raw) if raw else "(no output)"
+                    obs = f"{body}\n\n(exit_code={ec})"
+        if submitted:
+            break
+        results.append(
+            {
+                "type": "tool_result",
+                "tool_use_id": action.get("id", ""),
+                "content": obs,
+            }
+        )
+        for extra in tool_uses[1:]:
             results.append(
                 {
                     "type": "tool_result",
-                    "tool_use_id": action.get("id", ""),
-                    "content": obs,
+                    "tool_use_id": extra.get("id", ""),
+                    "content": _format_error(
+                        "Only the first `bash` call per turn is executed; this "
+                        "extra tool call was ignored."
+                    ),
                 }
             )
-            for extra in tool_uses[1:]:
-                results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": extra.get("id", ""),
-                        "content": _format_error(
-                            "Only the first `bash` call per turn is executed; this "
-                            "extra tool call was ignored."
-                        ),
-                    }
-                )
-            messages.append({"role": "user", "content": results})
+        messages.append({"role": "user", "content": results})
 
     logger.info(
         "[vanillux] %s: finished after %d turns (submitted=%s)",

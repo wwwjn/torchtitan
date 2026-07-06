@@ -430,6 +430,102 @@ class AnthropicAdapter:
             return []
         return list(session.turns)
 
+    async def complete(self, sid: str, body: dict) -> dict | None:
+        """Run one Anthropic ``/v1/messages`` turn in-process (no HTTP).
+
+        Shared core of the HTTP ``_handle_messages`` handler and the direct
+        (in-process) caller (the tmax vanillux loop), so the TITO turn capture is
+        byte-identical on both paths. Returns the Anthropic message-response
+        dict, or None when the session is closed/unknown or the generator
+        returns no completion (the HTTP handler maps those to 503/404/502; a
+        direct caller treats None as a terminal turn).
+        """
+        if sid in self.closed:
+            return None
+        session = self.store.get(sid)
+        if session is None:
+            return None
+
+        async with session.lock:
+            prompt_ids, extends_previous = _plan_prompt(self, session, body)
+
+            # Per-turn generation cap: respect the model context budget so a long
+            # prompt does not overflow max_model_len mid-trajectory.
+            sampling = session.sampling
+            if session.max_context_tokens > 0:
+                remaining = session.max_context_tokens - len(prompt_ids)
+                if remaining <= 0:
+                    # Prompt already over budget: end the trajectory cleanly with
+                    # an empty completion (recorded so the merge sees a length
+                    # finish).
+                    session.turns.append(
+                        CapturedTurn(
+                            prompt_token_ids=list(prompt_ids),
+                            completion_token_ids=[],
+                            completion_logprobs=[],
+                            min_policy_version=None,
+                            max_policy_version=None,
+                            finish_reason="length",
+                            extends_previous=extends_previous,
+                        )
+                    )
+                    empty_blocks = [{"type": "text", "text": ""}]
+                    return _message_response(
+                        body, empty_blocks, "max_tokens", len(prompt_ids), 0
+                    )
+                if remaining < sampling.max_tokens:
+                    sampling = dataclasses.replace(sampling, max_tokens=remaining)
+
+            # Per-call nonce: a slow one-shot reply can make the client retry the
+            # same turn; a stable id would collide as "already in flight". The
+            # nonce makes each submission distinct.
+            request_id = (
+                f"{session.routing_session_id}/turn={len(session.turns)}"
+                f"/{secrets.token_hex(4)}"
+            )
+            completion = await session.generate_fn(
+                prompt_token_ids=prompt_ids,
+                request_id=request_id,
+                routing_session_id=session.routing_session_id,
+                sampling_config=sampling,
+            )
+            if completion is None:
+                return None
+
+            session.turns.append(
+                CapturedTurn(
+                    prompt_token_ids=list(prompt_ids),
+                    completion_token_ids=list(completion.token_ids),
+                    completion_logprobs=list(completion.token_logprobs),
+                    min_policy_version=completion.min_policy_version,
+                    max_policy_version=completion.max_policy_version,
+                    finish_reason=completion.finish_reason,
+                    extends_previous=extends_previous,
+                )
+            )
+            session.last_prompt_ids = list(prompt_ids)
+            session.last_completion_ids = list(completion.token_ids)
+            session.req_count += 1
+
+            logger.info(
+                "[anthropic_adapter] %s turn=%d: prompt=%d max_tokens=%d out=%d finish=%s",
+                session.routing_session_id,
+                len(session.turns) - 1,
+                len(prompt_ids),
+                sampling.max_tokens,
+                len(completion.token_ids),
+                completion.finish_reason,
+            )
+
+            blocks, stop = _completion_to_blocks(
+                self.renderer, completion.token_ids, session.tools
+            )
+            if completion.finish_reason == "length":
+                stop = "max_tokens"
+            in_tok, out_tok = len(prompt_ids), len(completion.token_ids)
+
+        return _message_response(body, blocks, stop, in_tok, out_tok)
+
 
 # ---------------------------------------------------------------------------
 # Request handling
@@ -506,108 +602,33 @@ def _plan_prompt(
 
 
 async def _handle_messages(request: web.Request) -> web.StreamResponse:
+    """HTTP wrapper over ``AnthropicAdapter.complete`` (for the unmodified
+    in-sandbox agent / Claude Code bridge path). The tmax host-side vanillux loop
+    calls ``complete`` directly in-process and never reaches this handler."""
     body = await request.json()
     sid = _request_session_id(request)
     adapter: AnthropicAdapter = request.app[_ADAPTER_KEY]
     if sid in adapter.closed:
         return web.Response(status=503, text="session closed")
-    session = adapter.store.get(sid)
-    if session is None:
+    if adapter.store.get(sid) is None:
         return web.Response(status=404, text=f"unknown session {sid!r}")
 
-    async with session.lock:
-        prompt_ids, extends_previous = _plan_prompt(adapter, session, body)
-
-        # Per-turn generation cap: respect the model context budget so a long
-        # prompt does not overflow max_model_len mid-trajectory.
-        sampling = session.sampling
-        if session.max_context_tokens > 0:
-            remaining = session.max_context_tokens - len(prompt_ids)
-            if remaining <= 0:
-                # Prompt already over budget: end the trajectory cleanly with an
-                # empty completion (recorded so the merge sees a length finish).
-                session.turns.append(
-                    CapturedTurn(
-                        prompt_token_ids=list(prompt_ids),
-                        completion_token_ids=[],
-                        completion_logprobs=[],
-                        min_policy_version=None,
-                        max_policy_version=None,
-                        finish_reason="length",
-                        extends_previous=extends_previous,
-                    )
-                )
-                # Streaming clients (stream=True) abort with "Stream ended ..." on a
-                # one-shot JSON body, so emit SSE for them; JSON otherwise.
-                empty_blocks = [{"type": "text", "text": ""}]
-                if body.get("stream") is True or "text/event-stream" in (
-                    request.headers.get("Accept", "")
-                ):
-                    return await _stream_response(
-                        request, empty_blocks, "max_tokens", len(prompt_ids), 0
-                    )
-                return web.json_response(
-                    _message_response(
-                        body, empty_blocks, "max_tokens", len(prompt_ids), 0
-                    )
-                )
-            if remaining < sampling.max_tokens:
-                sampling = dataclasses.replace(sampling, max_tokens=remaining)
-
-        # Per-call nonce: a slow one-shot reply can make the client retry the same
-        # turn; with handler_cancellation the first handler is cancelled before it
-        # appends, so a stable id would collide as "already in flight". The nonce
-        # makes each submission distinct.
-        request_id = (
-            f"{session.routing_session_id}/turn={len(session.turns)}"
-            f"/{secrets.token_hex(4)}"
-        )
-        completion = await session.generate_fn(
-            prompt_token_ids=prompt_ids,
-            request_id=request_id,
-            routing_session_id=session.routing_session_id,
-            sampling_config=sampling,
-        )
-        if completion is None:
-            return web.Response(status=502, text="generator returned no completion")
-
-        session.turns.append(
-            CapturedTurn(
-                prompt_token_ids=list(prompt_ids),
-                completion_token_ids=list(completion.token_ids),
-                completion_logprobs=list(completion.token_logprobs),
-                min_policy_version=completion.min_policy_version,
-                max_policy_version=completion.max_policy_version,
-                finish_reason=completion.finish_reason,
-                extends_previous=extends_previous,
-            )
-        )
-        session.last_prompt_ids = list(prompt_ids)
-        session.last_completion_ids = list(completion.token_ids)
-        session.req_count += 1
-
-        logger.info(
-            "[anthropic_adapter] %s turn=%d: prompt=%d max_tokens=%d out=%d finish=%s",
-            session.routing_session_id,
-            len(session.turns) - 1,
-            len(prompt_ids),
-            sampling.max_tokens,
-            len(completion.token_ids),
-            completion.finish_reason,
-        )
-
-        blocks, stop = _completion_to_blocks(
-            adapter.renderer, completion.token_ids, session.tools
-        )
-        if completion.finish_reason == "length":
-            stop = "max_tokens"
-        in_tok, out_tok = len(prompt_ids), len(completion.token_ids)
+    resp = await adapter.complete(sid, body)
+    if resp is None:
+        return web.Response(status=502, text="generator returned no completion")
 
     if body.get("stream") is True or "text/event-stream" in request.headers.get(
         "Accept", ""
     ):
-        return await _stream_response(request, blocks, stop, in_tok, out_tok)
-    return web.json_response(_message_response(body, blocks, stop, in_tok, out_tok))
+        usage = resp["usage"]
+        return await _stream_response(
+            request,
+            resp["content"],
+            resp["stop_reason"],
+            usage["input_tokens"],
+            usage["output_tokens"],
+        )
+    return web.json_response(resp)
 
 
 def _message_response(
