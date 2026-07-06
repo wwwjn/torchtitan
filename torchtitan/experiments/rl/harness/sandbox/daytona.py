@@ -315,7 +315,20 @@ class DaytonaSandbox:
             except asyncio.TimeoutError:
                 return None
             except Exception as e:
-                if "convert exit code" in str(e):
+                msg = str(e)
+                # "convert exit code": Daytona briefly returns an empty exit_code
+                # mid-command -> treat as still running.
+                # Transient host->daytona disconnects (e.g. DaytonaConnectionError
+                # "Server disconnected") during a poll must NOT discard the whole
+                # multi-turn rollout on one network hiccup: treat them as still
+                # running so the poll loop retries (bounded by the outer deadline,
+                # which fires a clean TimeoutError if the sandbox is truly gone).
+                low = msg.lower()
+                if (
+                    "convert exit code" in msg
+                    or "disconnect" in low
+                    or "connection" in low
+                ):
                     return None
                 raise
 
