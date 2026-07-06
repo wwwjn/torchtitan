@@ -53,7 +53,7 @@ from renderers import Renderer
 from torchtitan.experiments.rl.environment import TokenEnv
 from torchtitan.experiments.rl.examples.tmax.data import TMaxDataset, TMaxSample
 from torchtitan.experiments.rl.examples.tmax.env import TMaxEnv
-from torchtitan.experiments.rl.examples.tmax.grading import grade_tmax
+from torchtitan.experiments.rl.examples.tmax.grading import grade_tmax, seed_workspace
 from torchtitan.experiments.rl.examples.tmax.rubric import RewardTMax, TMAX_REWARD_KEY
 from torchtitan.experiments.rl.examples.tmax.vanillux_loop import run_vanillux_loop
 from torchtitan.experiments.rl.harness import (
@@ -255,6 +255,11 @@ class TMaxRollouter(Rollouter):
                     # Force every tool command to run as root (tmax tasks touch
                     # system paths); the faithful Vanillux loop dispatches bash here.
                     root_sb = _RootSandbox(sb)
+                    # Seed the agent-facing inputs (environment/seeds/* -> /workspace)
+                    # BEFORE the agent runs -- upstream seeds at reset. Without this,
+                    # seed-bearing tasks are unsolvable (inputs absent during rollout).
+                    # Grading fixtures (tests/*) are uploaded later by grade_tmax.
+                    await seed_workspace(root_sb, sample.tmax)
                     _turns, submitted = await run_vanillux_loop(
                         root_sb,
                         task=sample.problem_statement,

@@ -46,9 +46,15 @@ _TEST_SH = "/tests/test.sh"
 _VERIFIER_DIR = "/logs/verifier"
 _DEFAULT_REWARD_PATH = "/logs/verifier/reward.txt"
 
-# environment/seeds/<rel> fixtures seed the agent's workspace (<workdir>/<rel>);
-# tests/<rel> fixtures live next to test.sh (/tests/<rel>).
+# Two fixture classes with OPPOSITE timing (see seed_workspace / grade_tmax):
+#   environment/seeds/<rel> -- agent-facing INPUT files (the task's initial
+#     workspace state). Seeded to /workspace BEFORE the agent runs (upstream
+#     SWERLVanilluxSandboxEnv seeds at reset) so the policy can read them. Upstream
+#     ignores the per-task workdir and always uses /workspace; we match that.
+#   tests/<rel>             -- GRADING fixtures. Uploaded next to test.sh
+#     (/tests/<rel>) at grade time ONLY, so the agent cannot peek at the verifier.
 _SEEDS_PREFIX = "environment/seeds/"
+_SEEDS_DEST = "/workspace"
 _TESTS_PREFIX = "tests/"
 
 
@@ -57,23 +63,33 @@ def _eval_timeout_sec() -> int:
     return int(val) if val and val.strip() else 900
 
 
-def _fixture_dest(rel: str, workdir: str) -> str | None:
-    """Map a fixture relpath to its in-sandbox destination.
+def _grading_fixture_dest(rel: str) -> str | None:
+    """Map a GRADING fixture relpath (tests/*) to its in-sandbox destination.
 
-    ``environment/seeds/aa`` -> ``<workdir>/aa``;
-    ``tests/expected_output.txt`` -> ``/tests/expected_output.txt``.
-    Anything else (unexpected layout) is skipped.
+    ``tests/expected_output.txt`` -> ``/tests/expected_output.txt``. ``test.sh`` is
+    uploaded explicitly (never as a fixture). ``environment/seeds/*`` are NOT graded
+    here -- they are agent inputs seeded to /workspace before the agent runs (see
+    ``seed_workspace``), so they are skipped.
     """
     rel = rel.lstrip("/")
     if rel == "tests/test.sh":
         return None  # test.sh is uploaded explicitly, never as a fixture
-    if rel.startswith(_SEEDS_PREFIX):
-        sub = rel[len(_SEEDS_PREFIX) :]
-        return posixpath.join(workdir, sub) if sub else None
     if rel.startswith(_TESTS_PREFIX):
         sub = rel[len(_TESTS_PREFIX) :]
         return posixpath.join(_TESTS_DIR, sub) if sub else None
     return None
+
+
+def _iter_seed_fixtures(tmax: dict, dest: str):
+    """Yield ``(sandbox_path, content)`` for every ``environment/seeds/*`` input,
+    placed under ``dest`` (/workspace). These are the task's agent-facing initial
+    workspace files, not grading fixtures."""
+    for rel, content in (tmax.get("fixtures") or {}).items():
+        rel = rel.lstrip("/")
+        if rel.startswith(_SEEDS_PREFIX):
+            sub = rel[len(_SEEDS_PREFIX) :]
+            if sub:
+                yield posixpath.join(dest, sub), content
 
 
 def _parse_reward(text: str) -> float:
@@ -88,6 +104,30 @@ def _parse_reward(text: str) -> float:
 # --------------------------------------------------------------------------- #
 # Harness Sandbox path (async) -- used by the rollouter.
 # --------------------------------------------------------------------------- #
+async def seed_workspace(sb: Sandbox, tmax: dict, *, dest: str = _SEEDS_DEST) -> None:
+    """Upload the task's ``environment/seeds/*`` inputs to ``dest`` (/workspace)
+    BEFORE the agent runs.
+
+    These are agent-facing input files (the task's initial workspace state);
+    upstream ``SWERLVanilluxSandboxEnv`` seeds them at reset, so a faithful rollout
+    must place them before the policy runs -- otherwise seed-bearing tasks are
+    structurally unsolvable (the inputs never exist during the rollout). Grading
+    fixtures (tests/*) are handled separately by ``grade_tmax`` (anti-peek).
+    No-op for tasks without seeds.
+    """
+    seeds = list(_iter_seed_fixtures(tmax, dest))
+    if not seeds:
+        return
+    await sb.exec(f"mkdir -p {shlex.quote(dest)}", user="root", check=False, timeout=60)
+    for path, content in seeds:
+        parent = posixpath.dirname(path)
+        if parent and parent != dest:
+            await sb.exec(
+                f"mkdir -p {shlex.quote(parent)}", user="root", check=False, timeout=60
+            )
+        await sb.write_file(path, content, user="root")
+
+
 async def grade_tmax(
     sb: Sandbox,
     tmax: dict,
@@ -97,9 +137,11 @@ async def grade_tmax(
 ) -> float:
     """Grade a tmax task in the (already-run) sandbox ``sb`` and return reward.
 
-    Creates ``/logs/verifier`` + ``/tests``, uploads ``test.sh`` and every
-    fixture to its destination, runs ``bash /tests/test.sh``, then reads back
-    ``reward_path`` (default ``/logs/verifier/reward.txt``). Returns a float in
+    Creates ``/logs/verifier`` + ``/tests``, uploads ``test.sh`` and the grading
+    fixtures (tests/*) to their destinations, runs ``bash /tests/test.sh``, then
+    reads back ``reward_path`` (default ``/logs/verifier/reward.txt``). Agent-input
+    seeds (environment/seeds/*) are NOT uploaded here -- they are seeded to
+    /workspace before the rollout (see ``seed_workspace``). Returns a float in
     [0, 1]; 0.0 when the reward file is missing or unparseable.
     """
     timeout = timeout_sec if timeout_sec is not None else _eval_timeout_sec()
@@ -115,7 +157,7 @@ async def grade_tmax(
         timeout=60,
     )
     for rel, content in fixtures.items():
-        dest = _fixture_dest(rel, workdir)
+        dest = _grading_fixture_dest(rel)
         if dest is None:
             continue
         await sb.write_file(dest, content, user="root")
@@ -139,6 +181,20 @@ async def grade_tmax(
 # --------------------------------------------------------------------------- #
 # Raw daytona Sandbox path (sync) -- used by local_smoke.py.
 # --------------------------------------------------------------------------- #
+def seed_workspace_daytona(sb, tmax: dict, *, dest: str = _SEEDS_DEST) -> None:
+    """``seed_workspace`` against a RAW daytona Sandbox (sync API), so the smoke
+    test seeds agent inputs the SAME way the rollouter does. No-op without seeds."""
+    seeds = list(_iter_seed_fixtures(tmax, dest))
+    if not seeds:
+        return
+    sb.process.exec(f"mkdir -p {shlex.quote(dest)}", timeout=60)
+    for path, content in seeds:
+        parent = posixpath.dirname(path)
+        if parent and parent != dest:
+            sb.process.exec(f"mkdir -p {shlex.quote(parent)}", timeout=60)
+        sb.fs.upload_file(content.encode("utf-8"), path)
+
+
 def grade_tmax_daytona(
     sb,
     tmax: dict,
@@ -150,7 +206,8 @@ def grade_tmax_daytona(
 
     Uses the daytona SDK's sync API directly (``sb.process.exec`` /
     ``sb.fs.upload_file``) so the grading logic can be exercised in a standalone
-    script without importing the full torchtitan/vLLM training stack.
+    script without importing the full torchtitan/vLLM training stack. Seeds are
+    placed separately by ``seed_workspace_daytona`` before the agent runs.
     """
     timeout = timeout_sec if timeout_sec is not None else _eval_timeout_sec()
     test_sh = tmax.get("test_sh") or ""
@@ -163,7 +220,7 @@ def grade_tmax_daytona(
         timeout=60,
     )
     for rel, content in fixtures.items():
-        dest = _fixture_dest(rel, workdir)
+        dest = _grading_fixture_dest(rel)
         if dest is None:
             continue
         sb.fs.upload_file(content.encode("utf-8"), dest)

@@ -157,6 +157,29 @@ class PolicyTrainer(Actor, Configurable):
         self.model = model
         self.model_parts = [model]
 
+        # Freeze the multimodal vision tower for text-only RL. RL rollouts carry no
+        # pixel_values, so the vision encoder never forwards and its params never
+        # receive gradients. Left trainable they still enter the optimizer, but Adam
+        # never steps them -> their optimizer state lacks the per-param "step" entry,
+        # which trips DCP's strict state_dict check on the interval checkpoint save
+        # ("Missing key in checkpoint state_dict: optimizer.state.vision_encoder.
+        # pos_embed.step") and kills the trainer. Freezing excludes them from the
+        # optimizer (build filters on requires_grad); the frozen weights still
+        # save/load as plain model state. No-op for text-only models.
+        num_frozen = 0
+        for part in self.model_parts:
+            vision = getattr(part, "vision_encoder", None)
+            if vision is not None:
+                for p in vision.parameters():
+                    if p.requires_grad:
+                        p.requires_grad_(False)
+                        num_frozen += 1
+        if num_frozen:
+            logger.info(
+                f"Froze {num_frozen} vision_encoder params (text-only RL; excluded "
+                "from optimizer + DCP optimizer state)."
+            )
+
         if isinstance(self.loss_fn, ChunkedLossWrapper):
             lm_head = model.lm_head
             assert lm_head is not None, "Model must have lm_head for ChunkedLossWrapper"

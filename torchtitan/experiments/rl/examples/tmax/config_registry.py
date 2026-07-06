@@ -46,6 +46,14 @@ from torchtitan.experiments.rl.examples.tmax.rollouter import TMaxRollouter
 # Empty by default; TMaxDataset raises a clear error if it is not set.
 _DEFAULT_DATA = os.environ.get("SWE_PROMPT_DATA", "")
 
+# Terminal-Bench 2.0 eval (rl_grpo_qwen3_5_9b_tmax_tb2_eval): the TB-2.0 JSONL
+# (prepare_tb2_data.py output, tmax schema) and the trained DCP checkpoint dir to
+# score. Empty by default; the eval config falls back to _DEFAULT_DATA / base HF
+# weights if unset. TB-2.0 ships exactly 89 tasks.
+_TB2_DATA = os.environ.get("SWE_TB2_DATA", "")
+_TB2_CKPT = os.environ.get("SWE_TB2_CKPT", "")
+_TB2_NUM_TASKS = 89
+
 # Full TMax-9B recipe context (open-instruct qwen35_9b.sh: response_length 65536)
 # and per-turn generation cap (per_turn_max_tokens 16384). The context is the
 # generator's vLLM max_model_len AND the trainer batcher's packing width: both are
@@ -143,7 +151,12 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
         # The swe_r2e base sets num_samples=0 (off); we turn it on here. To eval the real
         # terminal-bench@2.0 benchmark instead, point the rollouter's validation_dataset at
         # TB-2.0 tasks in the tmax task format (see examples/tmax/data.py schema).
-        validation=ValidationConfig(num_samples=_TMAX_9B_VAL_SAMPLES, interval=20),
+        validation=ValidationConfig(
+            # SWE_VAL_SAMPLES=0 skips the pre/periodic held-out validation entirely
+            # (e.g. a pure step-time / speedup run); defaults to the paper's 32.
+            num_samples=int(os.environ.get("SWE_VAL_SAMPLES", _TMAX_9B_VAL_SAMPLES)),
+            interval=20,
+        ),
     )
     config.generator = dataclasses.replace(
         config.generator,
@@ -163,4 +176,58 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
         loss=dataclasses.replace(config.trainer.loss, num_chunks=32),
         checkpoint=dataclasses.replace(config.trainer.checkpoint, interval=20),
     )
+    return config
+
+
+def rl_grpo_qwen3_5_9b_tmax_tb2_eval() -> Controller.Config:
+    """Eval-only: score the Qwen3.5-9B tmax policy on the full Terminal-Bench 2.0
+    benchmark (89 tasks), greedy pass@1, via the same Daytona rollout + grade path.
+
+    Base = ``rl_grpo_qwen3_5_9b_tmax`` (same model / generator / renderer so the
+    trainer->generator weight sync works unchanged). Three changes make it eval-only:
+
+      1. Datasets point at the TB-2.0 JSONL (``SWE_TB2_DATA``, prepare_tb2_data.py
+         output). ``holdout_n=0`` makes both splits read the WHOLE file, so a
+         validation pass scores all 89 tasks; the train stream only feeds the
+         transient background collection that ``run()`` cancels once the 0-step
+         trainer returns.
+      2. ``num_training_steps=0`` -> ``run()`` does only the pre-training validation
+         pass (= the TB-2.0 solve-rate), no optimizer steps. ``interval=0`` disables
+         mid-training validation.
+      3. The trained DCP checkpoint (``SWE_TB2_CKPT``, e.g. the run's
+         ``checkpoint/step-100``) loads as the INITIAL model weights (not a resume):
+         a fresh dump dir has no ``checkpoint/`` to resume, so CheckpointManager
+         falls to ``initial_load_path``. ``initial_load_in_hf=False`` -> native titan
+         DCP (the run saved it that way); model-only -> just the policy weights.
+
+    Set ``SWE_ROLLOUT_CONCURRENCY`` >= 89 so all tasks run at once (validation shares
+    the global rollout semaphore). Greedy (temp=0, n=1) is applied by ``validate()``.
+    """
+    config = rl_grpo_qwen3_5_9b_tmax()
+    tb2_data = _TB2_DATA or _DEFAULT_DATA
+    config.rollouter = dataclasses.replace(
+        config.rollouter,
+        train_dataset=TMaxDataset.Config(
+            data_path=tb2_data, seed=42, holdout_n=0, split="train", shuffle=False
+        ),
+        validation_dataset=TMaxDataset.Config(
+            data_path=tb2_data, seed=99, holdout_n=0, split="validation", shuffle=False
+        ),
+    )
+    config.async_loop = dataclasses.replace(
+        config.async_loop,
+        num_training_steps=0,
+        validation=ValidationConfig(num_samples=_TB2_NUM_TASKS, interval=0),
+    )
+    if _TB2_CKPT:
+        config.trainer = dataclasses.replace(
+            config.trainer,
+            checkpoint=dataclasses.replace(
+                config.trainer.checkpoint,
+                enable=True,
+                initial_load_path=_TB2_CKPT,
+                initial_load_in_hf=False,
+                initial_load_model_only=True,
+            ),
+        )
     return config

@@ -76,26 +76,16 @@ def _scripted_agent(sb, sample: dict) -> None:
     """
     workdir = sample["metadata"].get("workdir", "/workspace")
     instruction = sample["metadata"].get("problem_statement", "")
-    fixtures = sample["metadata"].get("tmax", {}).get("fixtures", {})
     sb.process.exec(f"mkdir -p {workdir}", timeout=60)
 
     is_join = "command_capture.txt" in instruction and "/output" in instruction
     if is_join:
-        # The instruction tells the agent to "assemble any missing fixtures" -- the
-        # aa/bb seed files are not baked into the image, so materialize them (from the
-        # task's environment/seeds/ fixtures) exactly as a real agent would, then do a
-        # full outer join by first word emitting "<key> <aa field 2>" (empty when the
-        # key is bb-only), captured (stdout+stderr) to /output/command_capture.txt.
-        # Matches tests/expected_output.txt.
-        import base64
-
-        for rel, content in fixtures.items():
-            if rel.startswith("environment/seeds/"):
-                name = rel.rsplit("/", 1)[-1]
-                b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
-                sb.process.exec(
-                    f"echo {b64} | base64 -d > {workdir}/{name}", timeout=60
-                )
+        # The aa/bb seed inputs are already placed under /workspace by
+        # seed_workspace_daytona (the same path the rollouter uses), so a real agent
+        # can read them here. Do a full outer join by first word emitting
+        # "<key> <aa field 2>" (empty when the key is bb-only), captured
+        # (stdout+stderr) to /output/command_capture.txt. Matches
+        # tests/expected_output.txt.
         # Sort into temp files then join (avoids process-substitution quirks under
         # the daytona session shell); -a1 -a2 = full outer join, -e '' = empty for
         # missing, -o '0,1.2' = join key + second field of file 1 (aa).
@@ -130,6 +120,9 @@ def _run_one(client: Daytona, grading, sample: dict) -> float:
         )
     )
     try:
+        # Seed agent inputs (environment/seeds/* -> /workspace) BEFORE the agent,
+        # the SAME way the rollouter does, so this smoke exercises the real path.
+        grading.seed_workspace_daytona(sb, tmax)
         _scripted_agent(sb, sample)
         reward = grading.grade_tmax_daytona(sb, tmax, workdir=workdir)
         print(f"  -> reward={reward}")
