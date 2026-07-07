@@ -28,11 +28,14 @@ The dataset is an endless, seeded stream of frozen ``TMaxSample``s, mirroring
 from __future__ import annotations
 
 import json
+import logging
 import random
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 from torchtitan.config import Configurable
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -79,6 +82,12 @@ class TMaxDataset(Configurable):
         """Which slice this instance serves: ``train`` (rows[:-holdout_n]) or ``validation``
         (rows[-holdout_n:]). Ignored when ``holdout_n == 0``."""
 
+        skip_ids_path: str = ""
+        """Optional path to a zero-std annotation file (``SWE_ZERO_STD_LOG`` output from a
+        prior run). Every ``instance_id`` listed there is dropped at load, so prompts that
+        gave no learning signal (all-pass or all-fail groups) are not sampled again. Empty
+        = keep all rows. Reads JSONL rows ``{"instance_id": ...}`` or bare ids per line."""
+
     def __init__(self, config: Config) -> None:
         if not config.data_path:
             raise ValueError("TMaxDataset.Config.data_path is required")
@@ -117,6 +126,23 @@ class TMaxDataset(Configurable):
                 )
         if not samples:
             raise ValueError(f"no rows found in {config.data_path}")
+
+        # Skip prompts annotated zero-std by a prior run (no learning signal). Applied
+        # before the holdout split so both train and validation instances (same file,
+        # same order) exclude the same ids and the split stays aligned.
+        if config.skip_ids_path:
+            skip_ids = _load_skip_ids(config.skip_ids_path)
+            if skip_ids:
+                kept = [s for s in samples if s.instance_id not in skip_ids]
+                logger.info(
+                    f"TMaxDataset: skipped {len(samples) - len(kept)} zero-std prompt(s) "
+                    f"from {config.skip_ids_path} ({len(kept)}/{len(samples)} remain)"
+                )
+                samples = kept
+                if not samples:
+                    raise ValueError(
+                        f"all rows filtered out by skip_ids_path={config.skip_ids_path}"
+                    )
 
         # Held-out split: the last holdout_n rows (in file order) form the validation slice,
         # disjoint from the training slice, so periodic validation measures generalization
@@ -163,6 +189,31 @@ class TMaxDataset(Configurable):
         self._rng.setstate(state_dict["rng_state"])
         self._order = list(state_dict["order"])
         self._pos = state_dict["pos"]
+
+
+def _load_skip_ids(path: str) -> set[str]:
+    """Read instance_ids to skip from a zero-std annotation file.
+
+    Accepts either JSONL rows ``{"instance_id": ...}`` (the ``SWE_ZERO_STD_LOG``
+    format) or a bare ``instance_id`` per line. Missing file = empty set (a first
+    run has nothing to skip yet).
+    """
+    ids: set[str] = set()
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("{"):
+                    iid = (json.loads(line) or {}).get("instance_id")
+                    if iid:
+                        ids.add(iid)
+                else:
+                    ids.add(line)
+    except FileNotFoundError:
+        logger.warning(f"TMaxDataset: skip_ids_path {path} not found; skipping nothing")
+    return ids
 
 
 def _coerce_prompt(prompt) -> str:

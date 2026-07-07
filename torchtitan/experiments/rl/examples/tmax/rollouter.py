@@ -45,6 +45,7 @@ import asyncio
 import json
 import logging
 import os
+import statistics
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -154,7 +155,9 @@ class TMaxRollouter(Rollouter):
         # get advantage ~ -3.9), which distorts the gradient and suppresses reward
         # growth; the recipe centers only to keep the advantage in [-1, 1].
         advantage: AdvantageEstimator.Config = field(
-            default_factory=lambda: AdvantageEstimator.Config(should_std_normalize=False)
+            default_factory=lambda: AdvantageEstimator.Config(
+                should_std_normalize=False
+            )
         )
 
     def __init__(self, config: Config) -> None:
@@ -216,7 +219,37 @@ class TMaxRollouter(Rollouter):
         advantages = self.advantage_estimator(group)
         for rollout, advantage in zip(group.rollouts, advantages, strict=True):
             rollout.advantage = advantage
+        self._maybe_annotate_zero_std(sample, rollouts)
         return group
+
+    def _maybe_annotate_zero_std(
+        self, sample: TMaxSample, rollouts: list[Rollout]
+    ) -> None:
+        """Append this prompt's ``instance_id`` to ``SWE_ZERO_STD_LOG`` when its group
+        has zero reward variance (all-pass or all-fail = no learning signal, so it is
+        dropped by ``drop_zero_std_reward_groups``). A later run passes the file as
+        ``TMaxDataset.skip_ids_path`` to stop sampling these prompts.
+
+        Best-effort and never raises into the rollout. One short JSON line per call,
+        opened O_APPEND: POSIX makes such writes atomic, so the pooled RolloutWorker
+        processes can share one file without a lock.
+        """
+        path = os.environ.get("SWE_ZERO_STD_LOG", "")
+        if not path:
+            return
+        rewards = [r.reward for r in rollouts if r.reward is not None]
+        if len(rewards) < 2 or statistics.pstdev(rewards) != 0.0:
+            return
+        try:
+            with open(path, "a") as f:
+                f.write(
+                    json.dumps(
+                        {"instance_id": sample.instance_id, "reward": rewards[0]}
+                    )
+                    + "\n"
+                )
+        except OSError as e:
+            logger.warning(f"[tmax] zero-std annotate failed for {path}: {e}")
 
     async def _run_agent_rollout(
         self,

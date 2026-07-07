@@ -47,6 +47,11 @@ from torchtitan.experiments.rl.losses import DPPOLoss
 # Empty by default; TMaxDataset raises a clear error if it is not set.
 _DEFAULT_DATA = os.environ.get("SWE_PROMPT_DATA", "")
 
+# Optional zero-std skip list (SWE_ZERO_STD_LOG output from a prior run): every
+# instance_id listed is dropped at dataset load so all-pass / all-fail prompts (no
+# learning signal) are not sampled again. Empty = keep all rows.
+_SKIP_IDS = os.environ.get("SWE_SKIP_PROMPTS", "")
+
 # Terminal-Bench 2.0 eval (rl_grpo_qwen3_5_9b_tmax_tb2_eval): the TB-2.0 JSONL
 # (prepare_tb2_data.py output, tmax schema) and the trained DCP checkpoint dir to
 # score. Empty by default; the eval config falls back to _DEFAULT_DATA / base HF
@@ -81,6 +86,7 @@ def _tmax_rollouter() -> TMaxRollouter.Config:
             seed=42,
             holdout_n=_TMAX_9B_HOLDOUT_N,
             split="train",
+            skip_ids_path=_SKIP_IDS,
         ),
         validation_dataset=TMaxDataset.Config(
             data_path=_DEFAULT_DATA,
@@ -88,6 +94,7 @@ def _tmax_rollouter() -> TMaxRollouter.Config:
             shuffle=False,
             holdout_n=_TMAX_9B_HOLDOUT_N,
             split="validation",
+            skip_ids_path=_SKIP_IDS,
         ),
     )
 
@@ -137,9 +144,7 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
     # tmax's single-user + tool-loop structure makes preserve_all_thinking the
     # clean match (every past turn stays in the current cycle). Trade-off: prompts
     # grow with retained thinking, so the 65536 context fills sooner.
-    config.renderer = dataclasses.replace(
-        config.renderer, preserve_all_thinking=True
-    )
+    config.renderer = dataclasses.replace(config.renderer, preserve_all_thinking=True)
     config.async_loop = dataclasses.replace(
         config.async_loop,
         num_groups_per_train_step=8,
