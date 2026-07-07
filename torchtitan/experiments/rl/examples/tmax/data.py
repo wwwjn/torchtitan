@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -83,10 +84,10 @@ class TMaxDataset(Configurable):
         (rows[-holdout_n:]). Ignored when ``holdout_n == 0``."""
 
         skip_ids_path: str = ""
-        """Optional path to a zero-std annotation file (``SWE_ZERO_STD_LOG`` output from a
-        prior run). Every ``instance_id`` listed there is dropped at load, so prompts that
-        gave no learning signal (all-pass or all-fail groups) are not sampled again. Empty
-        = keep all rows. Reads JSONL rows ``{"instance_id": ...}`` or bare ids per line."""
+        """Optional zero-std annotation source (``SWE_ZERO_STD_DIR`` output from a prior
+        run): a directory of ``<instance_id>.json`` files, or a single JSONL/bare-id file.
+        Every ``instance_id`` in it is dropped at load, so prompts that gave no learning
+        signal (all-pass or all-fail groups) are not sampled again. Empty = keep all rows."""
 
     def __init__(self, config: Config) -> None:
         if not config.data_path:
@@ -192,13 +193,26 @@ class TMaxDataset(Configurable):
 
 
 def _load_skip_ids(path: str) -> set[str]:
-    """Read instance_ids to skip from a zero-std annotation file.
+    """Read instance_ids to skip from a zero-std annotation source.
 
-    Accepts either JSONL rows ``{"instance_id": ...}`` (the ``SWE_ZERO_STD_LOG``
-    format) or a bare ``instance_id`` per line. Missing file = empty set (a first
-    run has nothing to skip yet).
+    Accepts either a DIRECTORY (the ``SWE_ZERO_STD_DIR`` output: one
+    ``<instance_id>.json`` file per zero-std prompt, ``{"instance_id": ...}``) or a
+    single FILE (JSONL rows ``{"instance_id": ...}`` or a bare ``instance_id`` per
+    line). Missing source = empty set (a first run has nothing to skip yet).
     """
     ids: set[str] = set()
+    if os.path.isdir(path):
+        for name in os.listdir(path):
+            if not name.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(path, name)) as f:
+                    iid = (json.load(f) or {}).get("instance_id")
+            except (OSError, json.JSONDecodeError):
+                continue
+            if iid:
+                ids.add(iid)
+        return ids
     try:
         with open(path) as f:
             for line in f:

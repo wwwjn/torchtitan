@@ -225,31 +225,32 @@ class TMaxRollouter(Rollouter):
     def _maybe_annotate_zero_std(
         self, sample: TMaxSample, rollouts: list[Rollout]
     ) -> None:
-        """Append this prompt's ``instance_id`` to ``SWE_ZERO_STD_LOG`` when its group
-        has zero reward variance (all-pass or all-fail = no learning signal, so it is
-        dropped by ``drop_zero_std_reward_groups``). A later run passes the file as
-        ``TMaxDataset.skip_ids_path`` to stop sampling these prompts.
+        """Record this prompt's ``instance_id`` under ``SWE_ZERO_STD_DIR`` when its
+        group has zero reward variance (all-pass or all-fail = no learning signal, so
+        it is dropped by ``drop_zero_std_reward_groups``). A later run points
+        ``TMaxDataset.skip_ids_path`` at the same dir to stop sampling these prompts.
 
-        Best-effort and never raises into the rollout. One short JSON line per call,
-        opened O_APPEND: POSIX makes such writes atomic, so the pooled RolloutWorker
-        processes can share one file without a lock.
+        Writes ONE small file per prompt (``<instance_id>.json``), mirroring the
+        rollout-trace dump: a write-once-per-file pattern is the one that persists on
+        the manifold (oilfs) FUSE mount and is safe across the pooled RolloutWorker
+        processes -- unlike appending to a single shared file, which object-store FUSE
+        does not handle reliably. Re-encountering a prompt just overwrites its file
+        (natural dedup). Best-effort; never raises into the rollout.
         """
-        path = os.environ.get("SWE_ZERO_STD_LOG", "")
-        if not path:
+        dump_dir = os.environ.get("SWE_ZERO_STD_DIR", "")
+        if not dump_dir:
             return
         rewards = [r.reward for r in rollouts if r.reward is not None]
         if len(rewards) < 2 or statistics.pstdev(rewards) != 0.0:
             return
         try:
-            with open(path, "a") as f:
-                f.write(
-                    json.dumps(
-                        {"instance_id": sample.instance_id, "reward": rewards[0]}
-                    )
-                    + "\n"
-                )
+            os.makedirs(dump_dir, exist_ok=True)
+            safe = sample.instance_id.replace("/", "_")
+            path = os.path.join(dump_dir, f"{safe}.json")
+            with open(path, "w") as f:
+                json.dump({"instance_id": sample.instance_id, "reward": rewards[0]}, f)
         except OSError as e:
-            logger.warning(f"[tmax] zero-std annotate failed for {path}: {e}")
+            logger.warning(f"[tmax] zero-std annotate failed for {dump_dir}: {e}")
 
     async def _run_agent_rollout(
         self,

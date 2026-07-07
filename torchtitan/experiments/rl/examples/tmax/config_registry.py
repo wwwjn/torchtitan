@@ -47,8 +47,8 @@ from torchtitan.experiments.rl.losses import DPPOLoss
 # Empty by default; TMaxDataset raises a clear error if it is not set.
 _DEFAULT_DATA = os.environ.get("SWE_PROMPT_DATA", "")
 
-# Optional zero-std skip list (SWE_ZERO_STD_LOG output from a prior run): every
-# instance_id listed is dropped at dataset load so all-pass / all-fail prompts (no
+# Optional zero-std skip source (SWE_ZERO_STD_DIR output from a prior run): every
+# instance_id in it is dropped at dataset load so all-pass / all-fail prompts (no
 # learning signal) are not sampled again. Empty = keep all rows.
 _SKIP_IDS = os.environ.get("SWE_SKIP_PROMPTS", "")
 
