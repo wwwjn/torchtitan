@@ -41,6 +41,7 @@ from torchtitan.experiments.rl.examples.swe_r2e.config_registry import (
 )
 from torchtitan.experiments.rl.examples.tmax.data import TMaxDataset
 from torchtitan.experiments.rl.examples.tmax.rollouter import TMaxRollouter
+from torchtitan.experiments.rl.losses import DPPOLoss
 
 # tmax JSONL path, supplied by the launcher (PROMPT_DATA -> SWE_PROMPT_DATA).
 # Empty by default; TMaxDataset raises a clear error if it is not set.
@@ -186,9 +187,26 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
     # eval-able; keep last_save_model_only so the final step-100 save is a clean
     # model-only export for serving. The swe base uses interval=10000 (final save
     # only), which risks losing the whole ~20h run to any mid-run crash.
+    # Loss: DAPO clip-higher (swe base default). SWE_LOSS=dppo switches to the tmax
+    # recipe's DPPO (qwen35_9b.sh loss_fn dppo): PPO clip + a TV divergence
+    # trust-region mask (delta=0.1) that drops gradient on tokens pushed further
+    # off-policy past the divergence ball. Behind an env toggle for a clean A/B.
+    _loss = dataclasses.replace(config.trainer.loss, num_chunks=32)
+    if os.environ.get("SWE_LOSS", "").lower() == "dppo":
+        _loss = dataclasses.replace(
+            _loss,
+            loss_fn=DPPOLoss.Config(
+                ratio_clip_low=0.2,
+                ratio_clip_high=0.28,
+                divergence_threshold=float(
+                    os.environ.get("SWE_DPPO_DIVERGENCE_THRESHOLD", "0.1")
+                ),
+                divergence_type="tv",
+            ),
+        )
     config.trainer = dataclasses.replace(
         config.trainer,
-        loss=dataclasses.replace(config.trainer.loss, num_chunks=32),
+        loss=_loss,
         checkpoint=dataclasses.replace(config.trainer.checkpoint, interval=20),
     )
     return config

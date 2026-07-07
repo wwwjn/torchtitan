@@ -1,0 +1,173 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""DPPO loss: PPO-clipped surrogate with a divergence trust-region mask.
+
+Faithful to open-instruct's ``loss_fn=dppo`` (the tmax recipe; DPPO paper
+https://arxiv.org/abs/2602.04879). On top of the PPO clip, a per-token
+trust-region MASK zeros the gradient for tokens that would push the policy
+FURTHER from the rollout (behavior) policy AND whose behavior<->policy
+divergence has already exceeded a threshold ``delta``. Tokens that move the
+ratio back toward 1 are never masked, preserving PPO's beneficial asymmetry.
+
+The divergence is the binary (Bernoulli over ``{sampled token, all others}``)
+approximation from Eqs. 13/14 of the DPPO paper -- computed from only the
+per-token logprobs, so it needs no extra forward pass. For TITO rollouts the
+generator (vLLM) logprobs ARE the behavior/old policy, matching the recipe's
+``--use_vllm_logprobs true``.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+
+from torchtitan.components.loss import BaseLoss, compute_logprobs
+from torchtitan.config import CompileConfig
+
+# Clamp |log(pi_theta/pi_old)| before exp() so a large generator/trainer
+# logprob mismatch cannot overflow exp() to inf/NaN.
+_MAX_LOG_RATIO = 10.0
+# Clamp logprobs before exp() when forming the Bernoulli probabilities for the
+# divergence (mirrors open-instruct's compute_binary_divergence).
+_MIN_LOGPROB_FOR_PROB = -30.0
+
+
+class DPPOLoss(BaseLoss):
+    """PPO clip-higher surrogate gated by a DPPO divergence trust-region mask.
+
+    Same ratio + asymmetric clip as :class:`DAPOLoss`, plus a 0/1 mask that
+    drops the gradient of tokens outside the trust region (divergence > delta)
+    that are being pushed further off-policy. A token whose generator logprob is
+    non-finite is dropped from the loss (as in DAPO). The scalar loss sums
+    per-token losses over loss positions divided by ``global_valid_tokens``.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(BaseLoss.Config):
+        ratio_clip_low: float = 0.2
+        """Lower clip: the importance ratio is clamped to ``>= 1 - ratio_clip_low``."""
+
+        ratio_clip_high: float = 0.2
+        """Upper clip: the ratio is clamped to ``<= 1 + ratio_clip_high``."""
+
+        divergence_threshold: float = 0.1
+        """DPPO trust-region radius ``delta``: a token is eligible for masking only
+        once its binary behavior<->policy divergence exceeds this."""
+
+        divergence_type: str = "tv"
+        """``"tv"`` (total variation, the recipe default) or ``"kl"`` binary divergence."""
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        compile_config: CompileConfig | None = None,
+    ) -> None:
+        del compile_config
+        self.ratio_clip_low = config.ratio_clip_low
+        self.ratio_clip_high = config.ratio_clip_high
+        self.divergence_threshold = config.divergence_threshold
+        self.divergence_type = config.divergence_type
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        global_valid_tokens: float | None = None,
+        *,
+        generator_logprobs: torch.Tensor,
+        advantages: torch.Tensor,
+        loss_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Compute the DPPO (clip + divergence-mask) surrogate loss.
+
+        Args mirror :class:`DAPOLoss`. ``generator_logprobs`` are the rollout
+        (behavior/old) logprobs; ``advantages`` are per-token (0 on prompt/pad).
+        """
+        trainer_logprobs = compute_logprobs(logits, labels)
+        # Drop tokens with a non-finite generator logprob (no valid old-policy
+        # reference; e.g. vLLM under cudagraph), same as DAPO.
+        response_mask = loss_mask
+        raw_log_ratio = trainer_logprobs - generator_logprobs
+        loss_mask = loss_mask & torch.isfinite(raw_log_ratio)
+        log_ratio = torch.clamp(
+            torch.nan_to_num(raw_log_ratio), -_MAX_LOG_RATIO, _MAX_LOG_RATIO
+        )
+        ratio = torch.exp(log_ratio)
+
+        clipped_ratio = torch.clamp(
+            ratio, 1 - self.ratio_clip_low, 1 + self.ratio_clip_high
+        )
+        token_loss = -torch.min(ratio * advantages, clipped_ratio * advantages)
+
+        # DPPO trust-region mask (detached; it gates gradient, not part of it).
+        # bad = pushing further off-policy (ratio>1 with A>0, or ratio<1 with A<0)
+        # while already outside the divergence ball. Never masks tokens moving the
+        # ratio back toward 1, so corrective updates always flow.
+        with torch.no_grad():
+            mu = torch.exp(
+                torch.clamp(generator_logprobs, min=_MIN_LOGPROB_FOR_PROB, max=0.0)
+            )
+            pi = torch.exp(
+                torch.clamp(trainer_logprobs, min=_MIN_LOGPROB_FOR_PROB, max=0.0)
+            )
+            if self.divergence_type == "kl":
+                eps = 1e-9
+                mu_c = mu.clamp(eps, 1.0 - eps)
+                pi_c = pi.clamp(eps, 1.0 - eps)
+                divergence = mu_c * (mu_c.log() - pi_c.log()) + (1.0 - mu_c) * (
+                    (1.0 - mu_c).log() - (1.0 - pi_c).log()
+                )
+            else:  # total variation (recipe default)
+                divergence = (mu - pi).abs()
+            outside_region = divergence > self.divergence_threshold
+            bad_high = (advantages > 0) & (ratio > 1.0) & outside_region
+            bad_low = (advantages < 0) & (ratio < 1.0) & outside_region
+            dppo_mask = (~(bad_high | bad_low)).to(token_loss.dtype)
+
+        token_loss = token_loss * dppo_mask
+
+        masked_loss = token_loss * loss_mask
+        loss_denominator = (
+            max(global_valid_tokens, 1) if global_valid_tokens is not None else 1
+        )
+        loss = masked_loss.sum() / loss_denominator
+
+        with torch.no_grad():
+            diff = trainer_logprobs - generator_logprobs
+            diff_for_metrics = torch.where(loss_mask, diff, torch.zeros_like(diff))
+            masked_ratio = ratio * loss_mask
+            metrics = {
+                "loss/mean": loss.detach(),
+                "loss/ratio_mean": masked_ratio.sum() / loss_denominator,
+                "loss/ratio_clipped_frac": (
+                    (torch.abs(ratio - clipped_ratio) > 1e-6).float() * loss_mask
+                ).sum()
+                / loss_denominator,
+                # Fraction of trained tokens the DPPO trust region KEEPS (1.0 = no
+                # masking; lower = more off-policy tokens dropped).
+                "loss/dppo_mask_frac_kept": (dppo_mask * loss_mask).sum()
+                / loss_denominator,
+                "loss/dppo_divergence_mean": (divergence * loss_mask).sum()
+                / loss_denominator,
+                "loss/generator_logprob_nan_frac": (
+                    (~torch.isfinite(generator_logprobs)).float() * response_mask
+                ).sum()
+                / loss_denominator,
+                "bit_wise/logprob_diff/mean": diff_for_metrics.float().sum()
+                / loss_denominator,
+                "bit_wise/logprob_diff/abs_mean": diff_for_metrics.abs().float().sum()
+                / loss_denominator,
+                "bit_wise/ratio_tokens_different/mean": (
+                    (diff_for_metrics.abs() > 1e-6).float() * loss_mask
+                ).sum()
+                / loss_denominator,
+                "bit_wise/logprob_diff/max": diff_for_metrics.abs().max(),
+            }
+
+        return loss, metrics
