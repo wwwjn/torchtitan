@@ -144,7 +144,12 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
         config.async_loop,
         num_groups_per_train_step=8,
         group_size=32,
-        max_offpolicy_steps=4,
+        # off-policy window = run-ahead buffer depth. Recipe (qwen35_9b.sh) uses
+        # async_steps=4 -> (4+1)*8=40 active groups. SWE_OFFPOLICY_STEPS raises it
+        # (e.g. 8 -> 72 groups) to feed a higher SWE_ROLLOUT_CONCURRENCY when the
+        # straggler tail under-fills the pool; DEVIATES from the recipe + raises
+        # off-policy staleness, so use only for speed experiments.
+        max_offpolicy_steps=int(os.environ.get("SWE_OFFPOLICY_STEPS", "4")),
         training_sample_builder=TrainingSampleBuilder.Config(
             drop_zero_std_reward_groups=True,
         ),
