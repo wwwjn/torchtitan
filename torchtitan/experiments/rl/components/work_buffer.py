@@ -84,9 +84,18 @@ class RolloutGroupWorkBuffer(Configurable):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
-        """No tunables: capacity is passed in by the controller from the run-ahead sizing."""
+        """Capacity is passed in by the controller from the run-ahead sizing."""
+
+        strict_fifo: bool = False
+        """take_finalized() order. False (default) = take-any: return the first
+        FINALIZED group in completion order, skipping still-INFLIGHT stragglers (no
+        head-of-line stall; the throughput default). True = strict FIFO: return the
+        OLDEST group only once IT is finalized, stalling on a slow head. FIFO removes
+        the take-any bias toward short/fast (=easy) rollouts in the trained batch, at
+        the cost of the straggler stall -- a diagnostic knob for that bias."""
 
     def __init__(self, config: Config, *, max_active_rollout_groups: int) -> None:
+        self._strict_fifo = config.strict_fifo
         self._max_active_rollout_groups = max_active_rollout_groups
         self._active_rollout_groups = 0
         # metric: Per-flush peak active slots; reset on `.metrics()` call.
@@ -183,12 +192,25 @@ class RolloutGroupWorkBuffer(Configurable):
             while True:
                 if self._closed:
                     return None
-                for group_id, work in self._work_by_group_id.items():
-                    if work.state is _RolloutGroupWorkState.FINALIZED:
-                        del self._work_by_group_id[group_id]
-                        self._condition.notify_all()
-                        return work.rollout_group
-                await self._condition.wait()  # nothing FINALIZED yet -> wait
+                if self._strict_fifo:
+                    # Strict FIFO: only the OLDEST group is takeable; stall if it is
+                    # still INFLIGHT (head-of-line). Removes take-any's short/fast bias
+                    # in the trained batch. Restores pre-take-any behavior.
+                    if self._work_by_group_id:
+                        oldest_group_id, oldest_work = next(
+                            iter(self._work_by_group_id.items())
+                        )
+                        if oldest_work.state is _RolloutGroupWorkState.FINALIZED:
+                            del self._work_by_group_id[oldest_group_id]
+                            self._condition.notify_all()
+                            return oldest_work.rollout_group
+                else:
+                    for group_id, work in self._work_by_group_id.items():
+                        if work.state is _RolloutGroupWorkState.FINALIZED:
+                            del self._work_by_group_id[group_id]
+                            self._condition.notify_all()
+                            return work.rollout_group
+                await self._condition.wait()  # nothing takeable yet -> wait
 
     async def release_active_groups(self, count: int, *, reason: str) -> None:
         """Free active slots: the trainer releases trained slots after its weight pull; the batcher

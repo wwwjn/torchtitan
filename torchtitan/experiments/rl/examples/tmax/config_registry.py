@@ -159,6 +159,14 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
         # straggler tail under-fills the pool; DEVIATES from the recipe + raises
         # off-policy staleness, so use only for speed experiments.
         max_offpolicy_steps=int(os.environ.get("SWE_OFFPOLICY_STEPS", "4")),
+        # Batcher take order. Default take-any (throughput); SWE_STRICT_FIFO=1 uses
+        # strict FIFO to remove take-any's bias toward short/fast (=easy) rollouts in
+        # the trained batch (diagnostic for the flat-reward hypothesis; costs the
+        # straggler stall).
+        group_buffer=dataclasses.replace(
+            config.async_loop.group_buffer,
+            strict_fifo=os.environ.get("SWE_STRICT_FIFO", "0") == "1",
+        ),
         training_sample_builder=TrainingSampleBuilder.Config(
             drop_zero_std_reward_groups=True,
         ),
