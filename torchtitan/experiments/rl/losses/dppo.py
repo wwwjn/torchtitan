@@ -151,7 +151,7 @@ class DPPOLoss(BaseLoss):
                 / loss_denominator,
                 # Fraction of trained tokens the DPPO trust region KEEPS (1.0 = no
                 # masking; lower = more off-policy tokens dropped).
-                "loss/dppo_mask_frac_kept": (dppo_mask * loss_mask).sum()
+                "loss/dppo_mask_kept_frac": (dppo_mask * loss_mask).sum()
                 / loss_denominator,
                 "loss/dppo_divergence_mean": (divergence * loss_mask).sum()
                 / loss_denominator,
