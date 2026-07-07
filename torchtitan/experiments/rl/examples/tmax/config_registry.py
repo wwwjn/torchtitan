@@ -202,16 +202,15 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
     # model-only export for serving. The swe base uses interval=10000 (final save
     # only), which risks losing the whole ~20h run to any mid-run crash.
     # Loss: DAPO clip-higher (swe base default). SWE_LOSS=dppo switches to the tmax
-    # recipe's DPPO (qwen35_9b.sh loss_fn dppo): PPO clip + a TV divergence
-    # trust-region mask (delta=0.1) that drops gradient on tokens pushed further
-    # off-policy past the divergence ball. Behind an env toggle for a clean A/B.
+    # recipe's DPPO (qwen35_9b.sh loss_fn dppo): UNCLIPPED -A*ratio + a TV divergence
+    # trust-region mask (delta=0.1) that drops the loss on tokens pushed further
+    # off-policy past the divergence ball (the mask replaces the PPO clip -- faithful
+    # to open-instruct, no ratio clip). Behind an env toggle for a clean A/B.
     _loss = dataclasses.replace(config.trainer.loss, num_chunks=32)
     if os.environ.get("SWE_LOSS", "").lower() == "dppo":
         _loss = dataclasses.replace(
             _loss,
             loss_fn=DPPOLoss.Config(
-                ratio_clip_low=0.2,
-                ratio_clip_high=0.28,
                 divergence_threshold=float(
                     os.environ.get("SWE_DPPO_DIVERGENCE_THRESHOLD", "0.1")
                 ),

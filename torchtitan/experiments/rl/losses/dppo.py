@@ -4,14 +4,15 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""DPPO loss: PPO-clipped surrogate with a divergence trust-region mask.
+"""DPPO loss: unclipped importance-ratio surrogate with a divergence trust-region mask.
 
 Faithful to open-instruct's ``loss_fn=dppo`` (the tmax recipe; DPPO paper
-https://arxiv.org/abs/2602.04879). On top of the PPO clip, a per-token
-trust-region MASK zeros the gradient for tokens that would push the policy
-FURTHER from the rollout (behavior) policy AND whose behavior<->policy
-divergence has already exceeded a threshold ``delta``. Tokens that move the
-ratio back toward 1 are never masked, preserving PPO's beneficial asymmetry.
+https://arxiv.org/abs/2602.04879). The surrogate is the UNCLIPPED ``-A * ratio``
+(no PPO ratio clip); a per-token trust-region MASK zeros the loss for tokens that
+would push the policy FURTHER from the rollout (behavior) policy AND whose
+behavior<->policy divergence has already exceeded a threshold ``delta``. The mask
+REPLACES the PPO clip as the trust region (that is the DPPO contribution). Tokens
+that move the ratio back toward 1 are never masked, preserving PPO's asymmetry.
 
 The divergence is the binary (Bernoulli over ``{sampled token, all others}``)
 approximation from Eqs. 13/14 of the DPPO paper -- computed from only the
@@ -38,23 +39,19 @@ _MIN_LOGPROB_FOR_PROB = -30.0
 
 
 class DPPOLoss(BaseLoss):
-    """PPO clip-higher surrogate gated by a DPPO divergence trust-region mask.
+    """Unclipped importance-ratio surrogate gated by a DPPO divergence mask.
 
-    Same ratio + asymmetric clip as :class:`DAPOLoss`, plus a 0/1 mask that
-    drops the gradient of tokens outside the trust region (divergence > delta)
-    that are being pushed further off-policy. A token whose generator logprob is
-    non-finite is dropped from the loss (as in DAPO). The scalar loss sums
-    per-token losses over loss positions divided by ``global_valid_tokens``.
+    Faithful to open-instruct's ``loss_fn=dppo`` (tmax recipe): the per-token loss
+    is the UNCLIPPED ``-advantage * ratio`` -- there is NO PPO ratio clip. The sole
+    trust region is a 0/1 divergence mask that zeros the loss (value and gradient)
+    of tokens outside the ball (divergence > delta) that are being pushed further
+    off-policy; the mask replaces the clip (DPPO paper, Eq. 12). A token whose
+    generator logprob is non-finite is dropped. The scalar loss sums per-token
+    losses over loss positions divided by ``global_valid_tokens``.
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(BaseLoss.Config):
-        ratio_clip_low: float = 0.2
-        """Lower clip: the importance ratio is clamped to ``>= 1 - ratio_clip_low``."""
-
-        ratio_clip_high: float = 0.2
-        """Upper clip: the ratio is clamped to ``<= 1 + ratio_clip_high``."""
-
         divergence_threshold: float = 0.1
         """DPPO trust-region radius ``delta``: a token is eligible for masking only
         once its binary behavior<->policy divergence exceeds this."""
@@ -69,8 +66,6 @@ class DPPOLoss(BaseLoss):
         compile_config: CompileConfig | None = None,
     ) -> None:
         del compile_config
-        self.ratio_clip_low = config.ratio_clip_low
-        self.ratio_clip_high = config.ratio_clip_high
         self.divergence_threshold = config.divergence_threshold
         self.divergence_type = config.divergence_type
 
@@ -84,7 +79,7 @@ class DPPOLoss(BaseLoss):
         advantages: torch.Tensor,
         loss_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Compute the DPPO (clip + divergence-mask) surrogate loss.
+        """Compute the DPPO (unclipped ratio + divergence-mask) surrogate loss.
 
         Args mirror :class:`DAPOLoss`. ``generator_logprobs`` are the rollout
         (behavior/old) logprobs; ``advantages`` are per-token (0 on prompt/pad).
@@ -100,10 +95,10 @@ class DPPOLoss(BaseLoss):
         )
         ratio = torch.exp(log_ratio)
 
-        clipped_ratio = torch.clamp(
-            ratio, 1 - self.ratio_clip_low, 1 + self.ratio_clip_high
-        )
-        token_loss = -torch.min(ratio * advantages, clipped_ratio * advantages)
+        # Unclipped importance-weighted surrogate: -A * ratio. Faithful to
+        # open-instruct DPPO (pg_losses = -adv * ratio, no PPO clip); the DPPO mask
+        # below is the only trust region.
+        token_loss = -(advantages * ratio)
 
         # DPPO trust-region mask (detached; it gates gradient, not part of it).
         # bad = pushing further off-policy (ratio>1 with A>0, or ratio<1 with A<0)
@@ -145,10 +140,6 @@ class DPPOLoss(BaseLoss):
             metrics = {
                 "loss/mean": loss.detach(),
                 "loss/ratio_mean": masked_ratio.sum() / loss_denominator,
-                "loss/ratio_clipped_frac": (
-                    (torch.abs(ratio - clipped_ratio) > 1e-6).float() * loss_mask
-                ).sum()
-                / loss_denominator,
                 # Fraction of trained tokens the DPPO trust region KEEPS (1.0 = no
                 # masking; lower = more off-policy tokens dropped).
                 "loss/dppo_mask_kept_frac": (dppo_mask * loss_mask).sum()
