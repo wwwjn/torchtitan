@@ -58,9 +58,9 @@ def _eager_rebuild_daytona_models() -> None:
         import sys
         import typing
 
-        import pydantic
-
         import daytona  # type: ignore
+
+        import pydantic
 
         try:
             for info in pkgutil.walk_packages(daytona.__path__, daytona.__name__ + "."):
@@ -93,6 +93,26 @@ _eager_rebuild_daytona_models()
 # many-way boot fanout over a high-latency link times out the exec requests.
 _SHARED_CLIENT = None
 _SHARED_CLIENT_LOCK = None
+
+# Cap concurrent sandbox CREATES (held only during create/boot, not the rollout).
+# At high rollout concurrency every group tries to boot its siblings at once; the
+# resulting create burst trips Daytona's rate limit (ThrottlerException / 429),
+# and the whole fanout backs off in lockstep. This throttles creates to a
+# Daytona-friendly rate while letting far more sandboxes RUN concurrently. Per
+# worker process; the Daytona account limit is shared, so total = num_workers x
+# this value -- keep the product well under the observed throttle point.
+_CREATE_SEM = None
+
+
+def _create_sem():
+    import asyncio
+
+    global _CREATE_SEM
+    if _CREATE_SEM is None:
+        _CREATE_SEM = asyncio.Semaphore(
+            int(_getenv("TT_DAYTONA_CREATE_CONCURRENCY", default="16"))
+        )
+    return _CREATE_SEM
 
 
 async def _get_shared_client(*, api_key: str | None, api_url, target):
@@ -179,23 +199,26 @@ class DaytonaSandbox:
         )
         # Daytona create transiently 401s a valid key under a concurrent boot burst.
         # Retry with jittered backoff so a wide fanout does not retry in lockstep.
+        # The create-concurrency semaphore (held only for the create+boot, released
+        # before the rollout runs) keeps the create rate under Daytona's throttle.
         retries = int(_getenv("TT_DAYTONA_CREATE_RETRIES", default="5"))
         backoff = 5.0
-        for attempt in range(retries + 1):
-            try:
-                self._sb = await self._client.create(params, timeout=create_timeout)
-                break
-            except Exception as e:
-                if attempt >= retries:
-                    raise
-                logger.warning(
-                    "daytona create failed (attempt %d/%d): %s",
-                    attempt + 1,
-                    retries + 1,
-                    e,
-                )
-                await asyncio.sleep(backoff * (0.5 + random.random()))
-                backoff = min(backoff * 2, 60.0)
+        async with _create_sem():
+            for attempt in range(retries + 1):
+                try:
+                    self._sb = await self._client.create(params, timeout=create_timeout)
+                    break
+                except Exception as e:
+                    if attempt >= retries:
+                        raise
+                    logger.warning(
+                        "daytona create failed (attempt %d/%d): %s",
+                        attempt + 1,
+                        retries + 1,
+                        e,
+                    )
+                    await asyncio.sleep(backoff * (0.5 + random.random()))
+                    backoff = min(backoff * 2, 60.0)
         self.sandbox_id = self._sb.id
         return self
 
