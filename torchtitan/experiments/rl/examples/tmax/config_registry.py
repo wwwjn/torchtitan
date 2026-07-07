@@ -147,6 +147,10 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
     config.renderer = dataclasses.replace(config.renderer, preserve_all_thinking=True)
     config.async_loop = dataclasses.replace(
         config.async_loop,
+        # Total optimizer steps. Swe base = 100; SWE_TRAIN_STEPS raises it (e.g. 500
+        # for a long "wash" run that streams zero-std prompt annotations to
+        # SWE_ZERO_STD_LOG for a later SWE_SKIP_PROMPTS pass).
+        num_training_steps=int(os.environ.get("SWE_TRAIN_STEPS", "100")),
         num_groups_per_train_step=8,
         group_size=32,
         # off-policy window = run-ahead buffer depth. Recipe (qwen35_9b.sh) uses
