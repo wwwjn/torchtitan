@@ -147,8 +147,14 @@ class TMaxRollouter(Rollouter):
         # Placeholder env (the agent loop runs in-sandbox; see env.py).
         message_env: TMaxEnv.Config = field(default_factory=TMaxEnv.Config)
         token_env: TokenEnv.Config = field(default_factory=TokenEnv.Config)
+        # Centered (mean-baseline only), NOT std-normalized: matches the tmax
+        # recipe's ``--advantage_normalization_type centered`` (qwen35_9b.sh).
+        # Dividing by the group std amplifies rare-outcome advantages for
+        # imbalanced binary-reward groups (e.g. a 30/32-pass group's 2 failures
+        # get advantage ~ -3.9), which distorts the gradient and suppresses reward
+        # growth; the recipe centers only to keep the advantage in [-1, 1].
         advantage: AdvantageEstimator.Config = field(
-            default_factory=lambda: AdvantageEstimator.Config(should_std_normalize=True)
+            default_factory=lambda: AdvantageEstimator.Config(should_std_normalize=False)
         )
 
     def __init__(self, config: Config) -> None:
