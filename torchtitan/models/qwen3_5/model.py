@@ -354,6 +354,10 @@ class GatedDeltaNet(Module):
         # last -> [1, B*L, C]; depthwise weight [C, 1, k] -> [C, k]. cu_seqlens is only
         # built under packing (FSDP, non-TP activations), so x is a plain tensor here.
         if cu_seqlens is not None:
+            # TODO(qwen3.5-gdn): support packed GDN under TP. The varlen FLA conv
+            # path flattens the sequence and currently assumes local activations;
+            # TP needs a local_map/placement-preserving version instead of
+            # materializing full tensors or rejecting DTensor activations.
             assert not isinstance(
                 x, DTensor
             ), "packed GDN conv (cu_seqlens) assumes non-TP (FSDP) activations"
