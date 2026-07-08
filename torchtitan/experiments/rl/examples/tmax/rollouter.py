@@ -81,25 +81,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _env_int(name: str, default: int) -> int:
-    val = os.environ.get(name)
-    return int(val) if val and val.strip() else default
-
-
-# Cap concurrently-ACTIVE rollouts (see swe_r2e/rollouter.py for the rationale:
-# every live rollout drives per-turn fs ops on the controller's single asyncio
-# loop; gating keeps the adapter responsive). All groups are still collected, in
-# waves.
-_ROLLOUT_SEM: asyncio.Semaphore | None = None
-
-
-def _rollout_sem() -> asyncio.Semaphore:
-    global _ROLLOUT_SEM
-    if _ROLLOUT_SEM is None:
-        _ROLLOUT_SEM = asyncio.Semaphore(_env_int("SWE_ROLLOUT_CONCURRENCY", 16))
-    return _ROLLOUT_SEM
-
-
 class _RootSandbox:
     """Sandbox wrapper that forces every operation to run as ``root``.
 
@@ -160,13 +141,33 @@ class TMaxRollouter(Rollouter):
             )
         )
 
+        # Run knobs as CONFIG (not env), so they are serialized into the W&B run
+        # config and each run's differences are visible. config_registry resolves
+        # them from the launcher env once; the RolloutWorker pool overrides
+        # rollout_concurrency to its per-worker share.
+        rollout_concurrency: int = 16
+        """Max concurrently-ACTIVE rollouts (per worker process). The pool total is
+        num_rollout_workers x this. Gates per-turn fs ops so the adapter stays
+        responsive; all groups are still collected in waves."""
+
+        time_budget_sec: int = 1200
+        """Per-rollout agent wall-clock budget (the vanillux loop stops after this)."""
+
+        eval_timeout_sec: int = 600
+        """Verifier (test.sh) run timeout."""
+
+        max_context_tokens: int = 32768
+        """Model context budget for the adapter session."""
+
     def __init__(self, config: Config) -> None:
         super().__init__(config)
-        self._time_budget_sec = _env_int("SWE_TIME_BUDGET_SEC", 1200)
-        self._eval_timeout_sec = _env_int("TMAX_EVAL_TIMEOUT_SEC", 600)
-        self._max_context_tokens = _env_int("SWE_MAX_CONTEXT_LEN", 32768)
+        self._time_budget_sec = config.time_budget_sec
+        self._eval_timeout_sec = config.eval_timeout_sec
+        self._max_context_tokens = config.max_context_tokens
         # Whole-rollout wall-clock guard: agent budget + eval + boot buffer.
         self._guard_sec = self._time_budget_sec + self._eval_timeout_sec + 300
+        # Per-worker rollout-concurrency semaphore (one rollouter per worker proc).
+        self._rollout_sem = asyncio.Semaphore(config.rollout_concurrency)
         self._adapter: AnthropicAdapter | None = None
         self._adapter_lock = asyncio.Lock()
 
@@ -282,7 +283,7 @@ class TMaxRollouter(Rollouter):
         status = RolloutStatus.ERROR
         reward = 0.0
         error_msg = ""
-        sem = _rollout_sem()
+        sem = self._rollout_sem
         await sem.acquire()
         try:
             async with asyncio.timeout(self._guard_sec):

@@ -96,6 +96,14 @@ def _tmax_rollouter() -> TMaxRollouter.Config:
             split="validation",
             skip_ids_path=_SKIP_IDS,
         ),
+        # Run knobs resolved from the launcher env ONCE, into config fields so they
+        # land in the W&B run config (per-run differences are visible). Same env
+        # names + defaults as before; the RolloutWorker pool splits
+        # rollout_concurrency across workers.
+        rollout_concurrency=int(os.environ.get("SWE_ROLLOUT_CONCURRENCY", "16")),
+        time_budget_sec=int(os.environ.get("SWE_TIME_BUDGET_SEC", "1200")),
+        eval_timeout_sec=int(os.environ.get("TMAX_EVAL_TIMEOUT_SEC", "600")),
+        max_context_tokens=int(os.environ.get("SWE_MAX_CONTEXT_LEN", "32768")),
     )
 
 

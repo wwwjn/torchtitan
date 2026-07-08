@@ -25,7 +25,6 @@ Only two payloads cross the Monarch RPC boundary: the raw ``sample`` in, and the
 
 from __future__ import annotations
 
-import os
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -60,18 +59,15 @@ class RolloutWorker(Actor):
             ``hf_assets_path`` fields are reused verbatim so a worker's rollouts
             are identical to the in-controller path).
         rollout_concurrency: This worker's own rollout-concurrency cap (the
-            controller splits the global ``SWE_ROLLOUT_CONCURRENCY`` target across
-            the pool). Set into the env before the rollouter builds its lazy
-            semaphore, so each worker process caps its own concurrent rollouts.
+            controller splits the global ``rollout_concurrency`` target across the
+            pool). Set into the rollouter Config (via replace) before build, so each
+            worker process caps its own concurrent rollouts from config -- not env.
     """
 
-    def __init__(self, config: "Controller.Config", *, rollout_concurrency: int) -> None:
+    def __init__(
+        self, config: "Controller.Config", *, rollout_concurrency: int
+    ) -> None:
         self.config = config
-        # Per-worker concurrency: the rollouter's semaphore is built lazily on the
-        # first rollout (reads SWE_ROLLOUT_CONCURRENCY), so setting it here -- one
-        # process per worker -- gives each worker its own cap; the pool total is
-        # num_workers * rollout_concurrency.
-        os.environ["SWE_ROLLOUT_CONCURRENCY"] = str(rollout_concurrency)
         self.renderer = config.renderer.build(tokenizer_path=config.hf_assets_path)
         # Same sampling config the controller builds (seed + renderer stop tokens);
         # the rollouter offsets the seed per sample.
@@ -80,7 +76,16 @@ class RolloutWorker(Actor):
             seed=config.generator.debug.seed,
             stop_token_ids=list(self.renderer.get_stop_token_ids()),
         )
-        self._rollouter: Rollouter = config.rollouter.build()
+        # Per-worker concurrency: override the rollouter's rollout_concurrency with
+        # this worker's share (pool total = num_workers x this) via config, so the
+        # rollouter builds its semaphore from config -- no process-wide env. The
+        # hasattr guard keeps the pool usable with any Rollouter.Config.
+        rollouter_config = config.rollouter
+        if hasattr(rollouter_config, "rollout_concurrency"):
+            rollouter_config = replace(
+                rollouter_config, rollout_concurrency=rollout_concurrency
+            )
+        self._rollouter: Rollouter = rollouter_config.build()
         self._generator_router: InterGeneratorRouter | None = None
 
     @endpoint
