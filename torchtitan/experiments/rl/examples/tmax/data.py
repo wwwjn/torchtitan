@@ -128,26 +128,11 @@ class TMaxDataset(Configurable):
         if not samples:
             raise ValueError(f"no rows found in {config.data_path}")
 
-        # Skip prompts annotated zero-std by a prior run (no learning signal). Applied
-        # before the holdout split so both train and validation instances (same file,
-        # same order) exclude the same ids and the split stays aligned.
-        if config.skip_ids_path:
-            skip_ids = _load_skip_ids(config.skip_ids_path)
-            if skip_ids:
-                kept = [s for s in samples if s.instance_id not in skip_ids]
-                logger.info(
-                    f"TMaxDataset: skipped {len(samples) - len(kept)} zero-std prompt(s) "
-                    f"from {config.skip_ids_path} ({len(kept)}/{len(samples)} remain)"
-                )
-                samples = kept
-                if not samples:
-                    raise ValueError(
-                        f"all rows filtered out by skip_ids_path={config.skip_ids_path}"
-                    )
-
         # Held-out split: the last holdout_n rows (in file order) form the validation slice,
         # disjoint from the training slice, so periodic validation measures generalization
         # rather than training-set recall. Deterministic (file order), no separate file.
+        # Done BEFORE the skip filter so the train/val boundary is stable regardless of
+        # which ids get skipped (a skip run and the wash share the same split).
         if config.holdout_n > 0:
             if config.holdout_n >= len(samples):
                 raise ValueError(
@@ -165,6 +150,29 @@ class TMaxDataset(Configurable):
         self._order = list(range(len(self._samples)))
         if self._shuffle:
             self._rng.shuffle(self._order)
+
+        # Skip prompts annotated zero-std by a prior run (no learning signal). Applied
+        # AFTER the shuffle as a lazy filter over the canonical (seed-fixed) order: a skip
+        # run then walks the SAME prompt sequence as the wash that produced the
+        # annotations, just with the dead prompts removed in place -- it inherits the
+        # wash's ordering instead of getting an independent shuffle of a shorter list.
+        if config.skip_ids_path:
+            skip_ids = _load_skip_ids(config.skip_ids_path)
+            if skip_ids:
+                before = len(self._order)
+                self._order = [
+                    i
+                    for i in self._order
+                    if self._samples[i].instance_id not in skip_ids
+                ]
+                logger.info(
+                    f"TMaxDataset: skipped {before - len(self._order)} zero-std prompt(s) "
+                    f"from {config.skip_ids_path} ({len(self._order)}/{before} remain)"
+                )
+                if not self._order:
+                    raise ValueError(
+                        f"all rows filtered out by skip_ids_path={config.skip_ids_path}"
+                    )
         self._pos = 0
 
     def __iter__(self) -> Iterator[TMaxSample]:
