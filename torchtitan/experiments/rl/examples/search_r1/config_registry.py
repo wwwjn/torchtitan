@@ -19,9 +19,11 @@ from __future__ import annotations
 import dataclasses
 
 from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.components.loss import ChunkedLossWrapper
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import default_adamw
 from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
+from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.experiments.rl.actors.generator import (
     SamplingConfig,
     VLLMCudagraphConfig,
@@ -36,11 +38,14 @@ from torchtitan.experiments.rl.controller import (
 )
 from torchtitan.experiments.rl.examples.search_r1.rollouter import SearchR1Rollouter
 from torchtitan.experiments.rl.losses import DAPOLoss
+from torchtitan.experiments.rl.models.cast_linear import LMHeadCastConverter
 from torchtitan.experiments.rl.models.vllm_registry import InferenceParallelismConfig
 from torchtitan.experiments.rl.observability.metrics import MetricsProcessor
 from torchtitan.experiments.rl.renderer import RendererConfig
 from torchtitan.experiments.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.models.qwen3 import model_registry
+from torchtitan.models.qwen3_5 import model_registry as qwen3_5_model_registry
+from torchtitan.protocols.model_spec import ModelSpec
 
 
 def rl_grpo_qwen3_1_7b_search_r1() -> Controller.Config:
@@ -138,6 +143,94 @@ def rl_grpo_qwen3_8b_search_r1() -> Controller.Config:
         gpu_memory_limit=0.6,
         parallelism=dataclasses.replace(
             config.generator.parallelism, tensor_parallel_degree=2
+        ),
+    )
+    return config
+
+
+def _set_max_seq_len(model_spec: ModelSpec, max_seq_len: int) -> None:
+    """Raise/lower the model's context length by setting every attention layer's
+    RoPE ``max_seq_len`` (``ModelSpec.model.max_seq_len`` is a read-only property
+    derived from it). Hybrid-safe: linear-attention (GDN) layers have no ``rope``
+    and are skipped."""
+    for layer in model_spec.model.layers:
+        rope = getattr(getattr(layer, "attention", None), "rope", None)
+        if rope is not None:
+            rope.max_seq_len = max_seq_len
+
+
+def rl_grpo_qwen3_5_9b_search_r1() -> Controller.Config:
+    """GRPO Search-R1 for Qwen3.5-9B (Gated DeltaNet hybrid) -- linear-attn check.
+
+    The dense 1.7B/8B Search-R1 recipe verbatim (clean held-out NQ exact-match eval),
+    swapping in the Qwen3.5-9B GDN model to validate the linear-attention
+    (GatedDeltaNet) implementation end to end. The trainer runs the FLA chunked GDN
+    forward/backward; the generator runs vLLM-native GDN (recurrent decode + chunked
+    prefill, the correct GDN decode path the torchtitan wrapper lacks), synced
+    torchtitan -> HF by the model's state_dict_adapter. A rising EM curve (matching
+    the dense curve) confirms the GDN forward + backward + weight sync are correct;
+    a flat/falling curve points at the linear-attention implementation.
+
+    Topology (MAST): 1 controller host (dense-retrieval server) + 1 trainer host
+    (FSDP-8) + N generator hosts (vLLM-native GDN, DP-8 x TP-1). Only the model and
+    the GDN toolchain differ from the dense config; the RL recipe (8 groups x 8, temp
+    1.0, std-normalized advantage, DAPO clip-higher, 500 steps, NQ-500 eval) is
+    unchanged so the two EM curves are directly comparable. Needs the CUDA 13 GDN
+    toolchain (``SWE_GDN=1`` in run.sh switches CUDA_HOME to the pip cu13 ptxas).
+    """
+    config = rl_grpo_qwen3_1_7b_search_r1()
+    # Qwen3.5-9B GDN hybrid + fp32 lm_head cast (RL logprob math needs fp32 logits),
+    # mirroring the swe_r2e/tmax GDN recipes.
+    config.model_spec = qwen3_5_model_registry(
+        "9B", attn_backend="varlen", converters=[LMHeadCastConverter.Config()]
+    )
+    # GDN's default context is 262144; cap RoPE (== the generator's vLLM
+    # max_model_len) to the Search-R1 sequence length so vLLM does not allocate a
+    # 256k-token KV cache. 4096 matches the batcher/dense-qwen3 context.
+    _set_max_seq_len(config.model_spec, 4096)
+    config.hf_assets_path = "torchtitan/experiments/rl/example_checkpoint/Qwen3.5-9B"
+    # Re-run the held-out NQ-500 eval every 25 steps (the base default interval=0 runs
+    # it only once pre-training). This is the whole point of the run: watch EM grow to
+    # confirm the GDN gradients are correct. ~34s/pass over 500 steps = ~11min total.
+    config.async_loop = dataclasses.replace(
+        config.async_loop,
+        validation=dataclasses.replace(config.async_loop.validation, interval=25),
+    )
+    # GDN is not torch.compile-clean; run eager (matches the qwen3_5 recipes).
+    config.compile = CompileConfig(enable=False, backend="aot_eager")
+    # qwen3.5 chat template; thinking off gave the best Search-R1 EM in the dense
+    # ablation (the renderer drops this knob if the qwen3.5 template ignores it).
+    config.renderer = RendererConfig(name="qwen3.5", enable_thinking=False)
+    # FSDP-8 trainer (9B on one 8-GPU host). FullAC recomputes activations to fit;
+    # the chunked loss bounds the fp32 lm_head logits over the 248320-token vocab.
+    config.trainer = dataclasses.replace(
+        config.trainer,
+        ac_config=FullAC.Config(),
+        parallelism=dataclasses.replace(
+            config.trainer.parallelism,
+            data_parallel_shard_degree=8,
+            tensor_parallel_degree=1,
+        ),
+        loss=ChunkedLossWrapper.Config(
+            num_chunks=8,
+            loss_fn=DAPOLoss.Config(ratio_clip_low=0.2, ratio_clip_high=0.28),
+        ),
+    )
+    # vLLM-native GDN generator. DP-8 x TP-1 = 8 single-GPU engines per host (the 9B
+    # ~18GB fits one GPU), avoiding the TP>1 custom-all-reduce path. gdn_prefill
+    # triton kernel + GDN-safe FULL_DECODE_ONLY decode graphs (#3668) + forced prefix
+    # caching (GDN defaults it OFF, so multi-turn rollouts re-prefill every turn).
+    config.generator = dataclasses.replace(
+        config.generator,
+        backend="vllm_native",
+        gpu_memory_limit=0.6,
+        vllm_additional_config={"gdn_prefill_backend": "triton"},
+        cudagraph=VLLMCudagraphConfig(enable=True, mode="FULL_DECODE_ONLY"),
+        enable_prefix_caching=True,
+        parallelism=dataclasses.replace(
+            config.generator.parallelism,
+            data_parallel_degree=8,
+            tensor_parallel_degree=1,
         ),
     )
     return config
