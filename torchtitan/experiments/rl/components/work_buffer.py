@@ -12,6 +12,7 @@ NOTE: The buffer holds work slots, and not the finalized RolloutGroups necessari
 import asyncio
 import collections
 import enum
+import time
 from dataclasses import dataclass, field
 
 from torchtitan.config import Configurable
@@ -46,6 +47,12 @@ class RolloutGroupWork:
     rollout_group: RolloutGroup | None = field(
         default=None, init=False
     )  # set once FINALIZED
+    # Monotonic wall-clock stamps for slot-occupancy observability: admitted_ts when the
+    # group enters the buffer (charges a slot), claimed_ts on WAITING -> INFLIGHT. A slot's
+    # occupancy (now - admitted_ts) surfaces stuck rollouts that hold an off-policy slot
+    # without finalizing (e.g. a hung Daytona sandbox), which starve the trainer.
+    admitted_ts: float | None = field(default=None, init=False)
+    claimed_ts: float | None = field(default=None, init=False)
     # TODO(async-rl): emit JSON lifecycle logging per RolloutGroupWork keyed by group_id:
     # admitted/claimed/finalized/batched/trained/dropped timestamps + policy version at admission and
     # at trainer consumption, for faithful end-to-end visibility.
@@ -144,6 +151,7 @@ class RolloutGroupWorkBuffer(Configurable):
                 self._active_rollout_groups_peak_since_flush,
                 self._active_rollout_groups,
             )
+            work.admitted_ts = time.monotonic()
             self._work_by_group_id[work.group_id] = work
             self._condition.notify_all()
 
@@ -156,6 +164,7 @@ class RolloutGroupWorkBuffer(Configurable):
                 for work in self._work_by_group_id.values():
                     if work.state is _RolloutGroupWorkState.WAITING:
                         work.state = _RolloutGroupWorkState.INFLIGHT
+                        work.claimed_ts = time.monotonic()
                         return work
                 await self._condition.wait()
 
@@ -254,7 +263,26 @@ class RolloutGroupWorkBuffer(Configurable):
         """Trainer loop: point-in-time buffer gauges for this step; resets the per-flush peak."""
         states = [work.state for work in self._work_by_group_id.values()]
         state_enum = _RolloutGroupWorkState
+        # Slot occupancy (seconds since admission) of the groups still holding an active slot
+        # but not yet finalized (WAITING + INFLIGHT). max surfaces a stuck straggler occupying
+        # a slot; mean is the typical in-flight wait. Both are 0 when the buffer is empty.
+        now = time.monotonic()
+        occupancy_secs = [
+            now - work.admitted_ts
+            for work in self._work_by_group_id.values()
+            if work.state is not state_enum.FINALIZED and work.admitted_ts is not None
+        ]
         out = [
+            m.Metric(
+                "rollout_buffer/slot_occupancy_max_sec",
+                m.NoReduce(max(occupancy_secs, default=0.0)),
+            ),
+            m.Metric(
+                "rollout_buffer/slot_occupancy_mean_sec",
+                m.NoReduce(
+                    sum(occupancy_secs) / len(occupancy_secs) if occupancy_secs else 0.0
+                ),
+            ),
             m.Metric(
                 "rollout_buffer/num_groups_waiting",
                 m.NoReduce(float(states.count(state_enum.WAITING))),

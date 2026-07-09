@@ -33,6 +33,7 @@ import os
 from torchtitan.experiments.rl.components.training_sample_builder import (
     TrainingSampleBuilder,
 )
+from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.experiments.rl.controller import Controller, ValidationConfig
 from torchtitan.experiments.rl.examples.swe_r2e.config_registry import (
     _set_max_seq_len,
@@ -238,6 +239,51 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
         loss=_loss,
         checkpoint=dataclasses.replace(config.trainer.checkpoint, interval=20),
     )
+    # Optional trainer FSDP width override for a fwd/bwd speed experiment. The mast_rl
+    # launcher derives the trainer host count from data_parallel_shard_degree, so
+    # SWE_DP_SHARD=16 -> 2 trainer hosts (FSDP-16), spreading the packed rows across
+    # 2x DP ranks -> ~half the microbatches per rank -> ~2x faster fwd/bwd. Default
+    # unset (0) keeps the base FSDP-8.
+    _dp_shard = int(os.environ.get("SWE_DP_SHARD", "0"))
+    if _dp_shard:
+        config.trainer = dataclasses.replace(
+            config.trainer,
+            parallelism=dataclasses.replace(
+                config.trainer.parallelism, data_parallel_shard_degree=_dp_shard
+            ),
+        )
+    # Optional AC-policy override for a fwd/bwd speed experiment. The base is FullAC
+    # (recompute the whole forward -- needed to fit seq 65536). SWE_AC=selective swaps
+    # in per-op SAC, which saves the expensive aten op outputs (projections, flash-attn
+    # in the 25% softmax layers) and recomputes the rest -> less recompute, more memory.
+    # Caveat: the fla GDN kernel is a dynamo-disabled custom autograd op invisible to the
+    # SAC aten policy, so the 75% GDN layers' kernel is recomputed regardless; the win is
+    # capped and only materializes if the extra saved activations fit at seq 65536.
+    _ac = os.environ.get("SWE_AC", "").lower()
+    if _ac == "selective":
+        config.trainer = dataclasses.replace(
+            config.trainer, ac_config=SelectiveAC.Config()
+        )
+    elif _ac in ("none", "off"):
+        # No activation checkpointing: keep the full forward activations instead of
+        # recomputing them in backward -> less compute, much more memory. A memory
+        # probe at seq 65536 (likely OOMs; FullAC exists because the activations are
+        # large), paired with SWE_LOCAL_BSZ.
+        config.trainer = dataclasses.replace(config.trainer, ac_config=None)
+    # Optional per-rank microbatch width override (rows per forward pass). Default 1
+    # (one 65536-token row per forward). SWE_LOCAL_BSZ=4 packs 4 rows/forward ->
+    # fewer, larger microbatches but 4x the activation memory per forward.
+    _lbsz = int(os.environ.get("SWE_LOCAL_BSZ", "0"))
+    if _lbsz:
+        config.async_loop = dataclasses.replace(
+            config.async_loop,
+            batcher=dataclasses.replace(
+                config.async_loop.batcher,
+                batch=dataclasses.replace(
+                    config.async_loop.batcher.batch, local_batch_size=_lbsz
+                ),
+            ),
+        )
     return config
 
 

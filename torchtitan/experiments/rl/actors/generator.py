@@ -12,6 +12,7 @@ import gc
 import logging
 import math
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -1266,12 +1267,25 @@ class VLLMGenerator(Actor, Configurable):
             # filled in place by FQN. Pull the full state dict (no template) and
             # let the vLLM model's load_weights copy + TP-shard the HF tensors
             # (converted from torchtitan layout by the state_dict_adapter).
+            # Weight-sync timing breakdown (rank 0): split the pull into transfer
+            # (ts.get_state_dict), layout conversion (to_hf), and vLLM load_weights.
+            # The transfer dominates -- torchstore's cpu_staged RDMA runs ~0.9 GB/s,
+            # so the ~34s/step pull is transfer-bound, not load/convert-bound.
+            _t0 = time.perf_counter()
             tt_state_dict = await ts.get_state_dict(
                 "model_state_dict",
                 direct_rdma=False,
             )
+            _t1 = time.perf_counter()
             hf_state_dict = self._sd_adapter.to_hf(tt_state_dict)
+            _t2 = time.perf_counter()
             self._get_model().load_weights(hf_state_dict.items())
+            _t3 = time.perf_counter()
+            if self._rank == 0:
+                logger.info(
+                    f"[pull-timing] get={_t1 - _t0:.2f}s to_hf={_t2 - _t1:.2f}s "
+                    f"load_weights={_t3 - _t2:.2f}s total={_t3 - _t0:.2f}s"
+                )
         else:
             # Async RL uses a StorageVolume snapshot so generators do not read
             # live trainer GPU tensors while optimizer steps may be mutating them.
