@@ -109,6 +109,29 @@ def _tmax_rollouter() -> TMaxRollouter.Config:
     )
 
 
+def _tmax_recipe_loss(loss):
+    """Apply the tmax recipe's DEFAULT loss to a base loss config.
+
+    The recipe (open-instruct qwen35_9b.sh loss_fn dppo) is DPPO: UNCLIPPED -A*ratio
+    + a TV divergence trust-region mask (delta=0.1) that drops the loss on tokens
+    pushed further off-policy past the divergence ball (the mask replaces the PPO
+    clip -- faithful to open-instruct, no ratio clip). SWE_LOSS=dapo reverts to the
+    swe base's DAPO clip-higher for a clean A/B. Only loss_fn is swapped; other loss
+    fields (e.g. num_chunks) are preserved.
+    """
+    if os.environ.get("SWE_LOSS", "dppo").lower() == "dapo":
+        return loss
+    return dataclasses.replace(
+        loss,
+        loss_fn=DPPOLoss.Config(
+            divergence_threshold=float(
+                os.environ.get("SWE_DPPO_DIVERGENCE_THRESHOLD", "0.1")
+            ),
+            divergence_type="tv",
+        ),
+    )
+
+
 def rl_grpo_qwen3_5_27b_tmax() -> Controller.Config:
     """Qwen3.6-27B (Gated DeltaNet hybrid) tmax terminal-agent on a single 8-GPU node.
 
@@ -120,6 +143,9 @@ def rl_grpo_qwen3_5_27b_tmax() -> Controller.Config:
     """
     config = _swe_27b()
     config.rollouter = _tmax_rollouter()
+    config.trainer = dataclasses.replace(
+        config.trainer, loss=_tmax_recipe_loss(config.trainer.loss)
+    )
     return config
 
 
@@ -230,22 +256,9 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
     # eval-able; keep last_save_model_only so the final step-100 save is a clean
     # model-only export for serving. The swe base uses interval=10000 (final save
     # only), which risks losing the whole ~20h run to any mid-run crash.
-    # Loss: DAPO clip-higher (swe base default). SWE_LOSS=dppo switches to the tmax
-    # recipe's DPPO (qwen35_9b.sh loss_fn dppo): UNCLIPPED -A*ratio + a TV divergence
-    # trust-region mask (delta=0.1) that drops the loss on tokens pushed further
-    # off-policy past the divergence ball (the mask replaces the PPO clip -- faithful
-    # to open-instruct, no ratio clip). Behind an env toggle for a clean A/B.
-    _loss = dataclasses.replace(config.trainer.loss, num_chunks=32)
-    if os.environ.get("SWE_LOSS", "").lower() == "dppo":
-        _loss = dataclasses.replace(
-            _loss,
-            loss_fn=DPPOLoss.Config(
-                divergence_threshold=float(
-                    os.environ.get("SWE_DPPO_DIVERGENCE_THRESHOLD", "0.1")
-                ),
-                divergence_type="tv",
-            ),
-        )
+    # Loss: the tmax recipe's DPPO is the DEFAULT (SWE_LOSS=dapo reverts). See
+    # _tmax_recipe_loss. num_chunks=32 (chunked lm-head loss) is preserved.
+    _loss = _tmax_recipe_loss(dataclasses.replace(config.trainer.loss, num_chunks=32))
     config.trainer = dataclasses.replace(
         config.trainer,
         loss=_loss,
