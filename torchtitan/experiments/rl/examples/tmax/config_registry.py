@@ -30,10 +30,11 @@ from __future__ import annotations
 import dataclasses
 import os
 
+from torchtitan.distributed.activation_checkpoint import SelectiveAC
+
 from torchtitan.experiments.rl.components.training_sample_builder import (
     TrainingSampleBuilder,
 )
-from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.experiments.rl.controller import Controller, ValidationConfig
 from torchtitan.experiments.rl.examples.swe_r2e.config_registry import (
     _set_max_seq_len,
@@ -205,11 +206,22 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
     # throughput). SWE_NUM_ROLLOUT_WORKERS=0 keeps the in-process path; default 8.
     # The global SWE_ROLLOUT_CONCURRENCY is split across the pool.
     config.num_rollout_workers = int(os.environ.get("SWE_NUM_ROLLOUT_WORKERS", "8"))
+    # Weight-sync KV policy. Default (SWE_SALT_KV=1): keep in-flight KV AND the prefix
+    # cache (no preempt, no full re-prefill) and salt the prefix cache per GROUP (its n
+    # samples share one namespace), so a NEW group recomputes its prefix under the new
+    # weights while an in-flight group keeps reusing its own KV. Mirrors open-instruct's
+    # per-prompt inflight update (cache_salt=base_request_id +
+    # inflight_updates_recompute_kv_cache=False), and drops the per-step full-batch
+    # re-prefill storm. SWE_SALT_KV=0 reverts to the reset-and-re-prefill path.
+    _salt_kv = os.environ.get("SWE_SALT_KV", "1") == "1"
     config.generator = dataclasses.replace(
         config.generator,
         sampling=dataclasses.replace(
             config.generator.sampling, max_tokens=_TMAX_9B_PER_TURN_TOKENS
         ),
+        salt_prefix_cache_on_weight_sync=_salt_kv,
+        reset_prefix_cache_on_weight_sync=not _salt_kv,
+        reset_running_requests_on_weight_sync=not _salt_kv,
     )
     # 32 chunks keeps per-chunk fp32 lm_head logits ~1.2 GiB at seq_len 65536
     # (16 chunks -> ~2.3 GiB, an OOM risk); 65536 % 32 == 0 for the chunk split.

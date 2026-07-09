@@ -715,6 +715,16 @@ class VLLMGenerator(Actor, Configurable):
         the new weights. No effect under strict-drain (engine idle at pull time); async hot-swap only.
         Default True to avoid reusing stale-weight KV."""
 
+        salt_prefix_cache_on_weight_sync: bool = False
+        """Async hot-swap alternative to the two reset knobs above. On weight sync, keep BOTH the
+        prefix cache and every in-flight request's KV (no preempt, no re-prefill storm); instead stamp
+        each request with a per-GROUP ``cache_salt`` (the ``group=`` prefix of ``routing_session_id``;
+        see ``add_request``). A NEW group gets a fresh salt -> cache-miss vs old-weight blocks ->
+        recompute its prefix under the new weights, while an in-flight group keeps reusing its own KV.
+        Mirrors open-instruct's per-prompt ``cache_salt=base_request_id`` (its n samples share one
+        request) + ``inflight_updates_recompute_kv_cache=False``. When True the two reset knobs above
+        are bypassed."""
+
         def __post_init__(self):
             # The generator runs vLLM full expert parallelism: vLLM forms the EP
             # group from all DP*TP ranks, so expert_parallel_degree must equal
@@ -743,6 +753,11 @@ class VLLMGenerator(Actor, Configurable):
                 raise ValueError(
                     "reset_running_requests_on_weight_sync requires "
                     "reset_prefix_cache_on_weight_sync=True (it only matters as part of resetting the cache)"
+                )
+            if self.salt_prefix_cache_on_weight_sync and self.debug.batch_invariant:
+                raise ValueError(
+                    "salt_prefix_cache_on_weight_sync keeps in-flight/old-weight KV, which breaks "
+                    "batch_invariant determinism; use reset_prefix_cache_on_weight_sync instead"
                 )
 
     def __init__(
@@ -1125,6 +1140,19 @@ class VLLMGenerator(Actor, Configurable):
                         for request, engine_input in zip(
                             local_requests, engine_inputs, strict=True
                         ):
+                            if self.config.salt_prefix_cache_on_weight_sync:
+                                # Salt by GROUP: routing_session_id is
+                                # "group=G/rollout=R"; take the "group=G" prefix so a
+                                # group's n samples share ONE prefix-cache namespace --
+                                # matching open-instruct's per-prompt base_request_id
+                                # (its n=samples ride one request). group_id is monotonic,
+                                # so a new group gets a fresh salt -> cache-miss old-weight
+                                # blocks -> recompute under the new weights, while an
+                                # in-flight group keeps reusing its own KV. A per-sample
+                                # salt would re-prefill the shared prompt n times.
+                                engine_input[
+                                    "cache_salt"
+                                ] = request.routing_session_id.split("/rollout=", 1)[0]
                             self._engine.add_request(
                                 request_id=request.request_id,
                                 prompt=engine_input,
@@ -1306,11 +1334,16 @@ class VLLMGenerator(Actor, Configurable):
             # TODO: can we avoid the copy and properly load fused qkv weights?
             self._get_model().model.load_state_dict(model_sd, strict=False)
         self.policy_version = version
-        if self.config.reset_prefix_cache_on_weight_sync:
+        if self.config.salt_prefix_cache_on_weight_sync:
+            # Salt mode: keep BOTH in-flight KV and the prefix cache (no preempt, no
+            # re-prefill storm). New groups carry a per-group cache_salt (set in
+            # add_request) so they recompute their prefix under the new weights, while
+            # an in-flight group keeps reusing its own KV. Mirrors open-instruct's
+            # inflight update with inflight_updates_recompute_kv_cache=False.
+            pass
+        elif self.config.reset_prefix_cache_on_weight_sync:
             # TODO(async-rl): consider a `flush_kv_cache_every_n_steps` flag to force-flush every N steps
             #   (helps long generations that span many steps).
-            # TODO(async-rl): salt the prefix cache per NEW rollout so a new rollout can't reuse stale-weight
-            #   KV, while an in-flight rollout keeps reusing its own KV (avoids the full drop).
             self._engine.reset_prefix_cache(
                 reset_running_requests=self.config.reset_running_requests_on_weight_sync,
             )
