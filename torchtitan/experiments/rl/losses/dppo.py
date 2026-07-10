@@ -59,6 +59,15 @@ class DPPOLoss(BaseLoss):
         divergence_type: str = "tv"
         """``"tv"`` (total variation, the recipe default) or ``"kl"`` binary divergence."""
 
+        ratio_cap: float = 0.0
+        """Truncated importance-sampling cap on the surrogate ratio. 0.0 = disabled
+        (unclipped, the recipe default). When > 0 the ratio in ``-A * ratio`` is
+        clamped to ``[0, ratio_cap]`` (e.g. 2.0) so a few tokens with a large
+        generator<->trainer logprob mismatch (e.g. a residual GDN train/infer
+        divergence tail) cannot spike the gradient. The DPPO TV mask bounds
+        probability-mass movement but NOT low-probability high-ratio tokens, so this
+        cap is the tool that lets DPPO tolerate a larger gen/train mismatch."""
+
     def __init__(
         self,
         config: Config,
@@ -68,6 +77,7 @@ class DPPOLoss(BaseLoss):
         del compile_config
         self.divergence_threshold = config.divergence_threshold
         self.divergence_type = config.divergence_type
+        self.ratio_cap = config.ratio_cap
 
     def __call__(
         self,
@@ -94,6 +104,13 @@ class DPPOLoss(BaseLoss):
             torch.nan_to_num(raw_log_ratio), -_MAX_LOG_RATIO, _MAX_LOG_RATIO
         )
         ratio = torch.exp(log_ratio)
+
+        # Optional truncated-IS cap: clamp the ratio so outlier tokens (large
+        # gen<->trainer logprob mismatch) cannot spike the gradient. 0.0 = disabled
+        # (recipe default, unclipped). The clamp saturates gradient above the cap.
+        if self.ratio_cap > 0.0:
+            uncapped_ratio = ratio
+            ratio = ratio.clamp(max=self.ratio_cap)
 
         # Unclipped importance-weighted surrogate: -A * ratio. Faithful to
         # open-instruct DPPO (pg_losses = -adv * ratio, no PPO clip); the DPPO mask
@@ -160,5 +177,9 @@ class DPPOLoss(BaseLoss):
                 / loss_denominator,
                 "bit_wise/logprob_diff/max": diff_for_metrics.abs().max(),
             }
+            if self.ratio_cap > 0.0:
+                metrics["loss/ratio_capped_frac"] = (
+                    (uncapped_ratio > self.ratio_cap).float() * loss_mask
+                ).sum() / loss_denominator
 
         return loss, metrics

@@ -128,6 +128,10 @@ def _tmax_recipe_loss(loss):
                 os.environ.get("SWE_DPPO_DIVERGENCE_THRESHOLD", "0.1")
             ),
             divergence_type="tv",
+            # Truncated-IS ratio cap (0 = disabled/recipe-faithful). SWE_DPPO_RATIO_CAP=2
+            # clamps the surrogate ratio so a residual GDN gen/train logprob-mismatch
+            # tail cannot spike the gradient (our logdiff max ~2 vs open-instruct ~0.5).
+            ratio_cap=float(os.environ.get("SWE_DPPO_RATIO_CAP", "0")),
         ),
     )
 
