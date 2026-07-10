@@ -182,6 +182,14 @@ class AsyncLoopConfig(Configurable.Config):
     fly); it is a ceiling, not a KV reservation, so vLLM pages KV on demand and admits
     fewer / preempts when tight rather than OOM-ing."""
 
+    generator_max_num_seqs: int | None = None
+    """Explicit override for the generator's vLLM max_num_seqs (the scheduler's max
+    concurrent decode batch per engine). None derives it from the rollout pool:
+    ceil(resolved_max_active_rollout_groups * group_size / num_generator_shards),
+    capped at 512. Set (e.g. 512) to remove the per-engine batch cap so vLLM batches
+    as many concurrent rollouts as KV allows; harmless as a ceiling (vLLM admits
+    fewer / preempts when KV is tight) but grows cudagraph capture sizes."""
+
     group_buffer: RolloutGroupWorkBuffer.Config = field(
         default_factory=RolloutGroupWorkBuffer.Config
     )
@@ -536,8 +544,9 @@ class Controller(Configurable):
 
         # Ceiling (not target) for the generator's max_num_seqs: the per-generator
         # upper bound on concurrently scheduled sequences. vLLM may admit fewer if KV
-        # is tight; this also sets CUDA-graph capture sizes.
-        max_num_seqs = min(
+        # is tight; this also sets CUDA-graph capture sizes. An explicit override
+        # (generator_max_num_seqs) removes the derived per-engine cap.
+        max_num_seqs = async_loop.generator_max_num_seqs or min(
             math.ceil(rollout_concurrency / num_generator_dp_shards), 512
         )
 

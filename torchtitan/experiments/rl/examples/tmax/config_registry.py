@@ -204,6 +204,14 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
             if os.environ.get("SWE_MAX_ACTIVE_GROUPS")
             else None
         ),
+        # Override the generator's vLLM max_num_seqs (decode batch cap per engine).
+        # Unset = derived from the rollout pool (capped 512). SWE_MAX_NUM_SEQS=512
+        # removes the cap so vLLM batches as many concurrent rollouts as KV allows.
+        generator_max_num_seqs=(
+            int(os.environ["SWE_MAX_NUM_SEQS"])
+            if os.environ.get("SWE_MAX_NUM_SEQS")
+            else None
+        ),
         # Batcher take order. Default take-any (throughput); SWE_STRICT_FIFO=1 uses
         # strict FIFO to remove take-any's bias toward short/fast (=easy) rollouts in
         # the trained batch (diagnostic for the flat-reward hypothesis; costs the
