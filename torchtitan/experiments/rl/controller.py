@@ -178,8 +178,9 @@ class AsyncLoopConfig(Configurable.Config):
     rollouts generate concurrently (higher generator utilization, less trainer
     starvation) WITHOUT loosening max_offpolicy_steps: groups still stale-drop at the
     batcher once they age past it. This is msl/rl's mean_age (queue size) vs max_age
-    (drop) decoupling. Generator max_num_seqs is sized from the staleness window, NOT
-    this, so a larger buffer does not grow generator KV cache."""
+    (drop) decoupling. Generator max_num_seqs scales with this (the max rollouts on the
+    fly); it is a ceiling, not a KV reservation, so vLLM pages KV on demand and admits
+    fewer / preempts when tight rather than OOM-ing."""
 
     group_buffer: RolloutGroupWorkBuffer.Config = field(
         default_factory=RolloutGroupWorkBuffer.Config
@@ -505,16 +506,14 @@ class Controller(Configurable):
             trainer_mesh: ProcMesh the trainer actor is spawned on.
             generator_meshes: ProcMesh objects the generator actors are spawned on.
         """
-        # Peak concurrent rollout sequences (groups * group_size, or the validation pass); sizes max_num_seqs below.
-        # Sized from the STALENESS window (off-policy + 1), NOT the (possibly larger)
-        # buffer: enlarging max_active_rollout_groups for run-ahead must not grow the
-        # generator KV cache. See AsyncLoopConfig.max_active_rollout_groups.
+        # Peak concurrent rollout sequences (buffer groups * group_size, or the
+        # validation pass); sizes max_num_seqs below. Uses the resolved buffer size
+        # (the max rollouts on the fly): max_num_seqs is a CEILING, not a KV
+        # reservation -- vLLM pages KV on demand and admits fewer / preempts when KV
+        # is tight, so a larger ceiling matches the run-ahead pool without OOM.
         async_loop = self.config.async_loop
-        staleness_window_groups = (
-            async_loop.max_offpolicy_steps + 1
-        ) * async_loop.num_groups_per_train_step
         rollout_concurrency = max(
-            staleness_window_groups * async_loop.group_size,
+            async_loop.resolved_max_active_rollout_groups() * async_loop.group_size,
             async_loop.validation.num_samples,
         )
         # Renderer thread pool: render work is CPU-bound, so size to CPU count (decoupled from rollout concurrency).
