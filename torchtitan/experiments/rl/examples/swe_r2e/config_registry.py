@@ -465,8 +465,11 @@ def rl_grpo_qwen3_5_9b_swe_r2e() -> Controller.Config:
         backend="vllm_native",
         vllm_additional_config={"gdn_prefill_backend": "triton"},
         cudagraph=VLLMCudagraphConfig(
-            enable=True, mode="FULL_DECODE_ONLY"
-        ),  # 3x decode (smoke-validated GDN)
+            enable=(os.environ.get("SWE_GEN_CUDAGRAPH", "1") == "1"),
+            mode="FULL_DECODE_ONLY",
+        ),  # 3x decode (smoke-validated GDN). SWE_GEN_CUDAGRAPH=0 -> eager decode:
+        # halves the gen/train logprob mismatch (cudagraph decode diverges from the
+        # eager trainer forward) at the cost of decode throughput.
         # Force prefix caching on: GDN's default is OFF (is_prefix_caching_supported
         # is False), so multi-turn rollouts re-prefill the full growing prompt every
         # turn (0% hit). vLLM runs GDN in experimental 'align' mode; a local smoke
