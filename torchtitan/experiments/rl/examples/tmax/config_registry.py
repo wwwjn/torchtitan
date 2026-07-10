@@ -195,6 +195,15 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
         # straggler tail under-fills the pool; DEVIATES from the recipe + raises
         # off-policy staleness, so use only for speed experiments.
         max_offpolicy_steps=int(os.environ.get("SWE_OFFPOLICY_STEPS", "4")),
+        # Buffer size (run-ahead groups), DECOUPLED from the staleness cap above.
+        # Unset = coupled ((off+1)*num_groups). SWE_MAX_ACTIVE_GROUPS enlarges the
+        # buffer (more concurrent rollouts -> less trainer starvation) while keeping
+        # SWE_OFFPOLICY_STEPS as the stale-drop cap (msl/rl mean_age vs max_age).
+        max_active_rollout_groups=(
+            int(os.environ["SWE_MAX_ACTIVE_GROUPS"])
+            if os.environ.get("SWE_MAX_ACTIVE_GROUPS")
+            else None
+        ),
         # Batcher take order. Default take-any (throughput); SWE_STRICT_FIFO=1 uses
         # strict FIFO to remove take-any's bias toward short/fast (=easy) rollouts in
         # the trained batch (diagnostic for the flat-reward hypothesis; costs the

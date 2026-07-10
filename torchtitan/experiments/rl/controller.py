@@ -167,8 +167,19 @@ class AsyncLoopConfig(Configurable.Config):
     """Sibling rollouts sampled per prompt (the GRPO group)."""
 
     max_offpolicy_steps: int = 3
-    """Max train-steps a rollout may lag the trainer. Sets the rollout buffer size and its
-    stalling behavior. 0 = fully on-policy (sync): generator and trainer alternate in lockstep."""
+    """Max train-steps a rollout may lag the trainer (the STALENESS cap). A group that
+    ages past this at the batcher is stale-dropped, and the trainer never trains on
+    older data. 0 = fully on-policy (sync): generator and trainer alternate in lockstep."""
+
+    max_active_rollout_groups: int | None = None
+    """Rollout buffer size: peak concurrent active rollout groups (the run-ahead
+    depth). None couples it to the staleness cap: (max_offpolicy_steps + 1) *
+    num_groups_per_train_step. Set LARGER to DECOUPLE run-ahead from staleness -- more
+    rollouts generate concurrently (higher generator utilization, less trainer
+    starvation) WITHOUT loosening max_offpolicy_steps: groups still stale-drop at the
+    batcher once they age past it. This is msl/rl's mean_age (queue size) vs max_age
+    (drop) decoupling. Generator max_num_seqs is sized from the staleness window, NOT
+    this, so a larger buffer does not grow generator KV cache."""
 
     group_buffer: RolloutGroupWorkBuffer.Config = field(
         default_factory=RolloutGroupWorkBuffer.Config
@@ -178,6 +189,13 @@ class AsyncLoopConfig(Configurable.Config):
     )
     batcher: Batcher.Config = field(default_factory=Batcher.Config)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
+
+    def resolved_max_active_rollout_groups(self) -> int:
+        """Rollout buffer size in groups: the explicit override if set, else the
+        staleness-coupled default ``(max_offpolicy_steps + 1) * num_groups_per_train_step``."""
+        if self.max_active_rollout_groups is not None:
+            return self.max_active_rollout_groups
+        return (self.max_offpolicy_steps + 1) * self.num_groups_per_train_step
 
 
 class Controller(Configurable):
@@ -488,12 +506,15 @@ class Controller(Configurable):
             generator_meshes: ProcMesh objects the generator actors are spawned on.
         """
         # Peak concurrent rollout sequences (groups * group_size, or the validation pass); sizes max_num_seqs below.
+        # Sized from the STALENESS window (off-policy + 1), NOT the (possibly larger)
+        # buffer: enlarging max_active_rollout_groups for run-ahead must not grow the
+        # generator KV cache. See AsyncLoopConfig.max_active_rollout_groups.
         async_loop = self.config.async_loop
-        max_active_rollout_groups = (
+        staleness_window_groups = (
             async_loop.max_offpolicy_steps + 1
         ) * async_loop.num_groups_per_train_step
         rollout_concurrency = max(
-            max_active_rollout_groups * async_loop.group_size,
+            staleness_window_groups * async_loop.group_size,
             async_loop.validation.num_samples,
         )
         # Renderer thread pool: render work is CPU-bound, so size to CPU count (decoupled from rollout concurrency).
@@ -740,10 +761,10 @@ class Controller(Configurable):
         self._trainer_policy_version = self.start_step
         self._generator_policy_version = self.start_step
 
-        # Buffer capacity caps how far generation runs ahead of the trainer (bounds off-policy staleness).
-        max_active_rollout_groups = (
-            async_loop.max_offpolicy_steps + 1
-        ) * async_loop.num_groups_per_train_step
+        # Buffer capacity = run-ahead depth (may exceed the staleness window when
+        # max_active_rollout_groups is set; staleness is still bounded by the batcher's
+        # stale-drop at max_offpolicy_steps).
+        max_active_rollout_groups = async_loop.resolved_max_active_rollout_groups()
 
         self._group_buffer = async_loop.group_buffer.build(
             max_active_rollout_groups=max_active_rollout_groups,
