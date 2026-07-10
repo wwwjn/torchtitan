@@ -199,7 +199,11 @@ class RMSNormGated(Module):
         x = x.float()
         variance = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.eps)
-        x = (self.weight.float() * x).to(input_dtype)
+        # Keep the whole norm*weight*silu(gate) product in fp32 and cast only at the
+        # end -- matches vLLM's native RMSNormGated. Downcasting weight*norm(x) to bf16
+        # BEFORE the gate multiply loses precision on the gate path (a top source of
+        # the trainer-vs-vLLM GDN logprob tail mismatch).
+        x = self.weight.float() * x
         x = x * F.silu(gate.float())
         return x.to(input_dtype)
 
@@ -445,8 +449,12 @@ class GatedDeltaNet(Module):
         # Gating signals, shape (bs, seqlen, n_value_heads):
         #   g:    decay rate per head, always negative
         #   beta: update gate ∈ (0, 1)
-        g = -torch.exp(self.A_log.float()) * F.softplus(xa.float() + self.dt_bias)
-        beta = torch.sigmoid(xb)
+        # fp32 gating to match vLLM's native GDN (a/b/A_log/dt_bias and g/beta all fp32).
+        # bf16 sigmoid on beta has up to ~100% rel error on (1-beta) at saturation.
+        g = -torch.exp(self.A_log.float()) * F.softplus(
+            xa.float() + self.dt_bias.float()
+        )
+        beta = torch.sigmoid(xb.float())
 
         output = self.kernel(xq, xk, xv, g, beta, cu_seqlens)
 
