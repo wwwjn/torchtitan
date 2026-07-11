@@ -223,6 +223,9 @@ async def run_vanillux_loop(
     turns = 0
     submitted = False
     consecutive_format_errors = 0
+    # Total format errors across the rollout (does NOT reset on a good turn, unlike
+    # consecutive_format_errors) -- surfaced as a wandb metric by the rollouter.
+    total_format_errors = 0
 
     while turns < max_turns and time.time() < deadline:
         payload = {
@@ -259,6 +262,7 @@ async def run_vanillux_loop(
                 if isinstance(b, dict) and b.get("type") == "text"
             ).strip()
             consecutive_format_errors += 1
+            total_format_errors += 1
             if (
                 stop_reason == "max_tokens" and not text
             ) or consecutive_format_errors > _MAX_FORMAT_ERRORS:
@@ -332,4 +336,4 @@ async def run_vanillux_loop(
         turns,
         submitted,
     )
-    return turns, submitted
+    return turns, submitted, total_format_errors

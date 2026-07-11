@@ -210,8 +210,9 @@ class TMaxRollouter(Rollouter):
                 for i in range(group_size)
             )
         )
-        rollouts = [rollout for rollout, _ in results]
-        submitted_flags = [submitted for _, submitted in results]
+        rollouts = [rollout for rollout, _, _ in results]
+        submitted_flags = [submitted for _, submitted, _ in results]
+        fmt_errors_list = [fmt for _, _, fmt in results]
 
         # Standard scoring + advantage path (mirrors Rollouter.run_group_rollouts).
         outputs = await self.score_group(rollouts, sample)
@@ -224,10 +225,18 @@ class TMaxRollouter(Rollouter):
         # Mirrors open-instruct's val/non_submitting_completion_fraction; a high value
         # means the scaffold (not the task difficulty) is capping reward.
         nonsubmit_frac = 1.0 - sum(submitted_flags) / len(submitted_flags)
+        # Format errors (malformed tool-calls) per rollout + fraction of rollouts that
+        # hit any -- surfaces the vanillux tool-call parse-failure rate on wandb.
+        fmt_errors_mean = sum(fmt_errors_list) / len(fmt_errors_list)
+        fmt_error_frac = sum(1.0 for f in fmt_errors_list if f > 0) / len(fmt_errors_list)
         group = RolloutGroup(
             group_id=group_id,
             rollouts=rollouts,
-            metrics=[m.Metric("rollout/nonsubmit_frac", m.Mean(nonsubmit_frac))],
+            metrics=[
+                m.Metric("rollout/nonsubmit_frac", m.Mean(nonsubmit_frac)),
+                m.Metric("rollout/format_errors_mean", m.Mean(fmt_errors_mean)),
+                m.Metric("rollout/format_error_frac", m.Mean(fmt_error_frac)),
+            ],
         )
         advantages = self.advantage_estimator(group)
         for rollout, advantage in zip(group.rollouts, advantages, strict=True):
@@ -298,6 +307,7 @@ class TMaxRollouter(Rollouter):
         reward = 0.0
         error_msg = ""
         submitted = False
+        fmt_errors = 0  # total format errors this rollout (from run_vanillux_loop)
         sem = self._rollout_sem
         await sem.acquire()
         try:
@@ -314,7 +324,7 @@ class TMaxRollouter(Rollouter):
                     # seed-bearing tasks are unsolvable (inputs absent during rollout).
                     # Grading fixtures (tests/*) are uploaded later by grade_tmax.
                     await seed_workspace(root_sb, sample.tmax)
-                    _turns, submitted = await run_vanillux_loop(
+                    _turns, submitted, fmt_errors = await run_vanillux_loop(
                         root_sb,
                         task=sample.problem_statement,
                         session_id=rollout_id,
@@ -399,6 +409,7 @@ class TMaxRollouter(Rollouter):
                 turns=turns,
             ),
             submitted,
+            fmt_errors,
         )
 
     def _maybe_dump_trace(
