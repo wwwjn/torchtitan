@@ -62,6 +62,7 @@ from torchtitan.experiments.rl.harness import (
     boot_agent_sandbox,
     Sandbox,
 )
+from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.experiments.rl.rollout.rollouter import Rollouter
 from torchtitan.experiments.rl.rollout.types import (
@@ -195,7 +196,7 @@ class TMaxRollouter(Rollouter):
         """Run + grade one prompt group of terminal-agent rollouts."""
         adapter = await self._ensure_adapter(renderer)
 
-        rollouts = await asyncio.gather(
+        results = await asyncio.gather(
             *(
                 self._run_agent_rollout(
                     adapter=adapter,
@@ -209,6 +210,8 @@ class TMaxRollouter(Rollouter):
                 for i in range(group_size)
             )
         )
+        rollouts = [rollout for rollout, _ in results]
+        submitted_flags = [submitted for _, submitted in results]
 
         # Standard scoring + advantage path (mirrors Rollouter.run_group_rollouts).
         outputs = await self.score_group(rollouts, sample)
@@ -216,7 +219,16 @@ class TMaxRollouter(Rollouter):
             rollout.reward = output.reward
             rollout.reward_breakdown = output.reward_breakdown
 
-        group = RolloutGroup(group_id=group_id, rollouts=rollouts)
+        # Fraction of siblings that never emitted the submit marker (errored or ran to
+        # the budget without submitting) -> the verifier never runs -> auto reward 0.
+        # Mirrors open-instruct's val/non_submitting_completion_fraction; a high value
+        # means the scaffold (not the task difficulty) is capping reward.
+        nonsubmit_frac = 1.0 - sum(submitted_flags) / len(submitted_flags)
+        group = RolloutGroup(
+            group_id=group_id,
+            rollouts=rollouts,
+            metrics=[m.Metric("rollout/nonsubmit_frac", m.Mean(nonsubmit_frac))],
+        )
         advantages = self.advantage_estimator(group)
         for rollout, advantage in zip(group.rollouts, advantages, strict=True):
             rollout.advantage = advantage
@@ -263,11 +275,13 @@ class TMaxRollouter(Rollouter):
         rollout_idx: int,
         sampling: "SamplingConfig",
         renderer: Renderer,
-    ) -> Rollout:
+    ) -> tuple[Rollout, bool]:
         """Boot a sandbox, run the agent as root, grade the task in place.
 
-        Always returns a ``Rollout`` (errors caught + marked terminal) so one bad
-        sibling never fails the whole group.
+        Always returns ``(Rollout, submitted)`` (errors caught + marked terminal) so
+        one bad sibling never fails the whole group. ``submitted`` is whether the agent
+        emitted the submit marker (False on any error / no-submit) -- the caller
+        aggregates it into the group's ``rollout/nonsubmit_frac`` metric.
         """
         rollout_id = RolloutTurnID(
             group_id=group_id, rollout_id=rollout_idx, turn_id=0
@@ -283,6 +297,7 @@ class TMaxRollouter(Rollouter):
         status = RolloutStatus.ERROR
         reward = 0.0
         error_msg = ""
+        submitted = False
         sem = self._rollout_sem
         await sem.acquire()
         try:
@@ -376,11 +391,14 @@ class TMaxRollouter(Rollouter):
             reward=reward,
             error_msg=error_msg,
         )
-        return Rollout(
-            group_id=group_id,
-            rollout_id=rollout_idx,
-            status=status,
-            turns=turns,
+        return (
+            Rollout(
+                group_id=group_id,
+                rollout_id=rollout_idx,
+                status=status,
+                turns=turns,
+            ),
+            submitted,
         )
 
     def _maybe_dump_trace(

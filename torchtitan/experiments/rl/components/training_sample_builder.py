@@ -85,6 +85,26 @@ class TrainingSampleBuilder(Configurable):
                 m.Mean(1.0 if is_zero_std else 0.0),
             )
         )
+        # Split the dropped (zero-std) groups by cause -- all-solved (too easy) vs
+        # all-failed (too hard), the analog of open-instruct's filtered_prompts_solved
+        # / filtered_prompts_zero. Both are dropped by drop_zero_std, so this shows
+        # WHY the trainable batch shrinks: over training all-failed should fall (the
+        # policy learns) while all-solved may rise. The complement of their sum (among
+        # zero-std groups) is the trainable mixed band; together they are the scalar
+        # summary of the per-group solve-rate ("solve_rate_hist") distribution.
+        group_mean_reward = statistics.mean(rewards)
+        metrics.append(
+            m.Metric(
+                "rollout_reward/group_all_solved_frac",
+                m.Mean(1.0 if is_zero_std and group_mean_reward > 0.0 else 0.0),
+            )
+        )
+        metrics.append(
+            m.Metric(
+                "rollout_reward/group_all_failed_frac",
+                m.Mean(1.0 if is_zero_std and group_mean_reward == 0.0 else 0.0),
+            )
+        )
         # Avg train reward = the paper's Figure-7 curve (open-instruct's
         # val/avg_group_performance_post_filter, computed on the TRAINING batch --
         # NOT held-out). It is the mean reward over ALL sampled groups INCLUDING the
