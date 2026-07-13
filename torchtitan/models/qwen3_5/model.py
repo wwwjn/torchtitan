@@ -322,6 +322,13 @@ class GatedDeltaNet(Module):
         norm: RMSNormGated.Config
         out_proj: Linear.Config
 
+        # vLLM-generation only: an injectable conv + recurrence core that runs
+        # against vLLM's paged conv/ssm cache (built in experiments/rl for the
+        # unified torchtitan_wrapper path). None (default) keeps the stateless
+        # training/eval path below byte-for-byte unchanged. Mirrors the
+        # config-injected ``inner_attention`` pattern -- no vLLM import in core.
+        inference_core: Module.Config | None = None
+
     def __init__(self, config: Config):
         super().__init__()
         self.key_head_dim = config.key_head_dim
@@ -348,6 +355,11 @@ class GatedDeltaNet(Module):
         self.kernel = config.kernel.build()
         self.norm = config.norm.build()
         self.out_proj = config.out_proj.build()
+
+        # Built only on the vLLM unified-generation path (see Config).
+        self.inference_core = (
+            config.inference_core.build() if config.inference_core is not None else None
+        )
 
     def _causal_conv(
         self, x: torch.Tensor, conv: nn.Module, cu_seqlens: torch.Tensor | None = None
@@ -419,9 +431,57 @@ class GatedDeltaNet(Module):
             x = conv(x)
         return F.silu(x).transpose(1, 2)
 
+    def _fused_conv_weight_bias(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # The 3 depthwise convs (conv_q/k/v) fuse channel-wise into the single
+        # fused conv vLLM's causal_conv1d kernels expect. Depthwise (per-channel
+        # independent) -> concatenation is numerically identical to 3 convs.
+        # Order [q | k | v] matches the mixed_qkv concat and vLLM's conv layout.
+        w = torch.cat(
+            [self.conv_q.weight, self.conv_k.weight, self.conv_v.weight], dim=0
+        )
+        w = w.view(w.size(0), w.size(-1))  # [C,1,k] -> [C,k]
+        biases = [self.conv_q.bias, self.conv_k.bias, self.conv_v.bias]
+        bias = torch.cat(biases, dim=0) if biases[0] is not None else None
+        return w, bias
+
+    def _forward_generation(self, x: torch.Tensor) -> torch.Tensor:
+        # vLLM unified path: projections + gates here (TorchTitan params/math),
+        # conv + recurrence delegated to the paged-cache core. Conv is done in
+        # the core (against conv_state), so project WITHOUT the local conv.
+        bs, seqlen, _ = x.shape
+        xq = self.in_proj_q(x)
+        xk = self.in_proj_k(x)
+        xv = self.in_proj_v(x)
+        xz = self.in_proj_z(x)
+        xa = self.in_proj_a(x)
+        xb = self.in_proj_b(x)
+
+        mixed_qkv = torch.cat([xq, xk, xv], dim=-1)
+        conv_weight, conv_bias = self._fused_conv_weight_bias()
+        # Reached only when inference_core is set (guarded in forward).
+        output = self.inference_core(  # pyrefly: ignore [not-callable]
+            mixed_qkv,
+            xa,
+            xb,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            conv_weight=conv_weight,
+            conv_bias=conv_bias,
+        )  # [bs, seqlen, n_value_heads, value_head_dim]
+
+        xz = xz.view(bs, seqlen, -1, self.value_head_dim)
+        output = self.norm(output, xz)
+        output = output.reshape(bs, seqlen, -1)
+        return self.out_proj(output)
+
     def forward(
         self, x: torch.Tensor, positions: torch.Tensor | None = None
     ) -> torch.Tensor:
+        if self.inference_core is not None:
+            return self._forward_generation(x)
+
         bs, seqlen, _ = x.shape
 
         # When several samples are packed into a row, `positions` restarts at 0 per

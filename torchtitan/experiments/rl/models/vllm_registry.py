@@ -28,6 +28,8 @@ Usage:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import os
 from typing import Any, Literal
 
 from torchtitan.components.checkpoint import CheckpointManager
@@ -96,7 +98,28 @@ class InferenceParallelismConfig:
         )
 
 
-def model_spec_to_hf_config_dict(spec: ModelSpec) -> dict[str, Any]:
+def _token_ids_from_hf_assets(hf_assets_path: str | None) -> dict[str, Any]:
+    """Read tokenizer special-token ids from HF assets if they are available."""
+    if not hf_assets_path or not os.path.isdir(hf_assets_path):
+        return {}
+
+    token_ids: dict[str, Any] = {}
+    for filename in ("generation_config.json", "config.json", "tokenizer_config.json"):
+        path = os.path.join(hf_assets_path, filename)
+        if not os.path.isfile(path):
+            continue
+        with open(path) as f:
+            data = json.load(f)
+        for key in ("bos_token_id", "eos_token_id", "pad_token_id"):
+            value = data.get(key)
+            if value is not None and key not in token_ids:
+                token_ids[key] = value
+    return token_ids
+
+
+def model_spec_to_hf_config_dict(
+    spec: ModelSpec, *, hf_assets_path: str | None = None
+) -> dict[str, Any]:
     """Build the HF-shaped config dict that vLLM's engine init reads.
 
     Field names match HF conventions because vLLM's engine reads them by
@@ -135,6 +158,14 @@ def model_spec_to_hf_config_dict(spec: ModelSpec) -> dict[str, Any]:
         (m for layer in cfg.layers if (m := getattr(layer, "moe", None)) is not None),
         None,
     )
+    delta_net = next(
+        (
+            dn
+            for layer in cfg.layers
+            if (dn := getattr(layer, "delta_net", None)) is not None
+        ),
+        None,
+    )
 
     n_heads = attn.n_heads
     n_kv_heads = attn.n_kv_heads or n_heads
@@ -160,13 +191,26 @@ def model_spec_to_hf_config_dict(spec: ModelSpec) -> dict[str, Any]:
         "tie_word_embeddings": getattr(
             cfg, "enable_weight_tying", False
         ),  # multimodal/GGUF only; wrapper ties weights
-        "bos_token_id": 0,  # Fuyu-only; engine reads tokenizer/sampling tokens
-        "eos_token_id": 1,  # per-model files only; engine reads tokenizer/sampling tokens
     }
+    hf.update(_token_ids_from_hf_assets(hf_assets_path))
 
     if ffn is not None:
         # Unused: only v1/metrics/perf.py reads it (off by default). SwiGLU hidden == w1.out_features.
         hf["intermediate_size"] = ffn.w1.out_features
+
+    if delta_net is not None:
+        # Native Qwen3.5 HF configs expose these hybrid/GDN fields. The wrapper
+        # computes cache shape from ModelSpec below, but keeping the HF-shaped
+        # config complete avoids other vLLM hybrid helpers seeing missing metadata.
+        hf["linear_conv_kernel_dim"] = delta_net.conv_kernel_size
+        hf["linear_key_head_dim"] = delta_net.key_head_dim
+        hf["linear_value_head_dim"] = delta_net.value_head_dim
+        hf["linear_num_key_heads"] = (
+            delta_net.in_proj_q.out_features // delta_net.key_head_dim
+        )
+        hf["linear_num_value_heads"] = (
+            delta_net.in_proj_v.out_features // delta_net.value_head_dim
+        )
 
     if moe is not None:
         # Presence required: >0 toggles MoE/EP branches.
@@ -255,6 +299,83 @@ def register_to_vllm(
 
     VLLMModelFromSpec.__name__ = VLLM_MODEL_NAME
     VLLMModelFromSpec.__qualname__ = VLLM_MODEL_NAME
+
+    # Linear-attention (GDN) models must report themselves hybrid so vLLM runs
+    # its mamba cache setup (HybridAttentionMambaModelConfig -> mamba_block_size,
+    # page-size padding) and allocates paged conv/ssm state for the GDN layers
+    # (which become MambaBase via VLLMGatedDeltaNetCore in vllm_wrapper). Set the
+    # flags per-spec so dense models stay non-hybrid.
+    _gdn_layers = [
+        layer_cfg.delta_net
+        for layer_cfg in getattr(model_spec.model, "layers", [])
+        if getattr(layer_cfg, "delta_net", None) is not None
+    ]
+    if _gdn_layers:
+        VLLMModelFromSpec.is_hybrid = True
+        VLLMModelFromSpec.has_inner_state = True
+
+        # vLLM's mamba page-size computation (platforms/interface.py) queries the
+        # model CLASS for GDN state shape + dtype. Compute from ModelSpec here so
+        # the class-level cache contract stays tied to the TorchTitan model build.
+        _dn = _gdn_layers[0]
+        _gdn_num_k = _dn.in_proj_q.out_features // _dn.key_head_dim
+        _gdn_num_v = _dn.in_proj_v.out_features // _dn.value_head_dim
+        _gdn_hk = _dn.key_head_dim
+        _gdn_hv = _dn.value_head_dim
+        _gdn_ck = _dn.conv_kernel_size
+
+        @classmethod
+        def get_mamba_state_shape_from_config(cls, vllm_config):
+            from vllm.model_executor.layers.mamba.mamba_utils import (
+                MambaStateShapeCalculator,
+            )
+
+            num_spec = (
+                vllm_config.speculative_config.num_speculative_tokens
+                if vllm_config.speculative_config
+                else 0
+            )
+            return MambaStateShapeCalculator.gated_delta_net_state_shape(
+                vllm_config.parallel_config.tensor_parallel_size,
+                _gdn_num_k,
+                _gdn_num_v,
+                _gdn_hk,
+                _gdn_hv,
+                _gdn_ck,
+                num_spec,
+            )
+
+        @classmethod
+        def get_mamba_state_dtype_from_config(cls, vllm_config):
+            from vllm.model_executor.layers.mamba.mamba_utils import (
+                MambaStateDtypeCalculator,
+            )
+
+            return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+                vllm_config.model_config.dtype,
+                vllm_config.cache_config.mamba_cache_dtype,
+                vllm_config.cache_config.mamba_ssm_cache_dtype,
+            )
+
+        @classmethod
+        def get_mamba_state_copy_func(cls):
+            # Enables "align"-mode mamba prefix caching (block-boundary state
+            # copy) so multi-turn rollouts reuse the GDN conv/ssm state across
+            # the shared prefix. Generic (not model-specific), same as native GDN.
+            from vllm.model_executor.layers.mamba.mamba_utils import (
+                MambaStateCopyFuncCalculator,
+            )
+
+            return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
+
+        VLLMModelFromSpec.get_mamba_state_shape_from_config = (
+            get_mamba_state_shape_from_config
+        )
+        VLLMModelFromSpec.get_mamba_state_dtype_from_config = (
+            get_mamba_state_dtype_from_config
+        )
+        VLLMModelFromSpec.get_mamba_state_copy_func = get_mamba_state_copy_func
+
     ModelRegistry.register_model(VLLM_MODEL_NAME, VLLMModelFromSpec)
 
     # Dynamic config parser class capturing ModelSpec in the closure. This
@@ -270,7 +391,20 @@ def register_to_vllm(
             code_revision=None,
             **kwargs,
         ):
-            config_dict = model_spec_to_hf_config_dict(model_spec)
+            hf_assets_path = (
+                model if isinstance(model, str) else checkpoint_config.initial_load_path
+            )
+            config_dict = model_spec_to_hf_config_dict(
+                model_spec, hf_assets_path=hf_assets_path
+            )
+            logger.info(
+                "TorchTitan vLLM config token ids: bos=%s eos=%s pad=%s "
+                "(hf_assets_path=%s)",
+                config_dict.get("bos_token_id"),
+                config_dict.get("eos_token_id"),
+                config_dict.get("pad_token_id"),
+                hf_assets_path,
+            )
             return config_dict, PretrainedConfig.from_dict(config_dict)
 
     logger.info(

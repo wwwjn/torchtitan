@@ -30,6 +30,7 @@ from torchtitan.config import (
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
 from torchtitan.experiments.rl.models.attention import VLLMAttentionWrapper
+from torchtitan.experiments.rl.models.gdn_vllm_unified import VLLMGatedDeltaNetCore
 from torchtitan.experiments.rl.models.vllm_registry import InferenceParallelismConfig
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.protocols.module import Module
@@ -191,11 +192,41 @@ class VLLMModelWrapper(Module):
             else model_config.dim // n_heads
         )
         new_layers = []
-        for layer_cfg in model_config.layers:
-            # Linear-attention layers (Qwen3.5 GDN) have no inner_attention to
-            # swap; vLLM runs its own GDN kernel for them. Keep them as-is.
+        for layer_idx, layer_cfg in enumerate(model_config.layers):
+            # Linear-attention (Qwen3.5 GDN) layers: make them unified vLLM-cache
+            # aware by injecting a paged-cache conv+recurrence core. Params + fla
+            # math stay TorchTitan's; only the cache management is vLLM's. (Before
+            # this, the wrapper kept GDN as-is, so it ran the stateless training
+            # forward -- wrong for continuous-batch decode; hence vllm_native.)
+            delta_net_cfg = getattr(layer_cfg, "delta_net", None)
             if getattr(layer_cfg, "attention", None) is None:
-                new_layers.append(layer_cfg)
+                if delta_net_cfg is not None:
+                    num_k_heads = (
+                        delta_net_cfg.in_proj_q.out_features
+                        // delta_net_cfg.key_head_dim
+                    )
+                    num_v_heads = (
+                        delta_net_cfg.in_proj_v.out_features
+                        // delta_net_cfg.value_head_dim
+                    )
+                    core_cfg = VLLMGatedDeltaNetCore.Config(
+                        layer_idx=layer_idx,
+                        num_k_heads=num_k_heads,
+                        num_v_heads=num_v_heads,
+                        head_k_dim=delta_net_cfg.key_head_dim,
+                        head_v_dim=delta_net_cfg.value_head_dim,
+                        conv_kernel_size=delta_net_cfg.conv_kernel_size,
+                    )
+                    new_layers.append(
+                        dataclasses.replace(
+                            layer_cfg,
+                            delta_net=dataclasses.replace(
+                                delta_net_cfg, inference_core=core_cfg
+                            ),
+                        )
+                    )
+                else:
+                    new_layers.append(layer_cfg)
                 continue
             inner = layer_cfg.attention.inner_attention
             vllm_backend = VLLMAttentionWrapper.Config(
@@ -349,6 +380,8 @@ class VLLMModelWrapper(Module):
 
         if input_ids is None:
             raise ValueError("Either input_ids or inputs_embeds must be provided")
+        if positions is None:
+            raise ValueError("positions must be provided by vLLM for generation")
 
         # Convert vLLM interface to TorchTitan interface
         # vLLM: [total_tokens] → TorchTitan: [batch_size, seq_len]
