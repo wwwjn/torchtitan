@@ -86,6 +86,9 @@ def _tmax_rollouter() -> TMaxRollouter.Config:
         train_dataset=TMaxDataset.Config(
             data_path=_DEFAULT_DATA,
             seed=42,
+            # SWE_DISABLE_SHUFFLE=1 -> take training rows in file order (0,1,2,...)
+            # for deterministic per-rollout inspection / open-instruct cross-check.
+            shuffle=(os.environ.get("SWE_DISABLE_SHUFFLE", "0") != "1"),
             holdout_n=_TMAX_9B_HOLDOUT_N,
             split="train",
             skip_ids_path=_SKIP_IDS,

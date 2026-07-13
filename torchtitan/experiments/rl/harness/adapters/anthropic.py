@@ -57,6 +57,7 @@ class CapturedTurn:
     # Whether this turn's prompt continues the previous turn's prompt+completion
     # (TITO-bridged). False marks a history rewrite (compaction) -> episode branch.
     extends_previous: bool
+    stop_reason: int | str | None = None
 
 
 @dataclass
@@ -501,6 +502,7 @@ class AnthropicAdapter:
                     max_policy_version=completion.max_policy_version,
                     finish_reason=completion.finish_reason,
                     extends_previous=extends_previous,
+                    stop_reason=completion.stop_reason,
                 )
             )
             session.last_prompt_ids = list(prompt_ids)

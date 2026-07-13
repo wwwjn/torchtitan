@@ -446,6 +446,7 @@ class TMaxRollouter(Rollouter):
                 "status": status,
                 "error": error_msg,
                 "reward": reward,
+                "stop_token_ids": list(renderer.get_stop_token_ids()),
                 "num_turns": len(captured),
                 "turns": [
                     {
@@ -453,7 +454,11 @@ class TMaxRollouter(Rollouter):
                         "prompt_tokens": len(ct.prompt_token_ids),
                         "completion_tokens": len(ct.completion_token_ids),
                         "finish_reason": ct.finish_reason,
+                        "stop_reason": getattr(ct, "stop_reason", None),
                         "extends_previous": ct.extends_previous,
+                        "completion_token_ids_tail": list(
+                            ct.completion_token_ids[-16:]
+                        ),
                         "completion_text": _decode(ct.completion_token_ids),
                     }
                     for i, ct in enumerate(captured)

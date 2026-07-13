@@ -112,7 +112,13 @@ def _swe_rollouter() -> SWER2ERollouter.Config:
     """Train/validation datasets for the coding-agent rollouter (rubric + env
     defaults live on the rollouter Config)."""
     return SWER2ERollouter.Config(
-        train_dataset=SWER2EDataset.Config(data_path=_DEFAULT_DATA, seed=42),
+        train_dataset=SWER2EDataset.Config(
+            data_path=_DEFAULT_DATA,
+            seed=42,
+            # SWE_DISABLE_SHUFFLE=1 -> deterministic prompt order (per-rollout
+            # inspection / reproducible first-step batch); default shuffle on.
+            shuffle=(os.environ.get("SWE_DISABLE_SHUFFLE", "0") != "1"),
+        ),
         validation_dataset=SWER2EDataset.Config(
             data_path=_DEFAULT_DATA, seed=99, shuffle=False
         ),

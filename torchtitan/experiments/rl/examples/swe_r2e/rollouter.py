@@ -381,6 +381,7 @@ class SWER2ERollouter(Rollouter):
                 "reward": reward,
                 "solved": solved,
                 "applied": applied,
+                "stop_token_ids": list(renderer.get_stop_token_ids()),
                 "num_turns": len(captured),
                 "diff": diff_text,
                 "turns": [
@@ -389,7 +390,11 @@ class SWER2ERollouter(Rollouter):
                         "prompt_tokens": len(ct.prompt_token_ids),
                         "completion_tokens": len(ct.completion_token_ids),
                         "finish_reason": ct.finish_reason,
+                        "stop_reason": getattr(ct, "stop_reason", None),
                         "extends_previous": ct.extends_previous,
+                        "completion_token_ids_tail": list(
+                            ct.completion_token_ids[-16:]
+                        ),
                         # The model's generated text this turn (the trained tokens).
                         "completion_text": _decode(ct.completion_token_ids),
                     }

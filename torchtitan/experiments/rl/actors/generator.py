@@ -572,6 +572,7 @@ class RequestDispatcher:
                         token_ids=list(completion_output.token_ids),
                         token_logprobs=token_logprobs,
                         finish_reason=completion_output.finish_reason,
+                        stop_reason=getattr(completion_output, "stop_reason", None),
                     ),
                     _extract_request_metrics_inputs(request_output),
                 )

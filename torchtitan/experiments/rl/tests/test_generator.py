@@ -60,11 +60,12 @@ class _FakeEngine:
         self.add_requests.append((args, kwargs))
 
 
-def _sample(*, token_ids=(10, 11), finish_reason="stop"):
+def _sample(*, token_ids=(10, 11), finish_reason="stop", stop_reason=None):
     return SimpleNamespace(
         token_ids=list(token_ids),
         logprobs=[{tok: SimpleNamespace(logprob=-0.1)} for tok in token_ids],
         finish_reason=finish_reason,
+        stop_reason=stop_reason,
     )
 
 
@@ -139,7 +140,13 @@ def test_process_finished_requests_resolves_future_with_completion():
         dispatcher.process_finished_requests(
             [
                 _request_output(
-                    outputs=[_sample(token_ids=(10, 11), finish_reason="length")]
+                    outputs=[
+                        _sample(
+                            token_ids=(10, 11),
+                            finish_reason="length",
+                            stop_reason=99,
+                        )
+                    ]
                 )
             ],
             policy_version=8,
@@ -150,6 +157,7 @@ def test_process_finished_requests_resolves_future_with_completion():
         assert completion.token_ids == [10, 11]
         assert completion.token_logprobs == [-0.1, -0.1]
         assert completion.finish_reason == "length"
+        assert completion.stop_reason == 99
         assert completion.min_policy_version == 7  # min = version it was admitted under
         assert completion.max_policy_version == 8  # max = live version at finish
         # The request is popped from the in-flight map.

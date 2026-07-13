@@ -61,6 +61,8 @@ class Completion:
     token_logprobs: list[float]
     finish_reason: str | None = None
     """vLLM `CompletionOutput.finish_reason` ("stop" | "length" | "abort")"""
+    stop_reason: int | str | None = None
+    """vLLM stop string or token id that ended generation, if any."""
 
     metrics: list[m.Metric] = field(default_factory=list)
     """Per-generation metrics measured by the generator (latencies); the
