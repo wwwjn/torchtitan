@@ -55,6 +55,65 @@ logger = logging.getLogger(__name__)
 # TODO(async-rl): this file is large. Split a backend-agnostic BaseGenerator.
 
 
+def _install_flashinfer_allreduce_import_stub() -> None:
+    """Avoid importing flashinfer.comm when vLLM's CudaCommunicator is unused.
+
+    vLLM imports ``flashinfer_all_reduce`` unconditionally while constructing a
+    CUDA device communicator, even when FlashInfer all-reduce is disabled. In the
+    MAST conda runtime, importing ``flashinfer.comm`` can resolve cudart to
+    tilelang's stub library, which lacks cudaDeviceReset and aborts engine init.
+    The torchtitan_wrapper path does not use FlashInfer all-reduce, so install a
+    no-op module before ``LLMEngine.from_engine_args`` reaches that import.
+    """
+    import sys
+    import types
+
+    module_name = "vllm.distributed.device_communicators.flashinfer_all_reduce"
+    if module_name in sys.modules:
+        return
+
+    module = types.ModuleType(module_name)
+
+    class FlashInferAllReduce:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise RuntimeError(
+                "FlashInfer all-reduce is disabled in TorchTitan's "
+                "torchtitan_wrapper generator path."
+            )
+
+    module.FlashInferAllReduce = FlashInferAllReduce
+    sys.modules[module_name] = module
+
+
+def _install_fp32_native_lm_head() -> None:
+    """Make vLLM's native lm_head matmul run in fp32 (matches the trainer).
+
+    The torchtitan trainer wraps lm_head in CastLinear (fp32 matmul); the
+    torchtitan_wrapper generator reuses it, so both sides are fp32. The
+    vllm_native generator instead uses vLLM's own ParallelLMHead, whose matmul
+    is bf16 (only the sampler log_softmax upcasts to fp32) -> a per-logit bf16
+    rounding difference vs the trainer. Patch LogitsProcessor._get_logits to
+    upcast hidden_states + lm_head weight to fp32 before the matmul so the
+    native generator's logits match the trainer's fp32 lm_head.
+    """
+    import torch.nn.functional as F
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+
+    if getattr(LogitsProcessor, "_tt_fp32_lm_head", False):
+        return
+
+    def _fp32_get_logits(self, hidden_states, lm_head, embedding_bias):
+        bias = None if embedding_bias is None else embedding_bias.float()
+        logits = F.linear(hidden_states.float(), lm_head.weight.float(), bias)
+        logits = self._gather_logits(logits)
+        if logits is not None:
+            logits = logits[..., : self.org_vocab_size]
+        return logits
+
+    LogitsProcessor._get_logits = _fp32_get_logits
+    LogitsProcessor._tt_fp32_lm_head = True
+
+
 @dataclass(kw_only=True, slots=True)
 class _RequestMetricsInputs:
     """Raw inputs needed to build a request's vLLM metrics. Used to pass
@@ -663,6 +722,12 @@ class VLLMGenerator(Actor, Configurable):
         model_dtype: str = "bfloat16"
         """Data type for model weights, passed directly to vLLM (auto, float16, bfloat16, float32)."""
 
+        mamba_cache_dtype: str = "auto"
+        """Data type for vLLM's convolutional recurrent cache."""
+
+        mamba_ssm_cache_dtype: str = "auto"
+        """Data type for vLLM's temporal/SSM recurrent cache."""
+
         gpu_memory_limit: float = 0.9
         """Fraction of GPU memory to use for the vLLM engine (0.0 to 1.0)."""
 
@@ -868,6 +933,8 @@ class VLLMGenerator(Actor, Configurable):
             enforce_eager=not config.cudagraph.enable,
             # Enables RequestOutput.metrics, so generator metrics can be returned
             disable_log_stats=False,
+            mamba_cache_dtype=config.mamba_cache_dtype,
+            mamba_ssm_cache_dtype=config.mamba_ssm_cache_dtype,
         )
         engine_kwargs["max_model_len"] = model_spec.model.max_seq_len
         engine_kwargs["max_num_seqs"] = self._max_num_seqs
@@ -885,11 +952,24 @@ class VLLMGenerator(Actor, Configurable):
             # vLLM's custom all-reduce hangs under Monarch's external_launcher at
             # TP>1; fall back to NCCL all-reduce.
             engine_kwargs["disable_custom_all_reduce"] = True
+        # Forward extra vLLM engine config on both native and torchtitan_wrapper
+        # paths. GDN hybrids use this to pin gdn_prefill_backend=triton; leaving it
+        # at vLLM's auto default can select cutedsl/flashinfer backends that are not
+        # valid in the MAST packaged runtime.
+        if config.vllm_additional_config:
+            engine_kwargs["additional_config"] = config.vllm_additional_config
+        # Neither generator path uses FlashInfer all-reduce (TP=1 + custom AR
+        # disabled), but vLLM imports flashinfer_all_reduce unconditionally during
+        # CudaCommunicator init, which can resolve cudart to tilelang's stub
+        # (missing cudaDeviceReset) and abort engine init. Install the no-op stub
+        # on BOTH the native and torchtitan_wrapper paths before LLMEngine init.
+        _install_flashinfer_allreduce_import_stub()
         if native:
-            # vLLM reads config.json + resolves its native model class; forward any
-            # extra engine config (e.g. gdn_prefill_backend for the GDN kernel).
-            if config.vllm_additional_config:
-                engine_kwargs["additional_config"] = config.vllm_additional_config
+            # Match the trainer's fp32 lm_head on the native generator (default on;
+            # SWE_GEN_NATIVE_FP32_LMHEAD=0 to disable for A/B).
+            if os.environ.get("SWE_GEN_NATIVE_FP32_LMHEAD", "1") == "1":
+                _install_fp32_native_lm_head()
+            # vLLM reads config.json + resolves its native model class.
             # Forward our cudagraph config on the native path too. Without this, vLLM
             # defaults to O2 (inductor VLLM_COMPILE + FULL_AND_PIECEWISE); we want the
             # cheaper, #3668-safe FULL_DECODE_ONLY (mode=NONE, no inductor, decode-only
@@ -904,6 +984,7 @@ class VLLMGenerator(Actor, Configurable):
             # torchtitan_wrapper: build PretrainedConfig from ModelSpec (no
             # config.json read) + pin the attention backend for the wrapper, and
             # let vLLM capture our cudagraph. Native manages its own compilation.
+            engine_kwargs["disable_custom_all_reduce"] = True
             engine_kwargs["config_format"] = TORCHTITAN_CONFIG_FORMAT
             engine_kwargs["attention_config"] = AttentionConfig(
                 backend=(
