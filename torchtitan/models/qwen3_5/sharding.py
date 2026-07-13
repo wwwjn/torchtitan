@@ -312,19 +312,29 @@ def _set_deltanet_sharding(
         out_dst_shardings=_norm_plc,
     )
 
-    # GatedDeltaKernel: local_map converts DTensor q/k/v/g/beta to local
+    # GatedDeltaKernel: local_map converts DTensor q/k/v/g/beta to local.
+    # cu_seqlens is a per-rank plain index tensor (built from the plain
+    # ``positions`` input) used to reset the recurrence at packed-sample
+    # boundaries. local_map requires a placement for every positional arg, so
+    # declare it fully Replicate (DP/CP/TP = R): in_src_shardings wraps the plain
+    # tensor as a Replicate DTensor (from_local, no collective -- each rank keeps
+    # its own cu_seqlens), and local_map converts it back to that local tensor.
+    # It is non-differentiable, so its in_grad placement is None.
     _kernel_plc = dense_activation_placement(tp=spmd.S(2))
+    _cu_seqlens_plc = dense_param_placement(tp=spmd.R)
     deltanet_cfg.kernel.sharding_config = ShardingConfig(
+        in_src_shardings={"cu_seqlens": _cu_seqlens_plc},
         in_dst_shardings={
             "q": _kernel_plc,
             "k": _kernel_plc,
             "v": _kernel_plc,
             "g": _kernel_plc,
             "beta": _kernel_plc,
+            "cu_seqlens": _cu_seqlens_plc,
         },
         out_src_shardings=_kernel_plc,
         local_map=LocalMapConfig(
-            in_grad_placements=(_kernel_plc,) * 5,
+            in_grad_placements=(_kernel_plc,) * 5 + (None,),
         ),
     )
 
