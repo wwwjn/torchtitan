@@ -608,13 +608,16 @@ class Qwen35TransformerBlock(Module):
             # GatedDeltaNet needs positions to reset conv/recurrent state at packed
             # sample boundaries (softmax uses attention_masks instead).
             h = self.attn(h, positions)
-        x = x + h
+        # fp32 residual add to match vLLM's fused_add_rms_norm (which upcasts the
+        # residual add to fp32); a plain bf16 add here compounds a hidden-state
+        # drift over all layers -> a floor on the gen/train logprob mismatch.
+        x = (x.float() + h.float()).to(x.dtype)
 
         h = self.ffn_norm(x)
         if self.moe_enabled:
-            x = x + self.moe(h)
+            x = (x.float() + self.moe(h).float()).to(x.dtype)
         else:
-            x = x + self.feed_forward(h)
+            x = (x.float() + self.feed_forward(h).float()).to(x.dtype)
         return x
 
 
