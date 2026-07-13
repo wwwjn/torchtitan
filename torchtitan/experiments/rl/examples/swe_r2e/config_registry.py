@@ -466,21 +466,26 @@ def rl_grpo_qwen3_5_9b_swe_r2e() -> Controller.Config:
             tensor_parallel_degree=1,
         ),
     )
+    generator_backend = os.environ.get("SWE_GEN_BACKEND", "vllm_native")
     config.generator = dataclasses.replace(
         config.generator,
-        backend="vllm_native",
+        backend=generator_backend,
         vllm_additional_config={"gdn_prefill_backend": "triton"},
+        mamba_ssm_cache_dtype=os.environ.get(
+            "SWE_GEN_MAMBA_SSM_CACHE_DTYPE",
+            "float32",
+        ),
+        # Default vllm_native (vLLM's own Qwen3.5, weights via state_dict_adapter);
+        # set SWE_GEN_BACKEND=torchtitan_wrapper for the unified GDN path (TT's FLA
+        # recurrence in vLLM's paged state). Keep GDN temporal state fp32 by
+        # default: vLLM "auto" follows model dtype (bf16), while the trainer FLA
+        # recurrent state is fp32. Cudagraph/prefix default off (eager,
+        # non-prefix-cached) until the unified cache-copy paths are validated.
         cudagraph=VLLMCudagraphConfig(
-            enable=(os.environ.get("SWE_GEN_CUDAGRAPH", "1") == "1"),
+            enable=(os.environ.get("SWE_GEN_CUDAGRAPH", "0") == "1"),
             mode="FULL_DECODE_ONLY",
-        ),  # 3x decode (smoke-validated GDN). SWE_GEN_CUDAGRAPH=0 -> eager decode:
-        # halves the gen/train logprob mismatch (cudagraph decode diverges from the
-        # eager trainer forward) at the cost of decode throughput.
-        # Force prefix caching on: GDN's default is OFF (is_prefix_caching_supported
-        # is False), so multi-turn rollouts re-prefill the full growing prompt every
-        # turn (0% hit). vLLM runs GDN in experimental 'align' mode; a local smoke
-        # measured ~2x prefill with byte-identical outputs vs no caching.
-        enable_prefix_caching=True,
+        ),
+        enable_prefix_caching=(os.environ.get("SWE_GEN_PREFIX_CACHE", "0") == "1"),
         # DP-8 x TP-1 = 8 TP-1 engines per 8-GPU host (matches the paper's
         # vllm_num_engines 48 across 6 gen hosts). TP-4 used only 4 of 8 GPUs/host
         # (world_size 4) -- half idle. TP-1 fits the 9B (~18GB) on one GPU and gives

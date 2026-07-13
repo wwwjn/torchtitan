@@ -223,6 +223,38 @@ def rl_grpo_qwen3_5_4b_varlen() -> Controller.Config:
     )
 
 
+def rl_grpo_qwen3_5_4b_varlen_unified() -> Controller.Config:
+    """Option-2 UNIFIED GDN generation for Qwen3.5-4B.
+
+    Same as :func:`rl_grpo_qwen3_5_4b_varlen` but ``backend="torchtitan_wrapper"``:
+    ALL layers run TorchTitan's own model, and the GDN layers become vLLM-cache
+    aware via the injected ``VLLMGatedDeltaNetCore`` (params + fla math stay
+    TorchTitan's, only paged conv/ssm cache is vLLM's). cudagraph stays off (the
+    fla chunk decode is not cudagraph-capturable).
+    """
+    cfg = rl_grpo_qwen3_5_4b_varlen()
+    return dataclasses.replace(
+        cfg,
+        generator=dataclasses.replace(cfg.generator, backend="torchtitan_wrapper"),
+    )
+
+
+def rl_grpo_qwen3_5_4b_varlen_unified_prefix() -> Controller.Config:
+    """Unified GDN + mamba prefix caching (align mode) for Qwen3.5-4B.
+
+    Same as :func:`rl_grpo_qwen3_5_4b_varlen_unified` but turns on prefix caching
+    so the GDN conv/ssm state is reused across the shared prompt prefix (the
+    group_size samples share one prompt). Exercises the align-mode state-copy
+    path (get_mamba_state_copy_func) to validate correctness before enabling it
+    on the multi-turn Search-R1 run.
+    """
+    cfg = rl_grpo_qwen3_5_4b_varlen_unified()
+    return dataclasses.replace(
+        cfg,
+        generator=dataclasses.replace(cfg.generator, enable_prefix_caching=True),
+    )
+
+
 def rl_grpo_qwen3_0_6b_flex() -> Controller.Config:
     """GRPO training config for Qwen3-0.6B with flex attention (4 GPUs: 2 gen + 2 train)."""
     group_size = 8

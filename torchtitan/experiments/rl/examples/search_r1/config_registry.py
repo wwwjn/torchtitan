@@ -234,3 +234,46 @@ def rl_grpo_qwen3_5_9b_search_r1() -> Controller.Config:
         ),
     )
     return config
+
+
+def rl_grpo_qwen3_5_9b_search_r1_unified() -> Controller.Config:
+    """UNIFIED GDN generation variant of :func:`rl_grpo_qwen3_5_9b_search_r1`.
+
+    Instead of ``vllm_native`` (vLLM's own GDN model), generation runs
+    TorchTitan's OWN model for every layer (``backend="torchtitan_wrapper"``);
+    the GDN layers become vLLM-cache aware via the injected
+    ``VLLMGatedDeltaNetCore`` -- params + fla math stay TorchTitan's, only the
+    paged conv/ssm cache is vLLM's. Everything else (data, reward, trainer, DP-8)
+    is identical, so its EM curve is directly comparable to the native run.
+
+    cudagraph OFF (the fla chunk decode is not cudagraph-capturable) and prefix
+    caching OFF (unified GDN mamba prefix caching not yet validated; add it once
+    the base unified path is confirmed on MAST).
+    """
+    config = rl_grpo_qwen3_5_9b_search_r1()
+    config.generator = dataclasses.replace(
+        config.generator,
+        backend="torchtitan_wrapper",
+        cudagraph=VLLMCudagraphConfig(enable=False),
+        enable_prefix_caching=False,
+    )
+    return config
+
+
+def rl_grpo_qwen3_5_9b_search_r1_unified_prefix() -> Controller.Config:
+    """Unified GDN + prefix caching ON (diagnostic).
+
+    Same as :func:`rl_grpo_qwen3_5_9b_search_r1_unified` but
+    ``enable_prefix_caching=True`` (align-mode mamba prefix caching via the
+    unified core's paged conv/ssm state). Multi-turn Search-R1 grows the prompt
+    each turn, so cache hits exercise the GDN recurrent-state restore path. This
+    is the discriminating run: unified+prefix-OFF is clean and native+prefix-ON
+    is clean, so if THIS regresses (EM drop / malformed generations) the custom
+    core's prefix-cache state handling is the culprit.
+    """
+    config = rl_grpo_qwen3_5_9b_search_r1_unified()
+    config.generator = dataclasses.replace(
+        config.generator,
+        enable_prefix_caching=True,
+    )
+    return config
