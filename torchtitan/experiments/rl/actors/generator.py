@@ -13,7 +13,7 @@ import logging
 import math
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 import cloudpickle
@@ -859,6 +859,27 @@ class VLLMGenerator(Actor, Configurable):
         self._backend = config.backend
         native = config.backend == "vllm_native"
         inner_attn = None
+        if native and os.environ.get("TT_GDN_UNIFIED_KERNEL") == "1":
+            # Opt-in: run the vLLM-native GDN layer's recurrence on TorchTitan's
+            # own fla kernels (same as the trainer) to cut train/infer drift.
+            # Must register before the vLLM engine builds the model. Default off.
+            from torchtitan.experiments.rl.models.gdn_vllm_titan import (
+                register_titan_gdn,
+            )
+
+            register_titan_gdn()
+            # The fla chunk kernel used for decode is not cudagraph-capturable
+            # (host-side chunk indexing), so force generator cudagraph off.
+            if config.cudagraph.enable:
+                logger.warning(
+                    "[gdn-titan] disabling generator cudagraph "
+                    "(TorchTitan fla GDN decode is not cudagraph-capturable)"
+                )
+                config = replace(
+                    config,
+                    cudagraph=replace(config.cudagraph, enable=False),
+                )
+                self.config = config
         if native:
             # vLLM resolves its native model class from config.json; weights are
             # synced via the model's state_dict_adapter (torchtitan -> HF) in
