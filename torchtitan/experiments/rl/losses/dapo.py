@@ -110,6 +110,27 @@ class DAPOLoss(BaseLoss):
                 torch.zeros_like(diff),
             )
             masked_ratio = ratio * loss_mask
+            # KL(vllm_sampling || local_trainer) via Schulman k1/k3 estimators on the
+            # sampled tokens (matches open-instruct debug/vllm_local_kl_*). Sampling
+            # policy p = vLLM (generator), target q = local trainer; logratio =
+            # log q - log p = trainer_logprobs - generator_logprobs = diff.
+            #   k1 = E_p[log p - log q] = mean(-logratio)          (unbiased, signed)
+            #   k3 = E_p[(q/p) - 1 - log(q/p)] = mean(exp(r) - r - 1)  (>= 0, low var)
+            # Masked-out positions have diff_for_metrics == 0 -> k3 term is exp(0)-0-1
+            # == 0, so they drop out of the sum. Normalized by loss_denominator so a
+            # SUM-reduce gives the global mean, like the bit_wise/* metrics.
+            k3_for_metrics = torch.exp(diff_for_metrics) - diff_for_metrics - 1.0
+            # Per-token reverse-KL integrand p * (log p - log q) evaluated at the
+            # sampled token (p = vLLM/generator, q = local trainer): explicitly
+            # probability-weighted, unlike the sample-based k1/k3. At loss_mask=True
+            # positions generator_logprobs is finite (non-finite ratios are masked
+            # above), so exp() is finite; masked-out positions are zeroed.
+            reverse_kl_tok = torch.exp(generator_logprobs) * (
+                generator_logprobs - trainer_logprobs
+            )
+            reverse_kl_for_metrics = torch.where(
+                loss_mask, reverse_kl_tok, torch.zeros_like(diff)
+            )
             metrics = {
                 "loss/mean": loss.detach(),
                 "loss/ratio_mean": masked_ratio.sum() / loss_denominator,
@@ -134,6 +155,12 @@ class DAPOLoss(BaseLoss):
                 ).sum()
                 / loss_denominator,
                 "bit_wise/logprob_diff/max": diff_for_metrics.abs().max(),
+                "debug/vllm_local_kl_k1_mean": -diff_for_metrics.float().sum()
+                / loss_denominator,
+                "debug/vllm_local_kl_k3_mean": k3_for_metrics.float().sum()
+                / loss_denominator,
+                "debug/vllm_local_reverse_kl_mean": reverse_kl_for_metrics.float().sum()
+                / loss_denominator,
             }
 
         return loss, metrics
