@@ -203,22 +203,28 @@ class DaytonaSandbox:
         # before the rollout runs) keeps the create rate under Daytona's throttle.
         retries = int(_getenv("TT_DAYTONA_CREATE_RETRIES", default="5"))
         backoff = 5.0
-        async with _create_sem():
-            for attempt in range(retries + 1):
-                try:
+        for attempt in range(retries + 1):
+            # Hold the create-concurrency semaphore ONLY around the actual create
+            # call, never during the backoff sleep. A create that hits a bad node
+            # (e.g. sysbox-mgr unavailable) and backs off must release its slot so
+            # other rollouts can boot; holding it across the exponential backoff
+            # (up to ~135s over 5 retries) collapses the effective create
+            # concurrency and starves long-tail groups (0 completed rollouts).
+            try:
+                async with _create_sem():
                     self._sb = await self._client.create(params, timeout=create_timeout)
-                    break
-                except Exception as e:
-                    if attempt >= retries:
-                        raise
-                    logger.warning(
-                        "daytona create failed (attempt %d/%d): %s",
-                        attempt + 1,
-                        retries + 1,
-                        e,
-                    )
-                    await asyncio.sleep(backoff * (0.5 + random.random()))
-                    backoff = min(backoff * 2, 60.0)
+                break
+            except Exception as e:
+                if attempt >= retries:
+                    raise
+                logger.warning(
+                    "daytona create failed (attempt %d/%d): %s",
+                    attempt + 1,
+                    retries + 1,
+                    e,
+                )
+                await asyncio.sleep(backoff * (0.5 + random.random()))
+                backoff = min(backoff * 2, 60.0)
         self.sandbox_id = self._sb.id
         return self
 
