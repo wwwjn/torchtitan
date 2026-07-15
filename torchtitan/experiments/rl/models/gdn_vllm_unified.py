@@ -256,22 +256,23 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
             and m.num_prefills > 0
             and m.num_decodes == 0
         ):
-            # Prefill-parity: for a SINGLE (non-packed) sequence the trainer's
-            # _cu_seqlens_from_positions returns None, so GatedDeltaNet takes the
-            # NON-packed conv path: F.pad(k-1,0) + depthwise F.conv1d + F.silu
-            # (model.py:399-432) -- NOT fla causal_conv1d. Reproduce that exact eager
-            # path here (fused q|k|v depthwise conv == the trainer's 3 separate convs).
+            # Prefill-parity (PACKED / cu_seqlens path = real training): the trainer's
+            # packed GatedDeltaNet conv uses fla causal_conv1d with cu_seqlens
+            # (model.py:372-397), resetting at each sample boundary. Match it: run the
+            # trainer's EXTERNAL fla causal_conv1d with the per-request cu_seqlens
+            # instead of vLLM's paged causal_conv1d_fn. Fused q|k|v depthwise conv ==
+            # the trainer's 3 separate depthwise convs (channel-wise identical).
             # fresh-prefill only; does NOT write the paged conv_state (decode needs it).
-            kw = conv_weight.shape[-1]
-            x_1Cn = mixed_qkv_TC.transpose(0, 1).unsqueeze(0)  # [1, C, n]
-            x_1Cn = F.pad(x_1Cn, [kw - 1, 0])
-            x_1Cn = F.conv1d(
-                x_1Cn,
-                conv_weight.unsqueeze(1),  # [C, 1, kw] depthwise
-                conv_bias,
-                groups=conv_weight.shape[0],
+            conv_out_TC = _external_fla_causal_conv1d(
+                mixed_qkv_TC.unsqueeze(0),  # [1, n, C] channels-last (as the trainer)
+                weight=conv_weight,  # [C, kw]
+                bias=conv_bias,
+                activation="silu",
+                cu_seqlens=m.non_spec_query_start_loc,
             )
-            conv_out_TC = F.silu(x_1Cn).squeeze(0).transpose(0, 1)  # [n, C]
+            if isinstance(conv_out_TC, tuple):
+                conv_out_TC = conv_out_TC[0]
+            conv_out_TC = conv_out_TC.squeeze(0)  # [n, C]
         elif m.num_prefills > 0:
             conv_out_TC = causal_conv1d_fn(
                 mixed_qkv_TC.transpose(0, 1),
@@ -396,8 +397,9 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
                     * F.softplus(a_THv[start:end].float() + dt_bias.float())
                 ).unsqueeze(0)
                 beta = torch.sigmoid(b_THv[start:end].float()).unsqueeze(0)
-                # Match the trainer's non-packed single-seq path EXACTLY:
-                #  - cu_seqlens=None (batched bs=1), not varlen [0,n]
+                # Match the trainer's PACKED path (real training uses cu_seqlens):
+                #  - cu_seqlens = the per-request query_start_loc (varlen), so the
+                #    chunk resets at sample boundaries exactly like the trainer.
                 #  - initial_state=None (stateless), NOT a zero tensor -- fla's
                 #    USE_INITIAL_STATE constexpr picks a different reduction for
                 #    None vs a real tensor, so a zero tensor is not bitwise-equal.
@@ -410,7 +412,7 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
                     beta,
                     initial_state=None,
                     output_final_state=True,
-                    cu_seqlens=None,
+                    cu_seqlens=m.non_spec_query_start_loc,
                     use_qk_l2norm_in_kernel=True,
                 )
                 out_1THvDv[:, start:end] = out
