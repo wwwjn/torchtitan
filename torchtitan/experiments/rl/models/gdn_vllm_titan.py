@@ -28,10 +28,13 @@ Opt-in via env ``TT_GDN_UNIFIED_KERNEL=1`` (default off -> vLLM-native, easy
 fallback). Call ``register_titan_gdn()`` before the vLLM engine is built.
 """
 
+import os
+
 import torch
 import torch.nn.functional as F
 from fla.ops.gated_delta_rule import (
     chunk_gated_delta_rule as _fla_chunk_gated_delta_rule,
+    fused_recurrent_gated_delta_rule as _fla_fused_recurrent_gated_delta_rule,
 )
 
 from torchtitan.tools.logging import logger
@@ -161,23 +164,51 @@ class TitanFLAGatedDeltaNet(QwenGatedDeltaNetAttention):
         # SAME chunk kernel as the trainer, then scatter the final state back.
         n_seq = m.num_decodes + m.num_prefills
         state_idx = nsi[:n_seq]
-        initial_state = ssm_state[state_idx]  # gather -> [n_seq, HV, V, K]
+        # vLLM's paged ssm_state is [.., HV, head_v_dim, head_k_dim] (value first),
+        # but fla's chunk kernel uses key-first [.., HV, K, V] state. The trainer's
+        # GatedDeltaKernel calls chunk with the DEFAULT transpose_state_layout=False,
+        # so to match the trainer's forward NUMERICS (transpose_state_layout is a
+        # kernel compute-path flag, not just a storage layout) we keep False here
+        # and transpose the paged state around the call instead of flipping the
+        # kernel layout. transpose(-1, -2) maps the [V, K] slot <-> fla's [K, V]
+        # state; this is also correct when head_k_dim != head_v_dim (27B), unlike a
+        # raw position-copy. (The prior `state_v_first=True` kwarg did not exist in
+        # fla -- it was silently dropped by **kwargs, so this already ran at the
+        # default False; the transposes just make the slot layout explicit + safe.)
+        initial_state = ssm_state[state_idx].transpose(-1, -2).contiguous()
         if m.has_initial_state is not None:
             initial_state[~m.has_initial_state] = 0
 
-        out, final_state = _fla_chunk_gated_delta_rule(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            initial_state=initial_state,
-            output_final_state=True,
-            cu_seqlens=m.non_spec_query_start_loc,
-            use_qk_l2norm_in_kernel=True,
-            state_v_first=True,  # ssm_state is [.., HV, head_v_dim, head_k_dim]
-        )
-        ssm_state[state_idx] = final_state.to(ssm_state.dtype)
+        # PARITY EXPERIMENT (TT_GDN_RECURRENT_PREFILL=1): route prefill through the
+        # SAME fused_recurrent kernel decode uses, matching a trainer that also runs
+        # fla_fused_recurrent. Recurrent is boundary-exact (token-by-token), so it
+        # removes both the chunk-vs-recurrent algorithmic split AND the vLLM
+        # 2048-chunk WY-boundary re-seed. Slow (per-token) -> parity/debug only.
+        if os.environ.get("TT_GDN_RECURRENT_PREFILL") == "1":
+            out, final_state = _fla_fused_recurrent_gated_delta_rule(
+                q,
+                k,
+                v,
+                g,
+                beta=beta,
+                initial_state=initial_state,
+                output_final_state=True,
+                cu_seqlens=m.non_spec_query_start_loc,
+                use_qk_l2norm_in_kernel=True,
+            )
+        else:
+            out, final_state = _fla_chunk_gated_delta_rule(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                initial_state=initial_state,
+                output_final_state=True,
+                cu_seqlens=m.non_spec_query_start_loc,
+                use_qk_l2norm_in_kernel=True,
+            )
+        ssm_state[state_idx] = final_state.transpose(-1, -2).to(ssm_state.dtype)
         core_attn_out[:n] = out.squeeze(0)
 
 

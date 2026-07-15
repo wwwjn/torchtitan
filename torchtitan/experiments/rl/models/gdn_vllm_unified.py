@@ -33,9 +33,22 @@ Legend (tensor shape suffixes, this module):
 
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
+
+# External fla (the SAME package the trainer uses). Opt-in via
+# TT_GDN_WRAPPER_EXTERNAL_FLA=1 so the wrapper's GDN prefill runs the trainer's
+# exact chunk + conv kernels (the vendored vLLM fla is a different copy -> a parity
+# gap). We align the GENERATOR to the TRAINER because only the trainer's fla path
+# has a backward (training needs it), so the trainer's kernels are the reference.
+from fla.modules.convolution import causal_conv1d as _external_fla_causal_conv1d
+from fla.ops.gated_delta_rule import (
+    chunk_gated_delta_rule as _external_fla_chunk_gated_delta_rule,
+)
 
 from torchtitan.protocols.module import Module
 from torchtitan.tools.logging import logger
@@ -238,7 +251,28 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
 
         # 1) Causal conv against the paged conv_state (reuse vLLM's kernels). A
         # batch with any prefill uses the varlen fn; pure-decode uses the update.
-        if m.num_prefills > 0:
+        if (
+            os.environ.get("TT_GDN_WRAPPER_EXTERNAL_FLA") == "1"
+            and m.num_prefills > 0
+            and m.num_decodes == 0
+        ):
+            # Prefill-parity: for a SINGLE (non-packed) sequence the trainer's
+            # _cu_seqlens_from_positions returns None, so GatedDeltaNet takes the
+            # NON-packed conv path: F.pad(k-1,0) + depthwise F.conv1d + F.silu
+            # (model.py:399-432) -- NOT fla causal_conv1d. Reproduce that exact eager
+            # path here (fused q|k|v depthwise conv == the trainer's 3 separate convs).
+            # fresh-prefill only; does NOT write the paged conv_state (decode needs it).
+            kw = conv_weight.shape[-1]
+            x_1Cn = mixed_qkv_TC.transpose(0, 1).unsqueeze(0)  # [1, C, n]
+            x_1Cn = F.pad(x_1Cn, [kw - 1, 0])
+            x_1Cn = F.conv1d(
+                x_1Cn,
+                conv_weight.unsqueeze(1),  # [C, 1, kw] depthwise
+                conv_bias,
+                groups=conv_weight.shape[0],
+            )
+            conv_out_TC = F.silu(x_1Cn).squeeze(0).transpose(0, 1)  # [n, C]
+        elif m.num_prefills > 0:
             conv_out_TC = causal_conv1d_fn(
                 mixed_qkv_TC.transpose(0, 1),
                 conv_weight,
@@ -265,22 +299,26 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
         # decode tokens use a recurrent update path, while prefill tokens use the
         # chunk kernel. This avoids routing mixed-batch length-1 decodes through
         # the prefill kernel and keeps the unified path closer to native GDN.
-        out_1THvDv = mixed_qkv_TC.new_empty(
-            1, n, self.num_v_heads, self.head_v_dim
-        )
+        out_1THvDv = mixed_qkv_TC.new_empty(1, n, self.num_v_heads, self.head_v_dim)
 
         def _split_qkv(
             mixed_qkv_slice_TC: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             num_tokens = mixed_qkv_slice_TC.shape[0]
-            q_1THkDk = mixed_qkv_slice_TC[:, : self.key_dim].contiguous().view(
-                1, num_tokens, self.num_k_heads, self.head_k_dim
+            q_1THkDk = (
+                mixed_qkv_slice_TC[:, : self.key_dim]
+                .contiguous()
+                .view(1, num_tokens, self.num_k_heads, self.head_k_dim)
             )
-            k_1THkDk = mixed_qkv_slice_TC[
-                :, self.key_dim : 2 * self.key_dim
-            ].contiguous().view(1, num_tokens, self.num_k_heads, self.head_k_dim)
-            v_1THvDv = mixed_qkv_slice_TC[:, 2 * self.key_dim :].contiguous().view(
-                1, num_tokens, self.num_v_heads, self.head_v_dim
+            k_1THkDk = (
+                mixed_qkv_slice_TC[:, self.key_dim : 2 * self.key_dim]
+                .contiguous()
+                .view(1, num_tokens, self.num_k_heads, self.head_k_dim)
+            )
+            v_1THvDv = (
+                mixed_qkv_slice_TC[:, 2 * self.key_dim :]
+                .contiguous()
+                .view(1, num_tokens, self.num_v_heads, self.head_v_dim)
             )
             return q_1THkDk, k_1THkDk, v_1THvDv
 
@@ -335,44 +373,81 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
         ) -> None:
             if end <= start:
                 return
-            q, k, v, g, beta = fused_post_conv_prep(
-                conv_output=conv_out_TC[start:end],
-                a=a_THv[start:end],
-                b=b_THv[start:end],
-                A_log=A_log,
-                dt_bias=dt_bias,
-                num_k_heads=self.num_k_heads,
-                head_k_dim=self.head_k_dim,
-                head_v_dim=self.head_v_dim,
-                apply_l2norm=True,
-                output_g_exp=False,
-            )
-            q = q.unsqueeze(0)
-            k = k.unsqueeze(0)
-            v = v.unsqueeze(0)
-            g = g.unsqueeze(0)
-            beta = beta.unsqueeze(0)
             initial_state = ssm_state[state_idx]
             initial_state = initial_state.clone()
             if has_initial_state is None:
                 initial_state.zero_()
             else:
                 initial_state[~has_initial_state] = 0
-            out, final_state = _vllm_chunk_gated_delta_rule(
-                q,
-                k,
-                v,
-                g,
-                beta,
-                initial_state=initial_state,
-                output_final_state=True,
-                cu_seqlens=cu_seqlens,
-                chunk_indices=m.chunk_indices,
-                chunk_offsets=m.chunk_offsets,
-                use_qk_l2norm_in_kernel=False,
-            )
-            out_1THvDv[:, start:end] = out
-            ssm_state[state_idx] = final_state.to(ssm_state.dtype)
+            if os.environ.get("TT_GDN_WRAPPER_EXTERNAL_FLA") == "1":
+                # Fully-unified prefill: drop fused_post_conv_prep and reproduce the
+                # trainer op-for-op -- eager fp32 gate (model.py:514-517), RAW q/k with
+                # in-kernel l2norm, GVA head-expand (model.py:243-247), and the trainer's
+                # EXTERNAL fla chunk. So gate + l2norm + recurrence all match the trainer;
+                # only the paged conv upstream remains vLLM's. Transpose the paged [V,K]
+                # state <-> fla's [K,V] (default transpose_state_layout=False, trainer-match).
+                q, k, v = _split_qkv(conv_out_TC[start:end])
+                if q.shape[2] != v.shape[2]:
+                    rep = v.shape[2] // q.shape[2]
+                    q = q.repeat_interleave(rep, dim=2)
+                    k = k.repeat_interleave(rep, dim=2)
+                g = (
+                    -torch.exp(A_log.float())
+                    * F.softplus(a_THv[start:end].float() + dt_bias.float())
+                ).unsqueeze(0)
+                beta = torch.sigmoid(b_THv[start:end].float()).unsqueeze(0)
+                # Match the trainer's non-packed single-seq path EXACTLY:
+                #  - cu_seqlens=None (batched bs=1), not varlen [0,n]
+                #  - initial_state=None (stateless), NOT a zero tensor -- fla's
+                #    USE_INITIAL_STATE constexpr picks a different reduction for
+                #    None vs a real tensor, so a zero tensor is not bitwise-equal.
+                # Fresh-prefill only (guarded by num_decodes==0 + assumed fresh).
+                out, final_state = _external_fla_chunk_gated_delta_rule(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    initial_state=None,
+                    output_final_state=True,
+                    cu_seqlens=None,
+                    use_qk_l2norm_in_kernel=True,
+                )
+                out_1THvDv[:, start:end] = out
+                ssm_state[state_idx] = final_state.transpose(-1, -2).to(ssm_state.dtype)
+            else:
+                q, k, v, g, beta = fused_post_conv_prep(
+                    conv_output=conv_out_TC[start:end],
+                    a=a_THv[start:end],
+                    b=b_THv[start:end],
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    num_k_heads=self.num_k_heads,
+                    head_k_dim=self.head_k_dim,
+                    head_v_dim=self.head_v_dim,
+                    apply_l2norm=True,
+                    output_g_exp=False,
+                )
+                q = q.unsqueeze(0)
+                k = k.unsqueeze(0)
+                v = v.unsqueeze(0)
+                g = g.unsqueeze(0)
+                beta = beta.unsqueeze(0)
+                out, final_state = _vllm_chunk_gated_delta_rule(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    cu_seqlens=cu_seqlens,
+                    chunk_indices=m.chunk_indices,
+                    chunk_offsets=m.chunk_offsets,
+                    use_qk_l2norm_in_kernel=False,
+                )
+                out_1THvDv[:, start:end] = out
+                ssm_state[state_idx] = final_state.to(ssm_state.dtype)
 
         num_decode_tokens = m.num_decode_tokens
         if m.num_decodes > 0:
