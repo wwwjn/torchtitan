@@ -144,6 +144,11 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use TorchTitan's fused SwiGLU gate+up projection override.",
     )
+    overrides.add_argument(
+        "--fused-attention-projections",
+        action="store_true",
+        help="Merge Qwen3.5 full-attention Q/gate, K, and V projections.",
+    )
     return parser.parse_args()
 
 
@@ -270,6 +275,12 @@ def _build_engine(config, args: argparse.Namespace, *, max_num_seqs: int):
         )
 
         apply_merged_gdn_projections()
+    if args.fused_attention_projections:
+        from torchtitan.experiments.rl.models.gdn_projection_ablation import (
+            apply_merged_qwen35_attention_projection,
+        )
+
+        apply_merged_qwen35_attention_projection()
 
     register_to_vllm(
         model_spec,
@@ -505,6 +516,12 @@ def generate() -> None:
         )
 
         apply_merged_gdn_projections()
+    if args.fused_attention_projections:
+        from torchtitan.experiments.rl.models.gdn_projection_ablation import (
+            apply_merged_qwen35_attention_projection,
+        )
+
+        apply_merged_qwen35_attention_projection()
 
     gen_config = config.generator
     model_spec = config.model_spec

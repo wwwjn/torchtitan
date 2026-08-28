@@ -11,6 +11,7 @@ from torchtitan.experiments.rl.models.gdn_projection_ablation import (
     _clear_merged_weight_cache,
     _merged_gdn_ba,
     _merged_gdn_qkvz,
+    _merged_qwen35_qkv_gate,
 )
 
 
@@ -27,6 +28,13 @@ def test_merged_gdn_projections_match_separate_linears() -> None:
     expected_ba = torch.cat([F.linear(x, weight) for weight in ba_weights], dim=-1)
     actual_ba = _merged_gdn_ba(x, *ba_weights)
     torch.testing.assert_close(actual_ba, expected_ba)
+
+    attention_weights = tuple(torch.randn(size, 13) for size in (14, 5, 5))
+    expected_attention = torch.cat(
+        [F.linear(x, weight) for weight in attention_weights], dim=-1
+    )
+    actual_attention = _merged_qwen35_qkv_gate(x, *attention_weights)
+    torch.testing.assert_close(actual_attention, expected_attention)
 
 
 def test_merged_gdn_projection_cache_can_be_refreshed() -> None:

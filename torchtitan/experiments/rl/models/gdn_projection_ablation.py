@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Inference-only merged input projections for Qwen3.5 Gated DeltaNet."""
+"""Inference-only merged input projections for Qwen3.5."""
 
 from __future__ import annotations
 
@@ -16,7 +16,8 @@ from torch.distributed.tensor import DTensor, Shard
 
 
 _MERGED_WEIGHT_CACHE: dict[tuple[int, ...], torch.Tensor] = {}
-_PATCHED = False
+_GDN_PATCHED = False
+_ATTENTION_PATCHED = False
 
 
 def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -78,6 +79,27 @@ def _merged_gdn_ba_fake(
     return torch.empty(*x.shape[:-1], output_dim, dtype=x.dtype, device=x.device)
 
 
+@torch.library.custom_op("torchtitan::merged_qwen35_qkv_gate", mutates_args=())
+def _merged_qwen35_qkv_gate(
+    x: torch.Tensor,
+    wq_gate: torch.Tensor,
+    wk: torch.Tensor,
+    wv: torch.Tensor,
+) -> torch.Tensor:
+    return F.linear(x, _merged_weight((wq_gate, wk, wv)))
+
+
+@_merged_qwen35_qkv_gate.register_fake
+def _merged_qwen35_qkv_gate_fake(
+    x: torch.Tensor,
+    wq_gate: torch.Tensor,
+    wk: torch.Tensor,
+    wv: torch.Tensor,
+) -> torch.Tensor:
+    output_dim = wq_gate.shape[0] + wk.shape[0] + wv.shape[0]
+    return torch.empty(*x.shape[:-1], output_dim, dtype=x.dtype, device=x.device)
+
+
 def _wrap_projection_output(
     output: torch.Tensor,
     weight: torch.Tensor,
@@ -105,8 +127,8 @@ def apply_merged_gdn_projections() -> None:
     vLLM's local ``qkvz`` and ``ba`` projection layout. A load-state hook drops
     the derived cache after RL weight synchronization.
     """
-    global _PATCHED
-    if _PATCHED:
+    global _GDN_PATCHED
+    if _GDN_PATCHED:
         return
 
     from torchtitan.distributed.utils import is_in_batch_invariant_mode
@@ -188,7 +210,73 @@ def apply_merged_gdn_projections() -> None:
 
     GatedDeltaNet.__init__ = init
     GatedDeltaNet.forward = forward
-    _PATCHED = True
+    _GDN_PATCHED = True
 
 
-__all__ = ["apply_merged_gdn_projections"]
+def apply_merged_qwen35_attention_projection() -> None:
+    """Patch Qwen3.5 full attention to merge Q/gate, K, and V projections."""
+    global _ATTENTION_PATCHED
+    if _ATTENTION_PATCHED:
+        return
+
+    from torchtitan.models.qwen3_5.model import Qwen35Attention
+
+    original_init = Qwen35Attention.__init__
+
+    def init(self, config) -> None:
+        original_init(self, config)
+        _clear_merged_weight_cache()
+        self.register_load_state_dict_post_hook(_clear_merged_weight_cache)
+
+    def forward(self, x_TD, attention_masks, positions=None):
+        num_tokens = x_TD.shape[0]
+        x = _local_tensor(x_TD)
+        projection_weights = (self.wq.weight, self.wk.weight, self.wv.weight)
+        local_projection_weights = tuple(map(_local_tensor, projection_weights))
+        qkv_gate = _merged_qwen35_qkv_gate(x, *local_projection_weights)
+        projection_sizes = tuple(weight.shape[0] for weight in local_projection_weights)
+        xq_gate_TN2H, xk_TNH, xv_TNH = (
+            _wrap_projection_output(part, projection_weights[0])
+            for part in qkv_gate.split(projection_sizes, dim=-1)
+        )
+
+        xq_gate_TN2H = xq_gate_TN2H.view(num_tokens, -1, self.head_dim * 2)
+        xq_TNH, gate_TNH = xq_gate_TN2H.chunk(2, dim=-1)
+        xk_TNH = xk_TNH.view(num_tokens, -1, self.head_dim)
+        xv_TNH = xv_TNH.view(num_tokens, -1, self.head_dim)
+
+        xq_TNH = self.q_norm(xq_TNH)
+        xk_TNH = self.k_norm(xk_TNH)
+
+        xq_TNR, xq_TNP = (
+            xq_TNH[..., : self.rotary_dim],
+            xq_TNH[..., self.rotary_dim :],
+        )
+        xk_TNR, xk_TNP = (
+            xk_TNH[..., : self.rotary_dim],
+            xk_TNH[..., self.rotary_dim :],
+        )
+        xq_TNR, xk_TNR = self.rope(xq_TNR, xk_TNR, positions)
+        xq_TNH = torch.cat([xq_TNR, xq_TNP], dim=-1)
+        xk_TNH = torch.cat([xk_TNR, xk_TNP], dim=-1)
+
+        out_TNH = self.inner_attention(
+            xq_TNH,
+            xk_TNH,
+            xv_TNH,
+            attention_masks=attention_masks,
+            scale=self.scaling,
+            enable_gqa=self.enable_gqa,
+        ).contiguous()
+        out_TNH = out_TNH * torch.sigmoid(gate_TNH)
+        return self.wo(out_TNH.view(num_tokens, -1))
+
+    Qwen35Attention.__init__ = init
+    Qwen35Attention.forward = forward
+    _ATTENTION_PATCHED = True
+
+
+__all__ = [
+    "apply_merged_gdn_projections",
+    "apply_merged_qwen35_attention_projection",
+]
