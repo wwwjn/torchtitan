@@ -42,6 +42,7 @@ from torchtitan.distributed.spmd_types import (
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
 from torchtitan.experiments.rl.models.vllm_registry import InferenceParallelismConfig
 from torchtitan.models.common.attention import FusedQKVLinear
+from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.protocols.module import Module
 from torchtitan.protocols.sharding import resolve_placements
@@ -630,6 +631,16 @@ class VLLMModelWrapper(Module):
                     layout,
                 ) in wqkv_sharding_config.state_shardings.items():
                     for proj_name in ("wq", "wk", "wv"):
+                        layouts[f"{module_prefix}{proj_name}.{state_name}"] = layout
+
+            if isinstance(module, FeedForward) and hasattr(module, "w13"):
+                # FusedSwiGLU's state-dict hook exposes w1/w3, while their
+                # shared parameter and sharding config live on the w13 child.
+                w13_sharding_config = getattr(module.w13, "_sharding_config", None)
+                if w13_sharding_config is None:
+                    continue
+                for state_name, layout in w13_sharding_config.state_shardings.items():
+                    for proj_name in ("w1", "w3"):
                         layouts[f"{module_prefix}{proj_name}.{state_name}"] = layout
 
             if module_fqn.rsplit(".", 1)[-1] == "vllm_attn":

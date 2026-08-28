@@ -139,6 +139,11 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Merge Qwen3.5 GDN qkvz and ba input projections.",
     )
+    overrides.add_argument(
+        "--fused-mlp",
+        action="store_true",
+        help="Use TorchTitan's fused SwiGLU gate+up projection override.",
+    )
     return parser.parse_args()
 
 
@@ -176,6 +181,16 @@ def _apply_overrides(config, args: argparse.Namespace) -> None:
 
     if args.max_num_batched_tokens is not None:
         config.generator.max_num_batched_tokens = args.max_num_batched_tokens
+
+    if args.fused_mlp:
+        fused_swiglu = "torchtitan.overrides.fused_swiglu.fused_swiglu"
+        override_imports = list(config.generator.override.imports)
+        if fused_swiglu not in override_imports:
+            override_imports.append(fused_swiglu)
+            config.generator.override = dataclasses.replace(
+                config.generator.override,
+                imports=override_imports,
+            )
 
 
 def _build_compilation_config(config, *, max_num_seqs: int, native: bool):
