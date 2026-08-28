@@ -149,6 +149,11 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Merge Qwen3.5 full-attention Q/gate, K, and V projections.",
     )
+    overrides.add_argument(
+        "--fused-gdn-norm",
+        action="store_true",
+        help="Use vLLM's fused Qwen3.5 GDN RMSNorm+gate kernel.",
+    )
     return parser.parse_args()
 
 
@@ -281,6 +286,12 @@ def _build_engine(config, args: argparse.Namespace, *, max_num_seqs: int):
         )
 
         apply_merged_qwen35_attention_projection()
+    if args.fused_gdn_norm:
+        from torchtitan.experiments.rl.models.gdn_projection_ablation import (
+            apply_fused_gdn_rmsnorm_gate,
+        )
+
+        apply_fused_gdn_rmsnorm_gate()
 
     register_to_vllm(
         model_spec,
@@ -522,6 +533,12 @@ def generate() -> None:
         )
 
         apply_merged_qwen35_attention_projection()
+    if args.fused_gdn_norm:
+        from torchtitan.experiments.rl.models.gdn_projection_ablation import (
+            apply_fused_gdn_rmsnorm_gate,
+        )
+
+        apply_fused_gdn_rmsnorm_gate()
 
     gen_config = config.generator
     model_spec = config.model_spec

@@ -18,6 +18,7 @@ from torch.distributed.tensor import DTensor, Shard
 _MERGED_WEIGHT_CACHE: dict[tuple[int, ...], torch.Tensor] = {}
 _GDN_PATCHED = False
 _ATTENTION_PATCHED = False
+_GDN_NORM_PATCHED = False
 
 
 def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -100,7 +101,38 @@ def _merged_qwen35_qkv_gate_fake(
     return torch.empty(*x.shape[:-1], output_dim, dtype=x.dtype, device=x.device)
 
 
-def _wrap_projection_output(
+@torch.library.custom_op("torchtitan::fused_gdn_rmsnorm_gate", mutates_args=())
+def _fused_gdn_rmsnorm_gate(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    from vllm.third_party.flash_linear_attention.ops.layernorm_guard import rmsnorm_fn
+
+    return rmsnorm_fn(
+        x,
+        weight,
+        None,
+        z=gate,
+        eps=eps,
+        group_size=None,
+        norm_before_gate=True,
+        activation="silu",
+    )
+
+
+@_fused_gdn_rmsnorm_gate.register_fake
+def _fused_gdn_rmsnorm_gate_fake(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+def _wrap_column_projection_output(
     output: torch.Tensor,
     weight: torch.Tensor,
 ) -> torch.Tensor:
@@ -115,6 +147,17 @@ def _wrap_projection_output(
         output,
         weight.device_mesh,
         placements,
+        run_check=False,
+    )
+
+
+def _wrap_like(output: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
+    if not isinstance(source, DTensor):
+        return output
+    return DTensor.from_local(
+        output,
+        source.device_mesh,
+        source.placements,
         run_check=False,
     )
 
@@ -175,7 +218,7 @@ def apply_merged_gdn_projections() -> None:
         qkvz = _merged_gdn_qkvz(x, *local_projection_weights)
         projection_sizes = tuple(weight.shape[0] for weight in local_projection_weights)
         query_TC, key_TC, value_TC, gate_TC = (
-            _wrap_projection_output(part, projection_weights[0])
+            _wrap_column_projection_output(part, projection_weights[0])
             for part in qkvz.split(projection_sizes, dim=-1)
         )
 
@@ -184,7 +227,7 @@ def apply_merged_gdn_projections() -> None:
         ba = _merged_gdn_ba(x, *local_gate_weights)
         gate_sizes = tuple(weight.shape[0] for weight in local_gate_weights)
         b_TN, a_TN = (
-            _wrap_projection_output(part, gate_weights[0])
+            _wrap_column_projection_output(part, gate_weights[0])
             for part in ba.split(gate_sizes, dim=-1)
         )
 
@@ -236,7 +279,7 @@ def apply_merged_qwen35_attention_projection() -> None:
         qkv_gate = _merged_qwen35_qkv_gate(x, *local_projection_weights)
         projection_sizes = tuple(weight.shape[0] for weight in local_projection_weights)
         xq_gate_TN2H, xk_TNH, xv_TNH = (
-            _wrap_projection_output(part, projection_weights[0])
+            _wrap_column_projection_output(part, projection_weights[0])
             for part in qkv_gate.split(projection_sizes, dim=-1)
         )
 
@@ -276,7 +319,32 @@ def apply_merged_qwen35_attention_projection() -> None:
     _ATTENTION_PATCHED = True
 
 
+def apply_fused_gdn_rmsnorm_gate() -> None:
+    """Patch Qwen3.5 GDN output normalization to use vLLM's fused kernel."""
+    global _GDN_NORM_PATCHED
+    if _GDN_NORM_PATCHED:
+        return
+
+    from torchtitan.models.qwen3_5.gdn import RMSNormGated
+
+    def forward(self, x, gate):
+        x_local = _local_tensor(x)
+        gate_local = _local_tensor(gate)
+        weight_local = _local_tensor(self.weight)
+        output = _fused_gdn_rmsnorm_gate(
+            x_local.contiguous(),
+            gate_local.contiguous(),
+            weight_local.contiguous(),
+            self.eps,
+        )
+        return _wrap_like(output, x)
+
+    RMSNormGated.forward = forward
+    _GDN_NORM_PATCHED = True
+
+
 __all__ = [
     "apply_merged_gdn_projections",
     "apply_merged_qwen35_attention_projection",
+    "apply_fused_gdn_rmsnorm_gate",
 ]
