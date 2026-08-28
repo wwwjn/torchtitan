@@ -52,6 +52,12 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
+from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+    causal_conv1d_update as _vllm_causal_conv1d_update,
+)
+from vllm.third_party.flash_linear_attention.ops import (
+    fused_recurrent_gated_delta_rule_packed_decode,
+)
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
@@ -282,6 +288,31 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
         num_prefills = gdn_metadata.num_prefills
         num_decode_tokens = gdn_metadata.num_decode_tokens
         num_sequences = num_decodes + num_prefills
+
+        if num_prefills == 0 and not is_in_batch_invariant_mode():
+            decode_state_indices = state_indices[:num_actual_tokens]
+            conv_output = _vllm_causal_conv1d_update(
+                mixed_qkv,
+                conv_state,
+                conv_weight,
+                conv_bias,
+                "silu",
+                conv_state_indices=decode_state_indices,
+                validate_data=False,
+            )
+            fused_recurrent_gated_delta_rule_packed_decode(
+                mixed_qkv=conv_output,
+                a=a,
+                b=b,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                scale=self.head_k_dim**-0.5,
+                initial_state=ssm_state,
+                out=output[:num_actual_tokens].unsqueeze(1),
+                ssm_state_indices=decode_state_indices,
+                use_qk_l2norm_in_kernel=True,
+            )
+            return
 
         # Convolution is split by request type and writes one contiguous
         # conv_output for the single recurrence below. Decode is FULL-captured in
