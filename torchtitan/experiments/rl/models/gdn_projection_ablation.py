@@ -16,9 +16,11 @@ from torch.distributed.tensor import DTensor, Shard
 
 
 _MERGED_WEIGHT_CACHE: dict[tuple[int, ...], torch.Tensor] = {}
+_OFFSET_WEIGHT_CACHE: dict[tuple[int, torch.dtype], torch.Tensor] = {}
 _GDN_PATCHED = False
 _ATTENTION_PATCHED = False
 _GDN_NORM_PATCHED = False
+_OFFSET_NORM_PATCHED = False
 
 
 def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -36,6 +38,22 @@ def _merged_weight(weights: tuple[torch.Tensor, ...]) -> torch.Tensor:
 
 def _clear_merged_weight_cache(*_args) -> None:
     _MERGED_WEIGHT_CACHE.clear()
+
+
+def _clear_offset_weight_cache(*_args) -> None:
+    _OFFSET_WEIGHT_CACHE.clear()
+
+
+def _adjusted_offset_weight(
+    weight: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    key = (weight.data_ptr(), dtype)
+    adjusted_weight = _OFFSET_WEIGHT_CACHE.get(key)
+    if adjusted_weight is None:
+        adjusted_weight = (weight.float() + 1.0).to(dtype).contiguous()
+        _OFFSET_WEIGHT_CACHE[key] = adjusted_weight
+    return adjusted_weight
 
 
 @torch.library.custom_op("torchtitan::merged_gdn_qkvz", mutates_args=())
@@ -127,6 +145,28 @@ def _fused_gdn_rmsnorm_gate_fake(
     x: torch.Tensor,
     gate: torch.Tensor,
     weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+@torch.library.custom_op("torchtitan::fused_offset_rmsnorm", mutates_args=())
+def _fused_offset_rmsnorm(
+    x: torch.Tensor,
+    adjusted_weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    from vllm import _custom_ops as ops
+
+    output = torch.empty_like(x)
+    ops.rms_norm(output, x, adjusted_weight, eps)
+    return output
+
+
+@_fused_offset_rmsnorm.register_fake
+def _fused_offset_rmsnorm_fake(
+    x: torch.Tensor,
+    adjusted_weight: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
     return torch.empty_like(x)
@@ -343,8 +383,40 @@ def apply_fused_gdn_rmsnorm_gate() -> None:
     _GDN_NORM_PATCHED = True
 
 
+def apply_fused_qwen35_offset_rmsnorm() -> None:
+    """Patch Qwen3.5 offset RMSNorm to use vLLM's fused CUDA kernel."""
+    global _OFFSET_NORM_PATCHED
+    if _OFFSET_NORM_PATCHED:
+        return
+
+    from torchtitan.models.qwen3_5.model import OffsetRMSNorm
+
+    original_init = OffsetRMSNorm.__init__
+
+    def init(self, config) -> None:
+        original_init(self, config)
+        _clear_offset_weight_cache()
+        self.register_load_state_dict_post_hook(_clear_offset_weight_cache)
+
+    def forward(self, x):
+        x_local = _local_tensor(x)
+        weight_local = _local_tensor(self.weight)
+        adjusted_weight = _adjusted_offset_weight(weight_local, x_local.dtype)
+        output = _fused_offset_rmsnorm(
+            x_local.contiguous(),
+            adjusted_weight,
+            self.eps,
+        )
+        return _wrap_like(output, x)
+
+    OffsetRMSNorm.__init__ = init
+    OffsetRMSNorm.forward = forward
+    _OFFSET_NORM_PATCHED = True
+
+
 __all__ = [
     "apply_merged_gdn_projections",
     "apply_merged_qwen35_attention_projection",
     "apply_fused_gdn_rmsnorm_gate",
+    "apply_fused_qwen35_offset_rmsnorm",
 ]

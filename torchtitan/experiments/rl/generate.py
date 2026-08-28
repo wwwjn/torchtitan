@@ -154,6 +154,11 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use vLLM's fused Qwen3.5 GDN RMSNorm+gate kernel.",
     )
+    overrides.add_argument(
+        "--fused-offset-norm",
+        action="store_true",
+        help="Use vLLM's fused Qwen3.5 offset RMSNorm kernel.",
+    )
     return parser.parse_args()
 
 
@@ -292,6 +297,12 @@ def _build_engine(config, args: argparse.Namespace, *, max_num_seqs: int):
         )
 
         apply_fused_gdn_rmsnorm_gate()
+    if args.fused_offset_norm:
+        from torchtitan.experiments.rl.models.gdn_projection_ablation import (
+            apply_fused_qwen35_offset_rmsnorm,
+        )
+
+        apply_fused_qwen35_offset_rmsnorm()
 
     register_to_vllm(
         model_spec,
@@ -539,6 +550,12 @@ def generate() -> None:
         )
 
         apply_fused_gdn_rmsnorm_gate()
+    if args.fused_offset_norm:
+        from torchtitan.experiments.rl.models.gdn_projection_ablation import (
+            apply_fused_qwen35_offset_rmsnorm,
+        )
+
+        apply_fused_qwen35_offset_rmsnorm()
 
     gen_config = config.generator
     model_spec = config.model_spec

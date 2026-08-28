@@ -8,11 +8,35 @@ import torch
 import torch.nn.functional as F
 
 from torchtitan.experiments.rl.models.gdn_projection_ablation import (
+    _adjusted_offset_weight,
     _clear_merged_weight_cache,
+    _clear_offset_weight_cache,
     _merged_gdn_ba,
     _merged_gdn_qkvz,
     _merged_qwen35_qkv_gate,
 )
+
+
+def test_adjusted_offset_weight_matches_qwen35_semantics() -> None:
+    weight = torch.tensor([-0.5, 0.25, 1.0], dtype=torch.bfloat16)
+
+    actual = _adjusted_offset_weight(weight, torch.bfloat16)
+    expected = (weight.float() + 1.0).to(torch.bfloat16)
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_adjusted_offset_weight_cache_can_be_refreshed() -> None:
+    weight = torch.zeros(3, dtype=torch.bfloat16)
+    _adjusted_offset_weight(weight, torch.bfloat16)
+
+    with torch.no_grad():
+        weight.add_(1)
+    _clear_offset_weight_cache()
+
+    expected = (weight.float() + 1.0).to(torch.bfloat16)
+    actual = _adjusted_offset_weight(weight, torch.bfloat16)
+    torch.testing.assert_close(actual, expected)
 
 
 def test_merged_gdn_projections_match_separate_linears() -> None:
