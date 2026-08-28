@@ -53,13 +53,24 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+    causal_conv1d_fn as _vllm_causal_conv1d,
     causal_conv1d_update as _vllm_causal_conv1d_update,
 )
 from vllm.third_party.flash_linear_attention.ops import (
+    fused_post_conv_prep,
     fused_recurrent_gated_delta_rule_packed_decode,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+
+
+_USE_FLASHINFER_PREFILL = False
+
+
+def enable_flashinfer_gdn_prefill() -> None:
+    """Use vLLM's FlashInfer GDN path for non-batch-invariant pure prefill."""
+    global _USE_FLASHINFER_PREFILL
+    _USE_FLASHINFER_PREFILL = True
 
 
 class VLLMInnerGatedDeltaNet(Module, MambaBase):
@@ -236,6 +247,72 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
         ssm_state[slot_indices] = final_state.transpose(-1, -2).to(ssm_state.dtype)
         return output
 
+    def _run_flashinfer_prefill(
+        self,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        conv_weight: torch.Tensor,
+        conv_bias: torch.Tensor | None,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+        state_indices: torch.Tensor,
+        gdn_metadata: GDNAttentionMetadata,
+        output: torch.Tensor,
+    ) -> None:
+        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+            fi_chunk_gated_delta_rule,
+        )
+
+        prefill_state_indices = gdn_metadata.prefill_state_indices
+        prefill_has_initial_state = gdn_metadata.prefill_has_initial_state
+        prefill_query_start_loc = gdn_metadata.prefill_query_start_loc
+        assert prefill_state_indices is not None
+        assert prefill_has_initial_state is not None
+        assert prefill_query_start_loc is not None
+
+        conv_output = _vllm_causal_conv1d(
+            mixed_qkv.transpose(0, 1),
+            conv_weight,
+            conv_bias,
+            activation="silu",
+            conv_states=conv_state,
+            has_initial_state=gdn_metadata.has_initial_state,
+            cache_indices=state_indices,
+            query_start_loc=gdn_metadata.non_spec_query_start_loc,
+            metadata=gdn_metadata,
+        ).transpose(0, 1)
+        query, key, value, decay, update_gate = fused_post_conv_prep(
+            conv_output=conv_output,
+            a=a,
+            b=b,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            num_k_heads=self.local_num_k_heads,
+            head_k_dim=self.head_k_dim,
+            head_v_dim=self.head_v_dim,
+            apply_l2norm=True,
+            output_g_exp=False,
+        )
+
+        initial_state = ssm_state[prefill_state_indices]
+        initial_state[~prefill_has_initial_state, ...] = 0
+        recurrent_output, final_state = fi_chunk_gated_delta_rule(
+            q=query.unsqueeze(0),
+            k=key.unsqueeze(0),
+            v=value.unsqueeze(0),
+            g=decay.unsqueeze(0),
+            beta=update_gate.unsqueeze(0),
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=prefill_query_start_loc,
+            use_qk_l2norm_in_kernel=False,
+        )
+        ssm_state[prefill_state_indices] = final_state.to(ssm_state.dtype)
+        output[: mixed_qkv.shape[0]] = recurrent_output.squeeze(0).to(output.dtype)
+
     # The decorator makes this an eager graph-split point during breakable capture.
     # The caller-owned output has a stable address across graph replays.
     @eager_break_during_capture
@@ -271,7 +348,6 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         a = a[:num_actual_tokens]
         b = b[:num_actual_tokens]
-
         state_indices = gdn_metadata.non_spec_state_indices_tensor
         assert state_indices is not None
         ssm_state = self.kv_cache[1]
@@ -282,10 +358,33 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
             if is_conv_state_dim_first()
             else self.kv_cache[0].transpose(-1, -2)
         )
-        negative_exp_A = -torch.exp(A_log.float())
-        dt_bias = dt_bias.float()
         num_decodes = gdn_metadata.num_decodes
         num_prefills = gdn_metadata.num_prefills
+
+        if (
+            _USE_FLASHINFER_PREFILL
+            and num_decodes == 0
+            and num_prefills > 0
+            and not is_in_batch_invariant_mode()
+        ):
+            self._run_flashinfer_prefill(
+                mixed_qkv,
+                a,
+                b,
+                conv_weight,
+                conv_bias,
+                A_log,
+                dt_bias,
+                conv_state,
+                ssm_state,
+                state_indices,
+                gdn_metadata,
+                output,
+            )
+            return
+
+        negative_exp_A = -torch.exp(A_log.float())
+        dt_bias = dt_bias.float()
         num_decode_tokens = gdn_metadata.num_decode_tokens
         num_sequences = num_decodes + num_prefills
 

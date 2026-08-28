@@ -140,6 +140,11 @@ def _parse_args() -> argparse.Namespace:
         help="Merge Qwen3.5 GDN qkvz and ba input projections.",
     )
     overrides.add_argument(
+        "--flashinfer-gdn-prefill",
+        action="store_true",
+        help="Use vLLM's FlashInfer Qwen3.5 GDN prefill kernels.",
+    )
+    overrides.add_argument(
         "--fused-mlp",
         action="store_true",
         help="Use TorchTitan's fused SwiGLU gate+up projection override.",
@@ -289,6 +294,10 @@ def _build_engine(config, args: argparse.Namespace, *, max_num_seqs: int):
     if args.native:
         return LLMEngine.from_engine_args(EngineArgs(**engine_kwargs))
 
+    if args.flashinfer_gdn_prefill:
+        from torchtitan.experiments.rl.models.gdn import enable_flashinfer_gdn_prefill
+
+        enable_flashinfer_gdn_prefill()
     if args.fused_gdn_projections:
         from torchtitan.experiments.rl.models.gdn_projection_ablation import (
             apply_merged_gdn_projections,
@@ -554,6 +563,10 @@ def generate() -> None:
     if args.native:
         raise ValueError("--native is only supported with --benchmark")
 
+    if args.flashinfer_gdn_prefill:
+        from torchtitan.experiments.rl.models.gdn import enable_flashinfer_gdn_prefill
+
+        enable_flashinfer_gdn_prefill()
     if args.fused_gdn_projections:
         from torchtitan.experiments.rl.models.gdn_projection_ablation import (
             apply_merged_gdn_projections,
