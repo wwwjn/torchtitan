@@ -12,7 +12,7 @@ import spmd_types as spmd
 import torch
 import torch.nn.functional as F
 
-from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor import DTensor, Replicate, Shard
 
 
 _MERGED_WEIGHT_CACHE: dict[tuple[int, ...], torch.Tensor] = {}
@@ -21,6 +21,7 @@ _GDN_PATCHED = False
 _ATTENTION_PATCHED = False
 _GDN_NORM_PATCHED = False
 _OFFSET_NORM_PATCHED = False
+_RESIDUAL_NORM_PATCHED = False
 
 
 def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -170,6 +171,31 @@ def _fused_offset_rmsnorm_fake(
     eps: float,
 ) -> torch.Tensor:
     return torch.empty_like(x)
+
+
+@torch.library.custom_op(
+    "torchtitan::fused_add_offset_rmsnorm",
+    mutates_args=("x", "residual"),
+)
+def _fused_add_offset_rmsnorm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    adjusted_weight: torch.Tensor,
+    eps: float,
+) -> None:
+    from vllm import _custom_ops as ops
+
+    ops.fused_add_rms_norm(x, residual, adjusted_weight, eps)
+
+
+@_fused_add_offset_rmsnorm.register_fake
+def _fused_add_offset_rmsnorm_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    adjusted_weight: torch.Tensor,
+    eps: float,
+) -> None:
+    return None
 
 
 def _wrap_column_projection_output(
@@ -414,9 +440,108 @@ def apply_fused_qwen35_offset_rmsnorm() -> None:
     _OFFSET_NORM_PATCHED = True
 
 
+def _fused_add_qwen35_offset_rmsnorm(module, x, residual):
+    x_local = _local_tensor(x)
+    residual_local = _local_tensor(residual)
+    weight_local = _local_tensor(module.weight)
+    adjusted_weight = _adjusted_offset_weight(weight_local, x_local.dtype)
+    _fused_add_offset_rmsnorm(
+        x_local,
+        residual_local,
+        adjusted_weight,
+        module.eps,
+    )
+    return x, residual
+
+
+def apply_fused_qwen35_residual_norm() -> None:
+    """Thread residuals through Qwen3.5 layers for fused add plus RMSNorm."""
+    global _RESIDUAL_NORM_PATCHED
+    if _RESIDUAL_NORM_PATCHED:
+        return
+
+    apply_fused_qwen35_offset_rmsnorm()
+
+    from torchtitan.experiments.rl.models.vllm_wrapper import VLLMModelWrapper
+    from torchtitan.models.qwen3_5.model import Qwen35Model
+
+    original_forward = VLLMModelWrapper.forward
+
+    def forward(
+        self,
+        input_ids=None,
+        positions=None,
+        inputs_embeds=None,
+        **kwargs,
+    ):
+        if not isinstance(self.model, Qwen35Model):
+            return original_forward(
+                self,
+                input_ids=input_ids,
+                positions=positions,
+                inputs_embeds=inputs_embeds,
+                **kwargs,
+            )
+        if inputs_embeds is not None:
+            raise NotImplementedError("inputs_embeds not yet supported")
+        if input_ids is None:
+            raise ValueError("Either input_ids or inputs_embeds must be provided")
+
+        with self.spmd_context():
+            hidden_states = self.model.tok_embeddings(input_ids)
+            residual = None
+            for layer in self.model.layers.values():
+                if residual is None:
+                    residual = hidden_states
+                    hidden_states = layer.attention_norm(hidden_states)
+                else:
+                    hidden_states, residual = _fused_add_qwen35_offset_rmsnorm(
+                        layer.attention_norm,
+                        hidden_states,
+                        residual,
+                    )
+
+                if layer.full_attn:
+                    hidden_states = layer.attn(
+                        hidden_states,
+                        None,
+                        positions,
+                    )
+                else:
+                    hidden_states = layer.attn(hidden_states, None)
+
+                hidden_states, residual = _fused_add_qwen35_offset_rmsnorm(
+                    layer.ffn_norm,
+                    hidden_states,
+                    residual,
+                )
+                if layer.moe_enabled:
+                    hidden_states = layer.moe(hidden_states)
+                else:
+                    hidden_states = layer.feed_forward(hidden_states)
+
+            hidden_states, _ = _fused_add_qwen35_offset_rmsnorm(
+                self.model.norm,
+                hidden_states,
+                residual,
+            )
+
+        if isinstance(hidden_states, DTensor):
+            assert all(
+                isinstance(placement, Replicate)
+                for placement in hidden_states.placements
+            )
+            hidden_states = hidden_states._local_tensor
+        return hidden_states
+
+    VLLMModelWrapper.forward = forward
+    _RESIDUAL_NORM_PATCHED = True
+
+
 __all__ = [
     "apply_merged_gdn_projections",
     "apply_merged_qwen35_attention_projection",
     "apply_fused_gdn_rmsnorm_gate",
     "apply_fused_qwen35_offset_rmsnorm",
+    "apply_fused_qwen35_residual_norm",
 ]
