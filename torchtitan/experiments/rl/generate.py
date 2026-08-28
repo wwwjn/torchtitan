@@ -134,6 +134,11 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use the same NCCL all-reduce fallback for both benchmark paths.",
     )
+    overrides.add_argument(
+        "--fused-gdn-projections",
+        action="store_true",
+        help="Merge Qwen3.5 GDN qkvz and ba input projections.",
+    )
     return parser.parse_args()
 
 
@@ -243,6 +248,13 @@ def _build_engine(config, args: argparse.Namespace, *, max_num_seqs: int):
 
     if args.native:
         return LLMEngine.from_engine_args(EngineArgs(**engine_kwargs))
+
+    if args.fused_gdn_projections:
+        from torchtitan.experiments.rl.models.gdn_projection_ablation import (
+            apply_merged_gdn_projections,
+        )
+
+        apply_merged_gdn_projections()
 
     register_to_vllm(
         model_spec,
@@ -471,6 +483,13 @@ def generate() -> None:
         return
     if args.native:
         raise ValueError("--native is only supported with --benchmark")
+
+    if args.fused_gdn_projections:
+        from torchtitan.experiments.rl.models.gdn_projection_ablation import (
+            apply_merged_gdn_projections,
+        )
+
+        apply_merged_gdn_projections()
 
     gen_config = config.generator
     model_spec = config.model_spec

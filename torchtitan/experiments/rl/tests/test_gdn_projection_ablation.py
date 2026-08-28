@@ -1,0 +1,44 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+import torch
+import torch.nn.functional as F
+
+from torchtitan.experiments.rl.models.gdn_projection_ablation import (
+    _clear_merged_weight_cache,
+    _merged_gdn_ba,
+    _merged_gdn_qkvz,
+)
+
+
+def test_merged_gdn_projections_match_separate_linears() -> None:
+    torch.manual_seed(0)
+    x = torch.randn(7, 13)
+
+    qkvz_weights = tuple(torch.randn(size, 13) for size in (5, 5, 11, 11))
+    expected_qkvz = torch.cat([F.linear(x, weight) for weight in qkvz_weights], dim=-1)
+    actual_qkvz = _merged_gdn_qkvz(x, *qkvz_weights)
+    torch.testing.assert_close(actual_qkvz, expected_qkvz)
+
+    ba_weights = tuple(torch.randn(size, 13) for size in (3, 3))
+    expected_ba = torch.cat([F.linear(x, weight) for weight in ba_weights], dim=-1)
+    actual_ba = _merged_gdn_ba(x, *ba_weights)
+    torch.testing.assert_close(actual_ba, expected_ba)
+
+
+def test_merged_gdn_projection_cache_can_be_refreshed() -> None:
+    torch.manual_seed(0)
+    x = torch.randn(2, 4)
+    weights = tuple(torch.randn(3, 4) for _ in range(2))
+    _merged_gdn_ba(x, *weights)
+
+    with torch.no_grad():
+        weights[0].add_(1)
+    _clear_merged_weight_cache()
+
+    expected = torch.cat([F.linear(x, weight) for weight in weights], dim=-1)
+    actual = _merged_gdn_ba(x, *weights)
+    torch.testing.assert_close(actual, expected)
