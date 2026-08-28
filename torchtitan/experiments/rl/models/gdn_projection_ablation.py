@@ -17,11 +17,13 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 
 _MERGED_WEIGHT_CACHE: dict[tuple[int, ...], torch.Tensor] = {}
 _OFFSET_WEIGHT_CACHE: dict[tuple[int, torch.dtype], torch.Tensor] = {}
+_QK_ROPE_CACHE: dict[int, torch.Tensor] = {}
 _GDN_PATCHED = False
 _ATTENTION_PATCHED = False
 _GDN_NORM_PATCHED = False
 _OFFSET_NORM_PATCHED = False
 _RESIDUAL_NORM_PATCHED = False
+_QK_NORM_ROPE_PATCHED = False
 
 
 def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -55,6 +57,25 @@ def _adjusted_offset_weight(
         adjusted_weight = (weight.float() + 1.0).to(dtype).contiguous()
         _OFFSET_WEIGHT_CACHE[key] = adjusted_weight
     return adjusted_weight
+
+
+def _qwen35_text_rope_cache(
+    cache: torch.Tensor,
+    rotary_dim: int,
+) -> torch.Tensor:
+    key = cache.data_ptr()
+    packed_cache = _QK_ROPE_CACHE.get(key)
+    if packed_cache is None:
+        half_rotary = rotary_dim // 2
+        packed_cache = torch.cat(
+            (
+                cache[:, :half_rotary],
+                cache[:, rotary_dim : rotary_dim + half_rotary],
+            ),
+            dim=-1,
+        ).contiguous()
+        _QK_ROPE_CACHE[key] = packed_cache
+    return packed_cache
 
 
 @torch.library.custom_op("torchtitan::merged_gdn_qkvz", mutates_args=())
@@ -385,6 +406,89 @@ def apply_merged_qwen35_attention_projection() -> None:
     _ATTENTION_PATCHED = True
 
 
+def apply_fused_qwen35_qk_norm_rope() -> None:
+    """Fuse Qwen3.5 text QK normalization, partial RoPE, and gate split."""
+    global _QK_NORM_ROPE_PATCHED
+    if _QK_NORM_ROPE_PATCHED:
+        return
+
+    apply_merged_qwen35_attention_projection()
+
+    from torchtitan.models.qwen3_5.model import Qwen35Attention
+    from vllm.model_executor.layers.fused_qk_norm_rope import fused_qk_rmsnorm_rope_gate
+
+    original_forward = Qwen35Attention.forward
+
+    def forward(self, x_TD, attention_masks, positions=None):
+        if positions is None or positions.ndim != 1:
+            return original_forward(self, x_TD, attention_masks, positions)
+
+        num_tokens = x_TD.shape[0]
+        x = _local_tensor(x_TD)
+        projection_weights = (self.wq.weight, self.wk.weight, self.wv.weight)
+        local_projection_weights = tuple(map(_local_tensor, projection_weights))
+        qkv_gate = _merged_qwen35_qkv_gate(x, *local_projection_weights)
+        projection_sizes = tuple(weight.shape[0] for weight in local_projection_weights)
+        xq_gate, xk, xv = qkv_gate.split(projection_sizes, dim=-1)
+
+        q_weight = _adjusted_offset_weight(
+            _local_tensor(self.q_norm.weight),
+            torch.float32,
+        )
+        k_weight = _adjusted_offset_weight(
+            _local_tensor(self.k_norm.weight),
+            torch.float32,
+        )
+        rope_cache = _qwen35_text_rope_cache(
+            _local_tensor(self.rope.cache),
+            self.rotary_dim,
+        )
+        q, k, gate = fused_qk_rmsnorm_rope_gate(
+            xq_gate,
+            xk,
+            q_weight,
+            k_weight,
+            rope_cache,
+            _local_tensor(positions),
+            self.q_norm.eps,
+            xq_gate.shape[-1] // (2 * self.head_dim),
+            xk.shape[-1] // self.head_dim,
+            self.head_dim,
+            self.rotary_dim,
+        )
+
+        xq_TNH = _wrap_column_projection_output(
+            q.view(num_tokens, -1, self.head_dim),
+            projection_weights[0],
+        )
+        xk_TNH = _wrap_column_projection_output(
+            k.view(num_tokens, -1, self.head_dim),
+            projection_weights[1],
+        )
+        xv_TNH = _wrap_column_projection_output(
+            xv.view(num_tokens, -1, self.head_dim),
+            projection_weights[2],
+        )
+        gate_TNH = _wrap_column_projection_output(
+            gate.view(num_tokens, -1, self.head_dim),
+            projection_weights[0],
+        )
+
+        out_TNH = self.inner_attention(
+            xq_TNH,
+            xk_TNH,
+            xv_TNH,
+            attention_masks=attention_masks,
+            scale=self.scaling,
+            enable_gqa=self.enable_gqa,
+        ).contiguous()
+        out_TNH = out_TNH * torch.sigmoid(gate_TNH)
+        return self.wo(out_TNH.view(num_tokens, -1))
+
+    Qwen35Attention.forward = forward
+    _QK_NORM_ROPE_PATCHED = True
+
+
 def apply_fused_gdn_rmsnorm_gate() -> None:
     """Patch Qwen3.5 GDN output normalization to use vLLM's fused kernel."""
     global _GDN_NORM_PATCHED
@@ -541,6 +645,7 @@ def apply_fused_qwen35_residual_norm() -> None:
 __all__ = [
     "apply_merged_gdn_projections",
     "apply_merged_qwen35_attention_projection",
+    "apply_fused_qwen35_qk_norm_rope",
     "apply_fused_gdn_rmsnorm_gate",
     "apply_fused_qwen35_offset_rmsnorm",
     "apply_fused_qwen35_residual_norm",

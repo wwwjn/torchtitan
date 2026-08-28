@@ -150,6 +150,11 @@ def _parse_args() -> argparse.Namespace:
         help="Merge Qwen3.5 full-attention Q/gate, K, and V projections.",
     )
     overrides.add_argument(
+        "--fused-qk-norm-rope",
+        action="store_true",
+        help="Fuse Qwen3.5 text QK normalization, partial RoPE, and gate split.",
+    )
+    overrides.add_argument(
         "--fused-gdn-norm",
         action="store_true",
         help="Use vLLM's fused Qwen3.5 GDN RMSNorm+gate kernel.",
@@ -296,6 +301,12 @@ def _build_engine(config, args: argparse.Namespace, *, max_num_seqs: int):
         )
 
         apply_merged_qwen35_attention_projection()
+    if args.fused_qk_norm_rope:
+        from torchtitan.experiments.rl.models.gdn_projection_ablation import (
+            apply_fused_qwen35_qk_norm_rope,
+        )
+
+        apply_fused_qwen35_qk_norm_rope()
     if args.fused_gdn_norm:
         from torchtitan.experiments.rl.models.gdn_projection_ablation import (
             apply_fused_gdn_rmsnorm_gate,
@@ -555,6 +566,12 @@ def generate() -> None:
         )
 
         apply_merged_qwen35_attention_projection()
+    if args.fused_qk_norm_rope:
+        from torchtitan.experiments.rl.models.gdn_projection_ablation import (
+            apply_fused_qwen35_qk_norm_rope,
+        )
+
+        apply_fused_qwen35_qk_norm_rope()
     if args.fused_gdn_norm:
         from torchtitan.experiments.rl.models.gdn_projection_ablation import (
             apply_fused_gdn_rmsnorm_gate,

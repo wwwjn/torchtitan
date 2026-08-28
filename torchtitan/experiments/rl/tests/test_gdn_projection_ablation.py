@@ -14,6 +14,7 @@ from torchtitan.experiments.rl.models.gdn_projection_ablation import (
     _merged_gdn_ba,
     _merged_gdn_qkvz,
     _merged_qwen35_qkv_gate,
+    _qwen35_text_rope_cache,
 )
 
 
@@ -36,6 +37,17 @@ def test_adjusted_offset_weight_cache_can_be_refreshed() -> None:
 
     expected = (weight.float() + 1.0).to(torch.bfloat16)
     actual = _adjusted_offset_weight(weight, torch.bfloat16)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_qwen35_text_rope_cache_matches_vllm_layout() -> None:
+    cos = torch.arange(8, dtype=torch.float32).view(2, 4)
+    sin = cos + 10
+    torchtitan_cache = torch.cat((cos, cos, sin, sin), dim=-1)
+
+    actual = _qwen35_text_rope_cache(torchtitan_cache, rotary_dim=8)
+    expected = torch.cat((cos, sin), dim=-1)
+
     torch.testing.assert_close(actual, expected)
 
 
