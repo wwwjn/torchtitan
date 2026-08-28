@@ -967,6 +967,29 @@ def rl_grpo_qwen3_5_9b_varlen() -> Controller.Config:
     )
 
 
+def rl_grpo_qwen3_5_27b_varlen() -> Controller.Config:
+    """Qwen3.5-27B GRPO with trainer and generator TP=4 (8 GPUs)."""
+    config = rl_grpo_qwen3_5_9b_varlen()
+    config.model_spec = _qwen3_5_rl_model_registry("27B", attn_backend="varlen")
+    config.hf_assets_path = "torchtitan/experiments/rl/example_checkpoint/Qwen3.5-27B"
+    config.trainer = dataclasses.replace(
+        config.trainer,
+        parallelism=dataclasses.replace(
+            config.trainer.parallelism,
+            data_parallel_shard_degree=1,
+            tensor_parallel_degree=4,
+        ),
+    )
+    config.generator = dataclasses.replace(
+        config.generator,
+        parallelism=dataclasses.replace(
+            config.generator.parallelism,
+            tensor_parallel_degree=4,
+        ),
+    )
+    return config
+
+
 def rl_grpo_qwen3_5_9b_varlen_batch_invariant() -> Controller.Config:
     """On-policy, batch-invariant Qwen3.5-9B GRPO with matching TP=2."""
     config = rl_grpo_qwen3_5_9b_varlen()

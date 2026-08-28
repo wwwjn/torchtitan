@@ -32,17 +32,19 @@ from torchtitan.config import (
     TrainingConfig,
 )
 from torchtitan.distributed import utils as dist_utils
-from torchtitan.distributed.parallel_dims import ParallelDims
+from torchtitan.distributed.parallel_dims import ParallelDims, unfold_dp_axes
 from torchtitan.distributed.spmd_types import (
     current_spmd_mesh,
     dtensor_to_plain_tensor_state_dict,
     plain_tensor_to_dtensor_state_dict,
+    spmd_axes,
 )
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
 from torchtitan.experiments.rl.models.vllm_registry import InferenceParallelismConfig
 from torchtitan.models.common.attention import FusedQKVLinear
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.protocols.module import Module
+from torchtitan.protocols.sharding import resolve_placements
 from torchtitan.protocols.state_dict_adapter import BaseStateDictAdapter
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
@@ -144,7 +146,25 @@ class PlainToDTensorStateDictAdapter(BaseStateDictAdapter):
         )
 
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
-        return dtensor_to_plain_tensor_state_dict(self.adapter.from_hf(hf_state_dict))
+        state_dict = self.adapter.from_hf(hf_state_dict)
+        for name, value in state_dict.items():
+            if not isinstance(value, DTensor):
+                continue
+
+            layout = self.state_dict_layouts.get(name)
+            if layout is None:
+                raise KeyError(f"{name} is missing SPMD layout metadata")
+
+            mesh = self.parallel_dims.get_activated_mesh(
+                unfold_dp_axes(spmd_axes(layout))
+            )
+            if mesh is not None:
+                state_dict[name] = value.redistribute(
+                    device_mesh=mesh,
+                    placements=resolve_placements(layout, mesh),
+                )
+
+        return dtensor_to_plain_tensor_state_dict(state_dict)
 
     def get_hf_storage_reader(
         self,
