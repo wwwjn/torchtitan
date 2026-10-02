@@ -6,9 +6,15 @@
 
 """TorchTitan integration for the standalone Dist-MoE package."""
 
+from .inference_runtime import DistMoeInferenceRuntime
 from .mxfp8 import MXFP8DistMoeRoutedExperts
 from .routed_experts import DistMoeRoutedExperts
 from .runtime import DistMoeRuntime
 
 
-__all__ = ["DistMoeRoutedExperts", "DistMoeRuntime", "MXFP8DistMoeRoutedExperts"]
+__all__ = [
+    "DistMoeInferenceRuntime",
+    "DistMoeRoutedExperts",
+    "DistMoeRuntime",
+    "MXFP8DistMoeRoutedExperts",
+]

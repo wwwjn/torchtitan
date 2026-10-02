@@ -30,7 +30,7 @@ from __future__ import annotations
 from typing import Any
 
 from torchtitan.components.checkpointer import CheckpointManager
-from torchtitan.config import OverrideConfig
+from torchtitan.config import Configurable, OverrideConfig
 from torchtitan.distributed.local_compile import LocalCompileConfig
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
@@ -204,6 +204,7 @@ def register_to_vllm(
     local_compile_config: LocalCompileConfig,
     checkpointer_config: CheckpointManager.Config | None,
     override: OverrideConfig,
+    dist_moe_runtime: Configurable.Config | None = None,
 ) -> None:
     """Register the TorchTitan model class and the TorchTitan config parser with vLLM.
 
@@ -238,6 +239,8 @@ def register_to_vllm(
             weights arrive from TorchStore.
         override: Config overrides applied to the generator's model config before
             model finalization and build (empty ``OverrideConfig`` for no overrides).
+        dist_moe_runtime: ``DistMoeInferenceRuntime.Config`` for models with
+            Dist-MoE routed experts; ``None`` otherwise.
     """
     from torchtitan.rl.model.vllm_wrapper import VLLMModelWrapper
     from vllm.logger import init_logger
@@ -264,6 +267,7 @@ def register_to_vllm(
                 vllm_config=vllm_config,
                 prefix=prefix,
                 override=override,
+                dist_moe_runtime=dist_moe_runtime,
             )
 
     VLLMModelFromSpec.__name__ = VLLM_MODEL_NAME

@@ -22,6 +22,7 @@ import torch_remat as remat
 from torchtitan.models.common.linear import GroupedLinear
 from torchtitan.protocols.module import Module
 
+from .inference_runtime import DistMoeInferenceRuntime
 from .runtime import DistMoeRuntime
 
 
@@ -102,7 +103,7 @@ class DistMoeRoutedExperts(Module):
         self.inplace_wgrad_accum = config.inplace_wgrad_accum
         self.bf16_grouped_gemm_preset = config.bf16_grouped_gemm_preset
         self.block_scaled_config: dist_moe.BlockScaledConfig | None = None
-        self._runtime: DistMoeRuntime | None = None
+        self._runtime: DistMoeRuntime | DistMoeInferenceRuntime | None = None
 
     def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
         """Leave communication and activation storage to the shared runtime."""
@@ -158,6 +159,13 @@ class DistMoeRoutedExperts(Module):
         runtime = self._runtime
         if runtime is None:
             raise RuntimeError("Dist-MoE context is not initialized")
+        num_tokens = x_TD.shape[0]
+        if isinstance(runtime, DistMoeInferenceRuntime):
+            x_TD, topk_scores_TK, topk_expert_ids_TK = (
+                runtime.equalize_inputs(
+                    x_TD, topk_scores_TK, topk_expert_ids_TK
+                )
+            )
         w13_operand, w2_operand = self._weight_operands()
         execution_options = dist_moe.ExecutionOptions(
             inplace_wgrad_accum=self.inplace_wgrad_accum,
@@ -177,4 +185,4 @@ class DistMoeRoutedExperts(Module):
             options=execution_options,
         )
         remat.recompute_needs_tensor(out_TD)
-        return out_TD
+        return out_TD if out_TD.shape[0] == num_tokens else out_TD[:num_tokens]

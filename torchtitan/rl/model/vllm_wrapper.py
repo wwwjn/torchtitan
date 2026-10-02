@@ -24,7 +24,12 @@ from spmd_types import SpmdType
 from torch.distributed.checkpoint import HuggingFaceStorageReader
 from torch.distributed.tensor import DTensor, Replicate
 from torchtitan.components.checkpointer import CheckpointManager
-from torchtitan.config import apply_overrides, OverrideConfig, TrainingConfig
+from torchtitan.config import (
+    apply_overrides,
+    Configurable,
+    OverrideConfig,
+    TrainingConfig,
+)
 from torchtitan.distributed.local_compile import LocalCompileConfig
 from torchtitan.distributed.parallelism_context import ParallelismContext
 from torchtitan.distributed.spmd_types import (
@@ -302,6 +307,7 @@ class VLLMModelWrapper(Module):
         vllm_config: VllmConfig,
         prefix: str = "",
         override: OverrideConfig,
+        dist_moe_runtime: Configurable.Config | None = None,
     ):
         super().__init__()
 
@@ -368,6 +374,11 @@ class VLLMModelWrapper(Module):
             # spmd context.
             with self.parallelism_context.activate_spmd():
                 self.model.init_weights(buffer_device=None)
+        self._initialize_dist_moe_runtime(
+            dist_moe_runtime,
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            vllm_config.device_config.device,
+        )
         self._maybe_initial_load_weights()
 
         # Give each gpt-oss attention's vLLM backend its sink rescale.
@@ -379,6 +390,66 @@ class VLLMModelWrapper(Module):
         # batch-invariant mode, where its size-dependent algorithm breaks).
         if self.parallelism_context.tp_enabled and not is_in_batch_invariant_mode():
             _patch_vllm_all_reduce()
+
+    def _initialize_dist_moe_runtime(
+        self,
+        runtime_config: Configurable.Config | None,
+        max_num_batched_tokens: int,
+        device: torch.device,
+    ) -> None:
+        """Give the generator's Dist-MoE experts their annex context.
+
+        Dist-MoE experts refuse to run without a runtime. The trainer
+        gets one from ``TrainingEngine``; vLLM constructs this model directly,
+        so the wrapper builds the generator's. The context is built once, before
+        any CUDA-graph capture, so no per-forward Python work runs under
+        capture or replay.
+        """
+        try:
+            from torchtitan.models.common.dist_moe import (
+                DistMoeInferenceRuntime,
+                DistMoeRoutedExperts,
+            )
+        except ImportError:
+            # Without the dist_moe package no module can be one of its experts.
+            has_experts = False
+        else:
+            has_experts = any(
+                isinstance(module, DistMoeRoutedExperts)
+                for module in self.model.modules()
+            )
+        self._dist_moe_runtime = None
+        if not has_experts:
+            if runtime_config is not None:
+                logger.warning(
+                    "Ignoring dist_moe_runtime: the generator model has no "
+                    "Dist-MoE routed experts."
+                )
+            return
+        if runtime_config is None:
+            raise ValueError(
+                "The generator model uses Dist-MoE routed experts but no "
+                "dist_moe_runtime was registered. Pass a "
+                "DistMoeInferenceRuntime.Config to register_to_vllm()."
+            )
+        if not isinstance(runtime_config, DistMoeInferenceRuntime.Config):
+            raise TypeError(
+                "dist_moe_runtime must be a DistMoeInferenceRuntime.Config; got "
+                f"{type(runtime_config).__qualname__}. The generator runs no "
+                "backward, so DistMoeRuntime's activation slots would reserve "
+                "memory it can never use."
+            )
+        # An inference context rejects any operand carrying requires_grad, and
+        # it tests the attribute rather than whether grad is enabled.
+        for module in self.model.modules():
+            if isinstance(module, DistMoeRoutedExperts):
+                module.requires_grad_(False)
+        self._dist_moe_runtime = runtime_config.build(
+            model_parts=[self.model],
+            parallelism_context=self.parallelism_context,
+            device=device,
+            max_num_batched_tokens=max_num_batched_tokens,
+        )
 
     # TODO: followup with potentially adding extra kwarg ``sinks`` to vLLM attn
     def _inject_attention_sinks(self) -> None:
