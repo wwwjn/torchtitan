@@ -240,3 +240,19 @@ def test_copy_gdn_gate_params_refreshes_fp32_copies_in_place():
     assert inner.A_log_fp32 is first
     assert torch.equal(inner.A_log_fp32, (A_log * 2).float())
     assert torch.equal(inner.dt_bias_fp32, (dt_bias * 2).float())
+
+
+def test_resolve_chunk_backend():
+    from torchtitan.models.common.linear_attention import resolve_chunk_backend
+
+    q = torch.empty(1, dtype=torch.float32)
+    # Explicit choices pass through; "auto" on non-fp16/bf16 inputs stays "fused".
+    assert resolve_chunk_backend("fused", q) == "fused"
+    assert resolve_chunk_backend("cudnn", q) == "cudnn"
+    assert resolve_chunk_backend("auto", q) == "fused"
+
+
+def test_vllm_gdn_inherits_shared_chunk_backend():
+    from torchtitan.models.qwen3_5.gdn import GatedDeltaKernel
+
+    assert GatedDeltaKernel.Config().chunk_backend == "fused"

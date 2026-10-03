@@ -23,6 +23,12 @@ import torch.distributed as dist
 from spmd_types import SpmdType
 from torch.distributed.checkpoint import HuggingFaceStorageReader
 from torch.distributed.tensor import DTensor, Replicate
+from vllm.compilation.decorators import support_torch_compile
+from vllm.config import VllmConfig
+from vllm.distributed import tensor_model_parallel_all_reduce
+from vllm.logger import init_logger
+from vllm.utils import torch_utils as _torch_utils
+
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.config import apply_overrides, OverrideConfig, TrainingConfig
 from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
@@ -37,11 +43,6 @@ from torchtitan.protocols.module import Module
 from torchtitan.protocols.sharding import resolve_placements
 from torchtitan.protocols.state_dict_adapter import BaseStateDictAdapter
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
-from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig
-from vllm.distributed import tensor_model_parallel_all_reduce
-from vllm.logger import init_logger
-from vllm.utils import torch_utils as _torch_utils
 
 
 logger = init_logger(__name__)
@@ -102,6 +103,7 @@ def _replace_vllm_layer_configs(model_config):
                 head_k_dim=delta_net_cfg.key_head_dim,
                 head_v_dim=delta_net_cfg.value_head_dim,
                 conv_kernel_size=delta_net_cfg.conv_kernel_size,
+                kernel=delta_net_cfg.inner_gated_delta_net.kernel,
                 sharding_config=delta_net_cfg.inner_gated_delta_net.sharding_config,
             )
             new_layer_cfg = dataclasses.replace(

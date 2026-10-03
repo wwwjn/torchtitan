@@ -28,6 +28,10 @@ from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.distributed.spmd_types import spmd_dense_sp_enabled, spmd_mesh_group
 from torchtitan.models.common import Conv1d, Linear
 from torchtitan.models.common.attention import local_head_split, VarlenMetadata
+from torchtitan.models.common.linear_attention import (
+    ChunkBackend,
+    resolve_chunk_backend,
+)
 from torchtitan.models.common.norm import GatedRMSNorm
 from torchtitan.protocols.module import Module
 
@@ -207,10 +211,13 @@ class GatedDeltaKernel(Module):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
-        pass
+        chunk_backend: ChunkBackend = "fused"
+        """Attention Gym chunk kernel. "cudnn" (SM100/SM103, fp16/bf16, needs
+        ``attn-gym[cudnn]``) or "auto" (cuDNN there, "fused" elsewhere)."""
 
     def __init__(self, config: Config):
         super().__init__()
+        self.chunk_backend = config.chunk_backend
 
     def forward(
         self,
@@ -249,6 +256,9 @@ class GatedDeltaKernel(Module):
             cu_seqlens=cu_seqlens,
             scale=xq_BTHK.shape[-1] ** -0.5,
             impl="fused",
+            kernel_options={
+                "backend": resolve_chunk_backend(self.chunk_backend, xq_THK)
+            },
         )
         return output.squeeze(0)
 

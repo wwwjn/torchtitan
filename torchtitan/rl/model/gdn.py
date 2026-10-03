@@ -31,15 +31,6 @@ from attn_gym.linear import (
     recurrent_gdn,
     recurrent_gdn_decode,
 )
-
-from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
-from torchtitan.models.common.decoder import Decoder
-from torchtitan.protocols.module import Module
-from torchtitan.rl.model.linear_attention_backend import (
-    GDNExecutionPath,
-    TorchTitanGDNAttentionBackend,
-    TorchTitanGDNAttentionMetadata,
-)
 from vllm.config import get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.abstract import MambaBase
@@ -51,6 +42,17 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 )
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+
+from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
+from torchtitan.models.common.decoder import Decoder
+from torchtitan.models.common.linear_attention import resolve_chunk_backend
+from torchtitan.models.qwen3_5.gdn import GatedDeltaKernel
+from torchtitan.protocols.module import Module
+from torchtitan.rl.model.linear_attention_backend import (
+    GDNExecutionPath,
+    TorchTitanGDNAttentionBackend,
+    TorchTitanGDNAttentionMetadata,
+)
 
 
 class VLLMInnerGatedDeltaNet(Module, MambaBase):
@@ -70,6 +72,8 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
         num_v_heads: int
         head_k_dim: int
         head_v_dim: int
+        kernel: GatedDeltaKernel.Config | None = None
+        """The shared model's kernel config; its ``chunk_backend`` picks the prefill kernel."""
         conv_kernel_size: int = 4
 
     def __init__(self, config: Config) -> None:
@@ -93,6 +97,9 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
         self.head_k_dim = config.head_k_dim
         self.head_v_dim = config.head_v_dim
         self.conv_kernel_size = config.conv_kernel_size
+        self.chunk_backend = (
+            config.kernel.chunk_backend if config.kernel is not None else "fused"
+        )
         # fp32 copies for the decode kernel, which requires fp32; see `copy_gate_params`.
         self.A_log_fp32: torch.Tensor | None = None
         self.dt_bias_fp32: torch.Tensor | None = None
@@ -365,6 +372,9 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
                 cu_seqlens=cu_seqlens,
                 has_initial_state=has_initial_state,
                 scale=self.head_k_dim**-0.5,
+                kernel_options={
+                    "backend": resolve_chunk_backend(self.chunk_backend, query)
+                },
             )
         output.copy_(recurrent_output[0].to(output.dtype))
 
