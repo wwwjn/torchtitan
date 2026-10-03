@@ -27,23 +27,24 @@ import torch.nn.functional as F
 def route_padding_to_local_experts(
     topk_scores_TK: torch.Tensor,
     topk_expert_ids_TK: torch.Tensor,
-    num_valid_tokens: int | torch.Tensor,
+    padding_mask_T: torch.Tensor,
     *,
     first_local_expert: int,
     num_local_experts: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Zero the scores of rows ``>= num_valid_tokens`` and route them locally.
+    """Zero the scores of padding rows and route those rows to local experts.
 
-    Shapes stay static, and ``num_valid_tokens`` may be a device scalar, so the
-    operation is CUDA-graph capturable when that scalar lives at a stable
-    address. The local experts of an EP rank are the contiguous range
+    ``padding_mask_T`` is TorchTitan's padding convention: a bool ``(T,)`` that
+    is true for padding. Shapes stay static and the mask may be computed on
+    the device from a stable buffer, so the operation is CUDA-graph capturable.
+    The local experts of an EP rank are the contiguous range
     ``[first_local_expert, first_local_expert + num_local_experts)``, which is
     how Dist-MoE maps ``expert_id // num_local_experts`` to a rank.
 
     Args:
         topk_scores_TK: Routing weights.
         topk_expert_ids_TK: Selected global expert IDs.
-        num_valid_tokens: Rows ``[0, num_valid_tokens)`` are real tokens.
+        padding_mask_T: True for rows that are padding.
         first_local_expert: Global ID of this rank's first expert.
         num_local_experts: Number of experts this rank owns.
 
@@ -54,8 +55,8 @@ def route_padding_to_local_experts(
     device = topk_expert_ids_TK.device
     row_TK = torch.arange(num_tokens, device=device)[:, None]
     slot_TK = torch.arange(top_k, device=device)[None, :]
-    is_padding_T1 = row_TK >= num_valid_tokens
     local_ids_TK = first_local_expert + (row_TK * top_k + slot_TK) % num_local_experts
+    is_padding_T1 = padding_mask_T[:, None]
     expert_ids_TK = torch.where(
         is_padding_T1, local_ids_TK.to(topk_expert_ids_TK.dtype), topk_expert_ids_TK
     )
@@ -84,10 +85,11 @@ def pad_to_num_tokens(
     x_TD = F.pad(x_TD, (0, 0, 0, extra))
     topk_scores_TK = F.pad(topk_scores_TK, (0, 0, 0, extra))
     topk_expert_ids_TK = F.pad(topk_expert_ids_TK, (0, 0, 0, extra))
+    padding_mask_T = torch.arange(num_tokens, device=x_TD.device) >= num_valid_tokens
     topk_scores_TK, topk_expert_ids_TK = route_padding_to_local_experts(
         topk_scores_TK,
         topk_expert_ids_TK,
-        num_valid_tokens,
+        padding_mask_T,
         first_local_expert=first_local_expert,
         num_local_experts=num_local_experts,
     )

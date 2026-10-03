@@ -105,6 +105,9 @@ class DistMoeRoutedExperts(Module):
         self.block_scaled_config: dist_moe.BlockScaledConfig | None = None
         self._runtime: DistMoeRuntime | DistMoeInferenceRuntime | None = None
 
+    # MoE.forward hands the routed tokens' padding mask to experts that set this.
+    uses_padding_mask = True
+
     def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
         """Leave communication and activation storage to the shared runtime."""
         del buffer_device
@@ -141,6 +144,8 @@ class DistMoeRoutedExperts(Module):
         topk_scores_TK: torch.Tensor,
         topk_expert_ids_TK: torch.Tensor,
         num_local_tokens_per_expert_E: torch.Tensor,
+        *,
+        padding_mask_T: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run distributed dispatch, expert computation, and combine.
 
@@ -151,6 +156,9 @@ class DistMoeRoutedExperts(Module):
             num_local_tokens_per_expert_E: Router statistics retained by the
                 surrounding MoE module; Dist-MoE derives dispatch metadata from
                 the selected IDs.
+            padding_mask_T: Optional bool ``(T,)``, true for rows the caller
+                padded. Under an inference runtime those rows are routed to
+                this rank's own experts with zero score.
 
         Returns:
             Combined local expert output with shape ``(T, D)``.
@@ -161,6 +169,10 @@ class DistMoeRoutedExperts(Module):
             raise RuntimeError("Dist-MoE context is not initialized")
         num_tokens = x_TD.shape[0]
         if isinstance(runtime, DistMoeInferenceRuntime):
+            if padding_mask_T is not None:
+                topk_scores_TK, topk_expert_ids_TK = runtime.route_padding_locally(
+                    topk_scores_TK, topk_expert_ids_TK, padding_mask_T
+                )
             x_TD, topk_scores_TK, topk_expert_ids_TK = (
                 runtime.equalize_inputs(
                     x_TD, topk_scores_TK, topk_expert_ids_TK

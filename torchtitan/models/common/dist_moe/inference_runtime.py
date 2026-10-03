@@ -29,7 +29,10 @@ import torch
 import torch.distributed as dist
 
 from torchtitan.config import Configurable
-from torchtitan.models.common.dist_moe.padding import pad_to_num_tokens
+from torchtitan.models.common.dist_moe.padding import (
+    pad_to_num_tokens,
+    route_padding_to_local_experts,
+)
 
 
 if TYPE_CHECKING:
@@ -228,6 +231,29 @@ class DistMoeInferenceRuntime(Configurable):
         if step is not None:
             self._token_count_cache = (step, num_tokens, result)
         return result
+
+    def route_padding_locally(
+        self,
+        topk_scores_TK: torch.Tensor,
+        topk_expert_ids_TK: torch.Tensor,
+        padding_mask_T: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Route rows the caller already padded to this rank's own experts.
+
+        vLLM pads a step's tokens (tensor-parallel rounding, CUDA-graph capture
+        size, data-parallel equalization) before the model runs, so those rows
+        went through the real router and carry real, often identical, expert
+        IDs. Dist-MoE would dispatch them to whichever rank owns those experts.
+        ``padding_mask_T`` is true for such rows: their scores become zero and
+        their IDs local, so they cost no network traffic and no remote load.
+        """
+        return route_padding_to_local_experts(
+            topk_scores_TK,
+            topk_expert_ids_TK,
+            padding_mask_T,
+            first_local_expert=self.first_local_expert,
+            num_local_experts=self.num_local_experts,
+        )
 
     def equalize_inputs(
         self,

@@ -41,14 +41,13 @@ def _assert_padding_is_local(scores, ids, num_valid_tokens):
     assert torch.all(padding_ids < FIRST_LOCAL + NUM_LOCAL)
 
 
-@pytest.mark.parametrize("as_tensor", [False, True])
-def test_route_padding_rewrites_only_rows_past_num_valid_tokens(as_tensor):
+def test_route_padding_rewrites_only_masked_rows():
     scores, ids = _routing(10)
-    num_valid_tokens = torch.tensor(6) if as_tensor else 6
+    padding_mask_T = torch.arange(10) >= 6
     new_scores, new_ids = route_padding_to_local_experts(
         scores,
         ids,
-        num_valid_tokens,
+        padding_mask_T,
         first_local_expert=FIRST_LOCAL,
         num_local_experts=NUM_LOCAL,
     )
@@ -58,10 +57,47 @@ def test_route_padding_rewrites_only_rows_past_num_valid_tokens(as_tensor):
     assert new_ids.dtype == ids.dtype
 
 
+def test_route_padding_handles_a_mask_that_is_not_a_suffix():
+    # TP-sharded masks and DP/graph padding can leave padding anywhere in a shard.
+    scores, ids = _routing(8)
+    padding_mask_T = torch.tensor([0, 1, 0, 0, 1, 1, 0, 1], dtype=torch.bool)
+    new_scores, new_ids = route_padding_to_local_experts(
+        scores,
+        ids,
+        padding_mask_T,
+        first_local_expert=FIRST_LOCAL,
+        num_local_experts=NUM_LOCAL,
+    )
+    torch.testing.assert_close(new_scores[~padding_mask_T], scores[~padding_mask_T])
+    torch.testing.assert_close(new_ids[~padding_mask_T], ids[~padding_mask_T])
+    assert torch.all(new_scores[padding_mask_T] == 0)
+    assert torch.all(
+        (new_ids[padding_mask_T] >= FIRST_LOCAL)
+        & (new_ids[padding_mask_T] < FIRST_LOCAL + NUM_LOCAL)
+    )
+
+
+def test_route_padding_with_an_all_valid_mask_changes_nothing():
+    scores, ids = _routing(6)
+    new_scores, new_ids = route_padding_to_local_experts(
+        scores,
+        ids,
+        torch.zeros(6, dtype=torch.bool),
+        first_local_expert=FIRST_LOCAL,
+        num_local_experts=NUM_LOCAL,
+    )
+    torch.testing.assert_close(new_scores, scores)
+    torch.testing.assert_close(new_ids, ids)
+
+
 def test_route_padding_spreads_rows_over_all_local_experts():
     scores, ids = _routing(64)
     _, new_ids = route_padding_to_local_experts(
-        scores, ids, 0, first_local_expert=FIRST_LOCAL, num_local_experts=NUM_LOCAL
+        scores,
+        ids,
+        torch.ones(64, dtype=torch.bool),
+        first_local_expert=FIRST_LOCAL,
+        num_local_experts=NUM_LOCAL,
     )
     counts = torch.bincount(new_ids.flatten().long(), minlength=NUM_EXPERTS)
     local = counts[FIRST_LOCAL : FIRST_LOCAL + NUM_LOCAL]
@@ -121,6 +157,15 @@ def _runtime(max_local_input_tokens: int, group_max: int) -> DistMoeInferenceRun
     runtime.num_local_experts = NUM_LOCAL
     runtime._ep_group_max_tokens = lambda num_tokens: group_max  # type: ignore[method-assign]
     return runtime
+
+
+def test_runtime_routes_vllm_padded_rows_to_its_own_experts():
+    runtime = _runtime(max_local_input_tokens=32, group_max=0)
+    scores, ids = _routing(10)
+    padding_mask_T = torch.arange(10) >= 7
+    new_scores, new_ids = runtime.route_padding_locally(scores, ids, padding_mask_T)
+    _assert_padding_is_local(new_scores, new_ids, 7)
+    torch.testing.assert_close(new_ids[:7], ids[:7])
 
 
 def test_equalize_inputs_pads_to_group_max():

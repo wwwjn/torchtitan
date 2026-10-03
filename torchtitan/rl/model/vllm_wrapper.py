@@ -391,6 +391,17 @@ class VLLMModelWrapper(Module):
         if self.parallelism_context.tp_enabled and not is_in_batch_invariant_mode():
             _patch_vllm_all_reduce()
 
+    def set_num_valid_tokens(self, num_valid_tokens: int) -> None:
+        """Publish how many of this step's tokens are real, for the padding mask.
+
+        vLLM pads a step (tensor-parallel rounding, CUDA-graph capture size,
+        data-parallel equalization) before the model runs. The runner calls this
+        with the unpadded count. It is a device write with no host sync, so it
+        can run before every graph replay. A no-op for models without Dist-MoE.
+        """
+        if self._num_valid_tokens is not None:
+            self._num_valid_tokens.fill_(num_valid_tokens)
+
     def _initialize_dist_moe_runtime(
         self,
         runtime_config: Configurable.Config | None,
@@ -419,6 +430,7 @@ class VLLMModelWrapper(Module):
                 for module in self.model.modules()
             )
         self._dist_moe_runtime = None
+        self._num_valid_tokens: torch.Tensor | None = None
         if not has_experts:
             if runtime_config is not None:
                 logger.warning(
@@ -449,6 +461,13 @@ class VLLMModelWrapper(Module):
             parallelism_context=self.parallelism_context,
             device=device,
             max_num_batched_tokens=max_num_batched_tokens,
+        )
+        # The runner writes each step's real token count here before the forward
+        # runs, and forward builds the padding mask from it on the device, so
+        # CUDA-graph replay sees the current count. The address must stay fixed
+        # from before capture. Until a step publishes, every token counts as real.
+        self._num_valid_tokens = torch.full(
+            (), torch.iinfo(torch.int32).max, dtype=torch.int32, device=device
         )
 
     # TODO: followup with potentially adding extra kwarg ``sinks`` to vLLM attn
@@ -509,9 +528,19 @@ class VLLMModelWrapper(Module):
             # Get embeddings
             h = self.model.tok_embeddings(input_ids)
 
+            # Rows past the real token count are padding that vLLM added. Marking
+            # them lets Dist-MoE keep them off the network (TorchTitan's
+            # padding_mask convention: true for padding).
+            layer_kwargs = {}
+            if self._num_valid_tokens is not None:
+                layer_kwargs["padding_mask"] = (
+                    torch.arange(input_ids.shape[0], device=input_ids.device)
+                    >= self._num_valid_tokens
+                )
+
             # Pass through transformer layers
             for layer in self.model.layers.values():
-                h = layer(h, attention_masks=None, positions=positions)
+                h = layer(h, attention_masks=None, positions=positions, **layer_kwargs)
 
             h = self.model.norm(h)
         # Inference disables sequence parallelism, so final hidden states should
