@@ -127,7 +127,8 @@ class DistMoeInferenceRuntime(Configurable):
         )
         self.padding = LocalExpertPadding(
             ep_pg,
-            num_local_experts=self._modules[0].num_experts // dist.get_world_size(ep_pg),
+            num_local_experts=self._modules[0].num_experts
+            // dist.get_world_size(ep_pg),
             max_local_input_tokens=self.max_local_input_tokens,
         )
 

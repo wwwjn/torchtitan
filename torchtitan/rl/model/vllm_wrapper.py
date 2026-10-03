@@ -14,7 +14,7 @@ TorchTitan models for vLLM.
 import copy
 import dataclasses
 from functools import partial
-from typing import Any
+from typing import Any, cast
 
 import spmd_types as spmd
 
@@ -377,7 +377,7 @@ class VLLMModelWrapper(Module):
         self._initialize_dist_moe_runtime(
             dist_moe_runtime,
             vllm_config.scheduler_config.max_num_batched_tokens,
-            vllm_config.device_config.device,
+            cast(torch.device, vllm_config.device_config.device),
         )
         self._maybe_initial_load_weights()
 
@@ -402,6 +402,14 @@ class VLLMModelWrapper(Module):
         if self._num_valid_tokens is not None:
             self._num_valid_tokens.fill_(num_valid_tokens)
 
+    @staticmethod
+    def _ignore_dist_moe_runtime(runtime_config: Configurable.Config | None) -> None:
+        if runtime_config is not None:
+            logger.warning(
+                "Ignoring dist_moe_runtime: the generator model has no "
+                "Dist-MoE routed experts."
+            )
+
     def _initialize_dist_moe_runtime(
         self,
         runtime_config: Configurable.Config | None,
@@ -416,6 +424,8 @@ class VLLMModelWrapper(Module):
         any CUDA-graph capture, so no per-forward Python work runs under
         capture or replay.
         """
+        self._dist_moe_runtime = None
+        self._num_valid_tokens: torch.Tensor | None = None
         try:
             from torchtitan.models.common.dist_moe import (
                 DistMoeInferenceRuntime,
@@ -423,20 +433,12 @@ class VLLMModelWrapper(Module):
             )
         except ImportError:
             # Without the dist_moe package no module can be one of its experts.
-            has_experts = False
-        else:
-            has_experts = any(
-                isinstance(module, DistMoeRoutedExperts)
-                for module in self.model.modules()
-            )
-        self._dist_moe_runtime = None
-        self._num_valid_tokens: torch.Tensor | None = None
-        if not has_experts:
-            if runtime_config is not None:
-                logger.warning(
-                    "Ignoring dist_moe_runtime: the generator model has no "
-                    "Dist-MoE routed experts."
-                )
+            self._ignore_dist_moe_runtime(runtime_config)
+            return
+        if not any(
+            isinstance(module, DistMoeRoutedExperts) for module in self.model.modules()
+        ):
+            self._ignore_dist_moe_runtime(runtime_config)
             return
         if runtime_config is None:
             raise ValueError(

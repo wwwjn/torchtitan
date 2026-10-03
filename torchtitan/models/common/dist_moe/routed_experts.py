@@ -173,10 +173,8 @@ class DistMoeRoutedExperts(Module):
                 topk_scores_TK, topk_expert_ids_TK = runtime.padding.route(
                     topk_scores_TK, topk_expert_ids_TK, padding_mask_T
                 )
-            x_TD, topk_scores_TK, topk_expert_ids_TK = (
-                runtime.padding.equalize(
-                    x_TD, topk_scores_TK, topk_expert_ids_TK
-                )
+            x_TD, topk_scores_TK, topk_expert_ids_TK = runtime.padding.equalize(
+                x_TD, topk_scores_TK, topk_expert_ids_TK
             )
         w13_operand, w2_operand = self._weight_operands()
         execution_options = dist_moe.ExecutionOptions(

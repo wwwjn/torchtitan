@@ -187,9 +187,11 @@ class LocalExpertPadding:
             return cache[2]
         if self._count_group is None:
             # Collective: every rank reaches its first forward together.
-            self._count_group = dist.new_group(
+            group = dist.new_group(
                 ranks=dist.get_process_group_ranks(self.ep_pg), backend="gloo"
             )
+            assert isinstance(group, dist.ProcessGroup)
+            self._count_group = group
         count = torch.tensor([num_tokens], dtype=torch.int32)
         dist.all_reduce(count, op=dist.ReduceOp.MAX, group=self._count_group)
         result = int(count.item())

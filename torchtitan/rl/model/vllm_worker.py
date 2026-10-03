@@ -97,9 +97,7 @@ class TorchTitanGPUModelRunner(GPUModelRunner):
         equalization) only adds rows. The model turns the count into a padding
         mask, which keeps those rows off Dist-MoE's network.
         """
-        set_num_valid_tokens = getattr(
-            self.get_model(), "set_num_valid_tokens", None
-        )
+        set_num_valid_tokens = getattr(self.get_model(), "set_num_valid_tokens", None)
         if set_num_valid_tokens is not None:
             set_num_valid_tokens(num_tokens)
         return super()._determine_batch_execution_and_padding(

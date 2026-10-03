@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 import torch
@@ -151,7 +152,7 @@ def test_config_rejects_invalid_values(kwargs):
 
 
 def _padding(max_local_input_tokens: int, group_max: int) -> LocalExpertPadding:
-    padding = object.__new__(LocalExpertPadding)
+    padding = cast(Any, object.__new__(LocalExpertPadding))
     padding.max_local_input_tokens = max_local_input_tokens
     padding.first_local_expert = FIRST_LOCAL
     padding.num_local_experts = NUM_LOCAL
