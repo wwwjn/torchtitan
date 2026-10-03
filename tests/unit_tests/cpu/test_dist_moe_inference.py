@@ -34,21 +34,21 @@ def _routing(num_tokens: int, top_k: int = 4):
     return scores, ids
 
 
-def _assert_padding_is_local(scores, ids, num_valid):
-    assert torch.all(scores[num_valid:] == 0)
-    padding_ids = ids[num_valid:]
+def _assert_padding_is_local(scores, ids, num_valid_tokens):
+    assert torch.all(scores[num_valid_tokens:] == 0)
+    padding_ids = ids[num_valid_tokens:]
     assert torch.all(padding_ids >= FIRST_LOCAL)
     assert torch.all(padding_ids < FIRST_LOCAL + NUM_LOCAL)
 
 
 @pytest.mark.parametrize("as_tensor", [False, True])
-def test_route_padding_rewrites_only_rows_past_num_valid(as_tensor):
+def test_route_padding_rewrites_only_rows_past_num_valid_tokens(as_tensor):
     scores, ids = _routing(10)
-    num_valid = torch.tensor(6) if as_tensor else 6
+    num_valid_tokens = torch.tensor(6) if as_tensor else 6
     new_scores, new_ids = route_padding_to_local_experts(
         scores,
         ids,
-        num_valid,
+        num_valid_tokens,
         first_local_expert=FIRST_LOCAL,
         num_local_experts=NUM_LOCAL,
     )
