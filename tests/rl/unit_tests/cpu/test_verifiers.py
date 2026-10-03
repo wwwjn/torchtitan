@@ -287,3 +287,33 @@ def test_generation_server_requires_group_id() -> None:
 def test_parse_sampling_config_requires_stop_token_ids() -> None:
     with pytest.raises(ValueError, match="stop_token_ids"):
         _parse_sampling_config({"temperature": 1.0})
+
+
+def test_max_concurrent_rollouts_caps_running_rollouts() -> None:
+    rollouter = VerifiersRollouter.__new__(VerifiersRollouter)
+    rollouter._verifiers_config = SimpleNamespace(max_concurrent_rollouts=2)
+    rollouter._rollout_permits = None
+    running = peak = 0
+
+    async def fake_rollout(**kwargs):
+        nonlocal running, peak
+        running += 1
+        peak = max(peak, running)
+        await asyncio.sleep(0.01)
+        running -= 1
+        return kwargs["rollout_id"]
+
+    rollouter._run_single_rollout_unbounded = fake_rollout
+
+    async def run() -> list[int]:
+        return await asyncio.gather(
+            *(
+                rollouter._run_single_rollout(
+                    sample=None, sampling=None, group_id=0, rollout_id=i
+                )
+                for i in range(6)
+            )
+        )
+
+    assert asyncio.run(run()) == list(range(6))
+    assert peak == 2

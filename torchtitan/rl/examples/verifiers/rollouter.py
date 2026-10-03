@@ -123,6 +123,12 @@ class VerifiersRollouter(Rollouter):
         connection_timeout_sec: float = 120.0
         """Maximum time to wait for the Verifiers server to become healthy."""
 
+        max_concurrent_rollouts: int | None = None
+        """Cap on rollouts running at once across all groups (prime-rl's per-episode permits).
+        ``None`` leaves only the controller's group-slot cap. With more group slots than
+        ``max_concurrent_rollouts / group_size``, a finished rollout's permit goes to the next
+        group instead of idling until its siblings finish."""
+
         def __post_init__(self) -> None:
             Rollouter.Config.__post_init__(self)
             configured_taskset = self.verifiers_env_server.environment.taskset
@@ -148,6 +154,11 @@ class VerifiersRollouter(Rollouter):
                 raise ValueError("renderer_multiplex must be positive")
             if self.connection_timeout_sec <= 0:
                 raise ValueError("connection_timeout_sec must be positive")
+            if (
+                self.max_concurrent_rollouts is not None
+                and self.max_concurrent_rollouts <= 0
+            ):
+                raise ValueError("max_concurrent_rollouts must be positive")
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
@@ -158,6 +169,8 @@ class VerifiersRollouter(Rollouter):
         self._generation_server: GenerationServer | None = None
         self._verifiers_env_client: VerifiersEnvClient | None = None
         self._verifiers_train_client_config: VerifiersTrainClientConfig | None = None
+        # Created on first use, inside the controller's event loop.
+        self._rollout_permits: asyncio.Semaphore | None = None
 
     async def setup_async(
         self,
@@ -275,6 +288,32 @@ class VerifiersRollouter(Rollouter):
         rollout_id: int,
     ) -> Rollout:
         """Send one task to Verifiers and convert its trace to a rollout."""
+        limit = self._verifiers_config.max_concurrent_rollouts
+        if limit is None:
+            return await self._run_single_rollout_unbounded(
+                sample=sample,
+                sampling=sampling,
+                group_id=group_id,
+                rollout_id=rollout_id,
+            )
+        if self._rollout_permits is None:
+            self._rollout_permits = asyncio.Semaphore(limit)
+        async with self._rollout_permits:
+            return await self._run_single_rollout_unbounded(
+                sample=sample,
+                sampling=sampling,
+                group_id=group_id,
+                rollout_id=rollout_id,
+            )
+
+    async def _run_single_rollout_unbounded(
+        self,
+        *,
+        sample: object,
+        sampling: SamplingConfig,
+        group_id: int,
+        rollout_id: int,
+    ) -> Rollout:
         if not isinstance(sample, VerifiersTaskSample):
             raise TypeError("Verifiers requires a VerifiersTaskSample")
         if (

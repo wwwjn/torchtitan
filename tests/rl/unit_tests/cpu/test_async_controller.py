@@ -572,6 +572,27 @@ def test_take_finalized_does_not_release_active_slot() -> None:
     asyncio.run(run())
 
 
+def test_release_slot_on_take_frees_slot_when_batcher_takes() -> None:
+    async def run() -> None:
+        buffer = RolloutGroupWorkBuffer.Config(release_slot_on_take=True).build(
+            max_active_rollout_groups=1, window_size=None
+        )
+        assert await buffer.wait_for_slot()
+        await buffer.add_work(RolloutGroupWork(group_id=0, sample=object()))
+        await buffer.finalize_work(RolloutGroup(group_id=0, rollouts=[]))
+
+        waiter = asyncio.create_task(buffer.wait_for_slot())
+        await asyncio.sleep(0)
+        assert not waiter.done()  # finalized but not taken: still holds its slot
+
+        await buffer.take_finalized()
+        assert await waiter
+        # The trainer's later release is a no-op instead of an over-release error.
+        await buffer.release_active_groups(1, reason="trained")
+
+    asyncio.run(run())
+
+
 def test_untrainable_group_releases_before_training() -> None:
     async def run() -> None:
         buffer = RolloutGroupWorkBuffer.Config().build(
