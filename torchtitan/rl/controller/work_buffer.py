@@ -85,11 +85,20 @@ class RolloutGroupWorkBuffer(Configurable):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
-        """No tunables: capacity and window size are derived by the controller."""
+        """Capacity and window size are derived by the controller."""
+
+        release_slot_on_take: bool = False
+        """Free a group's active slot when the batcher takes it, instead of after the trainer's
+        weight pull. Finished groups waiting for their batch then stop holding slots, and slots
+        return one group at a time instead of a whole step at once, so rollouts keep the
+        generators busy. The cost is the guarantee above: up to one extra step of groups can
+        start under the current policy and finish older than ``target_offpolicy_steps``. The
+        ``release_active_groups`` calls become no-ops."""
 
     def __init__(
         self, config: Config, *, max_active_rollout_groups: int, window_size: int | None
     ) -> None:
+        self._release_slot_on_take = config.release_slot_on_take
         self._max_active_rollout_groups = max_active_rollout_groups
         self._window_size = window_size
         self._active_rollout_groups = 0
@@ -201,6 +210,9 @@ class RolloutGroupWorkBuffer(Configurable):
                         if work.state is not _RolloutGroupWorkState.FINALIZED:
                             continue
                         del self._work_by_group_id[group_id]
+                        if self._release_slot_on_take:
+                            self._active_rollout_groups -= 1
+                            sl.log_trace_scalar({"rollout_buffer/released/taken": 1.0})
                         self._condition.notify_all()
                         return work.rollout_group
                 await self._condition.wait()  # nothing finalized inside the window -> stall
@@ -221,7 +233,8 @@ class RolloutGroupWorkBuffer(Configurable):
         """
         if count < 0:
             raise ValueError(f"count must be non-negative, got {count}")
-        if count == 0:
+        if count == 0 or self._release_slot_on_take:
+            # With release_slot_on_take, take_finalized already freed these slots.
             return
         async with self._condition:
             if count > self._active_rollout_groups:
