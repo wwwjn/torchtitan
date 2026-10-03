@@ -35,6 +35,7 @@ from torchtitan.components.optim import AdamW
 from torchtitan.config import CommConfig, DebugConfig
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.activation_checkpoint import FullAC
+from torchtitan.models.common.attention import FlexInnerAttention, VarlenInnerAttention
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.distributed.routing.intra_generator import IntraGeneratorRouter
 from torchtitan.rl.distributed.routing.strategies import LeastLoadedRoutingStrategy
@@ -47,6 +48,7 @@ from torchtitan.rl.generator import (
     LoopDecision,
     RequestDispatcher,
     SamplingConfig,
+    vllm_attention_backend,
     VLLMCudaGraphConfig,
     VLLMGenerator,
 )
@@ -795,3 +797,27 @@ def test_vllm_uneven_decode_tp_padding():
         torch.cuda.empty_cache()
         if temporary_dump_folder is not None:
             shutil.rmtree(temporary_dump_folder, ignore_errors=True)
+
+
+def test_batch_invariant_requires_torchtitan_attention():
+    with pytest.raises(ValueError, match="attention_backend"):
+        VLLMGenerator.Config(
+            parallelism=_PARALLELISM,
+            debug=DebugConfig(batch_invariant=True),
+            attention_backend="flashinfer",
+        )
+
+
+def test_vllm_attention_backend_mapping():
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    varlen = VarlenInnerAttention.Config()
+    flex = FlexInnerAttention.Config()
+    assert vllm_attention_backend(varlen, "torchtitan") == AttentionBackendEnum.CUSTOM
+    assert (
+        vllm_attention_backend(varlen, "flashinfer") == AttentionBackendEnum.FLASHINFER
+    )
+    assert (
+        vllm_attention_backend(flex, "flashinfer")
+        == AttentionBackendEnum.FLEX_ATTENTION
+    )
