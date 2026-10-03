@@ -1448,6 +1448,7 @@ class VLLMGenerator(Configurable):
         # With CPU prefetch, model_sd instead contains the prefetched CPU tensors,
         # and this load performs the local CPU-to-GPU copy.
         model.model.load_state_dict(model_sd, strict=True)
+        model.copy_gdn_gate_params()
         self.policy_version = version
         if self.config.reset_kv_cache_on_weight_sync:
             # Always reset running requests too: the only reason to reset is a strict

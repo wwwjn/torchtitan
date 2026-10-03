@@ -221,3 +221,22 @@ def test_hf_adapter_restores_local_shards(tmp_path: Path) -> None:
         nprocs=2,
         join=True,
     )
+
+
+def test_copy_gdn_gate_params_refreshes_fp32_copies_in_place():
+    """The fp32 decode copies of A_log/dt_bias are created once, then updated in place."""
+    from torchtitan.rl.model.gdn import VLLMInnerGatedDeltaNet
+
+    inner = VLLMInnerGatedDeltaNet.__new__(VLLMInnerGatedDeltaNet)
+    torch.nn.Module.__init__(inner)
+    inner.A_log_fp32 = inner.dt_bias_fp32 = None
+    A_log = torch.randn(4, dtype=torch.bfloat16)
+    dt_bias = torch.randn(4, dtype=torch.bfloat16)
+    inner.copy_gate_params(A_log, dt_bias)
+    first = inner.A_log_fp32
+    assert first.dtype == torch.float32 and torch.equal(first, A_log.float())
+    inner.copy_gate_params(A_log * 2, dt_bias * 2)
+    # Same storage: decode CUDA graphs captured the original address.
+    assert inner.A_log_fp32 is first
+    assert torch.equal(inner.A_log_fp32, (A_log * 2).float())
+    assert torch.equal(inner.dt_bias_fp32, (dt_bias * 2).float())

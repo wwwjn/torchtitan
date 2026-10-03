@@ -152,7 +152,8 @@ def test_prefetch_model_state_dict_updates_staging_buffers_in_place():
             model=SimpleNamespace(
                 state_dict=lambda: {"weight": "old"},
                 load_state_dict=load_state_dict,
-            )
+            ),
+            copy_gdn_gate_params=lambda: None,
         )
         generator._rank = 1
         generator.config.reset_kv_cache_on_weight_sync = False
@@ -399,7 +400,8 @@ def test_weight_sync_reset_kv_cache_flag_controls_cache_reset(
             model=SimpleNamespace(
                 state_dict=lambda: {},
                 load_state_dict=lambda state_dict, strict: None,
-            )
+            ),
+            copy_gdn_gate_params=lambda: None,
         )
         monkeypatch.setattr(generator, "_get_model", lambda: model)
 
