@@ -21,6 +21,7 @@ Shape suffixes: ``T`` local tokens, ``K`` selected experts, ``D`` model dim.
 """
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 
@@ -94,3 +95,104 @@ def pad_to_num_tokens(
         num_local_experts=num_local_experts,
     )
     return x_TD, topk_scores_TK, topk_expert_ids_TK
+
+
+def _engine_step() -> object | None:
+    """vLLM's per-step forward context, or None outside a vLLM forward."""
+    try:
+        from vllm.forward_context import get_forward_context
+
+        return get_forward_context()
+    except Exception:  # noqa: BLE001  (vLLM absent or not inside a forward)
+        return None
+
+
+class LocalExpertPadding:
+    """Keep padding rows on the rank that sends them, for one EP group.
+
+    Args:
+        ep_pg: The expert-parallel process group.
+        num_local_experts: Experts per EP rank (a contiguous block per rank).
+        max_local_input_tokens: Planned local token count of the context.
+    """
+
+    def __init__(
+        self,
+        ep_pg: dist.ProcessGroup,
+        *,
+        num_local_experts: int,
+        max_local_input_tokens: int,
+    ) -> None:
+        self.ep_pg = ep_pg
+        self.num_local_experts = num_local_experts
+        self.first_local_expert = dist.get_rank(ep_pg) * num_local_experts
+        self.max_local_input_tokens = max_local_input_tokens
+        self._count_group: dist.ProcessGroup | None = None
+        self._count_cache: tuple[object, int, int] | None = None
+
+    def route(
+        self,
+        topk_scores_TK: torch.Tensor,
+        topk_expert_ids_TK: torch.Tensor,
+        padding_mask_T: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Route rows the caller already padded (vLLM) to this rank's experts."""
+        return route_padding_to_local_experts(
+            topk_scores_TK,
+            topk_expert_ids_TK,
+            padding_mask_T,
+            first_local_expert=self.first_local_expert,
+            num_local_experts=self.num_local_experts,
+        )
+
+    def equalize(
+        self,
+        x_TD: torch.Tensor,
+        topk_scores_TK: torch.Tensor,
+        topk_expert_ids_TK: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pad this rank to the EP group's largest token count.
+
+        Dist-MoE needs the same token count on every EP rank. vLLM only
+        equalizes DP ranks in CUDA-graph-synced steps, so eager steps arrive
+        unequal. Callers slice the output back to the original count.
+        """
+        target = self._group_max_tokens(x_TD.shape[0])
+        if target > self.max_local_input_tokens:
+            raise ValueError(
+                f"Dist-MoE EP group holds {target} local tokens, above the planned "
+                f"{self.max_local_input_tokens}"
+            )
+        return pad_to_num_tokens(
+            x_TD,
+            topk_scores_TK,
+            topk_expert_ids_TK,
+            target,
+            first_local_expert=self.first_local_expert,
+            num_local_experts=self.num_local_experts,
+        )
+
+    def _group_max_tokens(self, num_tokens: int) -> int:
+        """Largest local token count over the EP group, once per engine step.
+
+        One CPU all-reduce on a private gloo group, cached on vLLM's forward
+        context. Under CUDA-graph capture the count is already DP-padded and a
+        host collective may not run.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            return num_tokens
+        step = _engine_step()
+        cache = self._count_cache
+        if step is not None and cache and cache[0] is step and cache[1] == num_tokens:
+            return cache[2]
+        if self._count_group is None:
+            # Collective: every rank reaches its first forward together.
+            self._count_group = dist.new_group(
+                ranks=dist.get_process_group_ranks(self.ep_pg), backend="gloo"
+            )
+        count = torch.tensor([num_tokens], dtype=torch.int32)
+        dist.all_reduce(count, op=dist.ReduceOp.MAX, group=self._count_group)
+        result = int(count.item())
+        if step is not None:
+            self._count_cache = (step, num_tokens, result)
+        return result

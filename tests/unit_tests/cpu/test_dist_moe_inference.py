@@ -15,6 +15,7 @@ pytest.importorskip(
 )
 from torchtitan.models.common.dist_moe.inference_runtime import DistMoeInferenceRuntime
 from torchtitan.models.common.dist_moe.padding import (
+    LocalExpertPadding,
     pad_to_num_tokens,
     route_padding_to_local_experts,
 )
@@ -142,7 +143,6 @@ def test_pad_to_num_tokens_is_identity_when_equal_and_rejects_shrinking():
         {"scratch_capacity_factor": 0.0},
         {"scratch_capacity_factor": float("inf")},
         {"vmm_capacity_factor": 0.0},
-        {"num_sms": 0},
     ],
 )
 def test_config_rejects_invalid_values(kwargs):
@@ -150,39 +150,39 @@ def test_config_rejects_invalid_values(kwargs):
         DistMoeInferenceRuntime.Config(**kwargs)
 
 
-def _runtime(max_local_input_tokens: int, group_max: int) -> DistMoeInferenceRuntime:
-    runtime = object.__new__(DistMoeInferenceRuntime)
-    runtime.max_local_input_tokens = max_local_input_tokens
-    runtime.first_local_expert = FIRST_LOCAL
-    runtime.num_local_experts = NUM_LOCAL
-    runtime._ep_group_max_tokens = lambda num_tokens: group_max  # type: ignore[method-assign]
-    return runtime
+def _padding(max_local_input_tokens: int, group_max: int) -> LocalExpertPadding:
+    padding = object.__new__(LocalExpertPadding)
+    padding.max_local_input_tokens = max_local_input_tokens
+    padding.first_local_expert = FIRST_LOCAL
+    padding.num_local_experts = NUM_LOCAL
+    padding._group_max_tokens = lambda num_tokens: group_max  # type: ignore[method-assign]
+    return padding
 
 
-def test_runtime_routes_vllm_padded_rows_to_its_own_experts():
-    runtime = _runtime(max_local_input_tokens=32, group_max=0)
+def test_padding_routes_vllm_padded_rows_to_its_own_experts():
+    padding = _padding(max_local_input_tokens=32, group_max=0)
     scores, ids = _routing(10)
     padding_mask_T = torch.arange(10) >= 7
-    new_scores, new_ids = runtime.route_padding_locally(scores, ids, padding_mask_T)
+    new_scores, new_ids = padding.route(scores, ids, padding_mask_T)
     _assert_padding_is_local(new_scores, new_ids, 7)
     torch.testing.assert_close(new_ids[:7], ids[:7])
 
 
-def test_equalize_inputs_pads_to_group_max():
-    runtime = _runtime(max_local_input_tokens=32, group_max=12)
+def test_equalize_pads_to_group_max():
+    padding = _padding(max_local_input_tokens=32, group_max=12)
     x = torch.randn(7, 8)
     scores, ids = _routing(7)
-    new_x, new_scores, new_ids = runtime.equalize_inputs(x, scores, ids)
+    new_x, new_scores, new_ids = padding.equalize(x, scores, ids)
     assert new_x.shape[0] == new_scores.shape[0] == new_ids.shape[0] == 12
     _assert_padding_is_local(new_scores, new_ids, 7)
 
 
-def test_equalize_inputs_rejects_group_above_planned_tokens():
-    runtime = _runtime(max_local_input_tokens=8, group_max=12)
+def test_equalize_rejects_group_above_planned_tokens():
+    padding = _padding(max_local_input_tokens=8, group_max=12)
     x = torch.randn(7, 8)
     scores, ids = _routing(7)
     with pytest.raises(ValueError, match="above the planned"):
-        runtime.equalize_inputs(x, scores, ids)
+        padding.equalize(x, scores, ids)
 
 
 def test_runtime_rejects_pipeline_parallelism_and_missing_experts():
@@ -193,5 +193,5 @@ def test_runtime_rejects_pipeline_parallelism_and_missing_experts():
             model_parts=[torch.nn.Linear(2, 2)],
             parallelism_context=context,  # type: ignore[arg-type]
             device=torch.device("cpu"),
-            max_num_batched_tokens=8,
+            num_tokens_per_microbatch_per_dp_rank=8,
         )

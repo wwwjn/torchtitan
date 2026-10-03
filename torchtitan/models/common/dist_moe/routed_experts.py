@@ -170,11 +170,11 @@ class DistMoeRoutedExperts(Module):
         num_tokens = x_TD.shape[0]
         if isinstance(runtime, DistMoeInferenceRuntime):
             if padding_mask_T is not None:
-                topk_scores_TK, topk_expert_ids_TK = runtime.route_padding_locally(
+                topk_scores_TK, topk_expert_ids_TK = runtime.padding.route(
                     topk_scores_TK, topk_expert_ids_TK, padding_mask_T
                 )
             x_TD, topk_scores_TK, topk_expert_ids_TK = (
-                runtime.equalize_inputs(
+                runtime.padding.equalize(
                     x_TD, topk_scores_TK, topk_expert_ids_TK
                 )
             )

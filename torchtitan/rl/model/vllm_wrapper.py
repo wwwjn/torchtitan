@@ -460,7 +460,7 @@ class VLLMModelWrapper(Module):
             model_parts=[self.model],
             parallelism_context=self.parallelism_context,
             device=device,
-            max_num_batched_tokens=max_num_batched_tokens,
+            num_tokens_per_microbatch_per_dp_rank=max_num_batched_tokens,
         )
         # The runner writes each step's real token count here before the forward
         # runs, and forward builds the padding mask from it on the device, so
