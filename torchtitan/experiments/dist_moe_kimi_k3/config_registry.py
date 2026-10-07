@@ -6,8 +6,12 @@
 
 """Production-shaped Kimi K3 recipes using upstream Dist-MoE integration."""
 
+import os
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from typing import Any
 
+import numpy as np
 import spmd_types as spmd
 import torch
 
@@ -19,17 +23,26 @@ from torchtitan_recipes.tests.models.kimi_k3 import (
 
 from torchtitan.components.data import (
     ConcatThenSplitPackingConfig,
+    DatasetBuildContext,
     GrainDataLoader,
     HuggingFaceStreamingSource,
+    SampleProcessor,
     SingleDatasetConfig,
+    TextSequence,
 )
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.optim.optimizer import DistMuon
-from torchtitan.config.transform import apply_transforms
+from torchtitan.config.transform import apply_transforms, ContextParallelTransform
 from torchtitan.config.transform.dist_moe import DistMoeTransform
 from torchtitan.distributed.activation_checkpoint import RegionAC
 from torchtitan.distributed.spmd_types import spmd_sparse_mesh
 from torchtitan.hf_datasets.text_datasets import TextProcessor
+from torchtitan.models.common.attention import VarlenInnerAttention
+from torchtitan.models.common.attention.cp_attention import (
+    UlyssesCPVarlenInnerAttention,
+)
+from torchtitan.models.common.attention.cp_kda import ContextParallelInnerKDA
+from torchtitan.models.common.attention.kda import InnerKDA
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.common.dist_moe.runtime import DistMoeRuntime
 from torchtitan.models.common.moe import MoE, RoundRobinTokenChoiceTopKRouter
@@ -43,6 +56,41 @@ _KIMI_K3_MANIFOLD_HF_ASSETS_PATH = (
 _KIMI_K3_C4_DATA_FILES = (
     "/mnt/torchtrain_datasets/tree/shuhuay/c4/en/c4-train.*.json.gz"
 )
+_KIMI_K3_LONG_CONTEXT_DATA_ROOT = os.environ.get(
+    "KIMI_K3_LONG_CONTEXT_DATA_ROOT",
+    (
+        "/mnt/torchtrain_datasets/tree/shuhuay/k3-oss/datasets/"
+        "c4-kimi-k3-long-context-v1"
+    ),
+)
+
+
+class _PretokenizedLongContextProcessor(SampleProcessor):
+    """Build one next-token sequence from an exact-length tokenized row."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(SampleProcessor.Config):
+        pass
+
+    def __init__(self, config: Config, *, context: DatasetBuildContext) -> None:
+        del config
+        self._max_context_length = context.max_context_length
+
+    def __call__(
+        self, sample: Mapping[str, Any], rng: np.random.Generator
+    ) -> TextSequence:
+        del rng
+        token_ids = np.asarray(sample["input_ids"], dtype=np.int64)
+        expected_num_tokens = self._max_context_length + 1
+        if token_ids.ndim != 1 or len(token_ids) != expected_num_tokens:
+            raise ValueError(
+                "pretokenized long-context rows must contain exactly "
+                f"{expected_num_tokens} token IDs, got shape {token_ids.shape}"
+            )
+        return TextSequence(
+            input_ids=token_ids[:-1],
+            labels=token_ids[1:],
+        )
 
 
 class _PhasedRoundRobinTokenChoiceTopKRouter(RoundRobinTokenChoiceTopKRouter):
@@ -171,6 +219,24 @@ def _kimi_k3_manifold_c4_dataloader() -> GrainDataLoader.Config:
     )
     return GrainDataLoader.Config(
         dataset=ConcatThenSplitPackingConfig(dataset=dataset),
+        streaming_shuffle_buffer_size=128,
+    )
+
+
+def _kimi_k3_long_context_dataloader(seq_len: int) -> GrainDataLoader.Config:
+    """Build the exact-row dataset used by the 32K context workload."""
+    data_files = f"{_KIMI_K3_LONG_CONTEXT_DATA_ROOT}/seq{seq_len}/part-*.json.gz"
+    dataset = SingleDatasetConfig(
+        source=HuggingFaceStreamingSource.Config(
+            path="json",
+            split="train",
+            load_dataset_kwargs={"data_files": data_files},
+        ),
+        processor=_PretokenizedLongContextProcessor.Config(),
+    )
+    return GrainDataLoader.Config(
+        dataset=dataset,
+        max_num_documents=1,
         streaming_shuffle_buffer_size=128,
     )
 
@@ -340,3 +406,98 @@ def kimi_k3_full_bf16_pretrain_dist_moe_pp8_fsdp64_ep64_gb200_512_v1_5() -> (
         seq_len=4096,
         num_tokens_per_microbatch=4096,
     )
+
+
+def kimi_k3_full_long_context_v4_2_dist_moe_mxfp8_gb200_256() -> Trainer.Config:
+    """Mirror the V4.2 32K topology with native MXFP8 Dist-MoE experts."""
+    dist_moe = require_dist_moe()
+    seq_len = 32_768
+    num_dp_shards = 4
+    num_pp_microbatches = 64
+
+    # The debug flavor is only a container for shared trainer defaults; its
+    # own context limit is lower than the released model's 32K workload.
+    config = kimi_k3_debugmodel()
+    model = build_model_config(
+        "Kimi-K3",
+        attn_backend="varlen",
+        seq_len=seq_len,
+    )
+    model = _compile_kimi_attention_residual(model)
+    parallelism = replace(
+        config.parallelism,
+        data_parallel_replicate_degree=1,
+        data_parallel_shard_degree=num_dp_shards,
+        context_parallel_degree=16,
+        context_parallel_load_balancer=None,
+        tensor_parallel_degree=1,
+        expert_parallel_degree=64,
+        pipeline_parallel_degree=4,
+        pipeline_parallel_schedule="Interleaved1F1B",
+        pipeline_parallel_module_fqns_per_model_part=None,
+        pipeline_parallel_layers_per_stage=12,
+        num_pp_microbatches=num_pp_microbatches,
+        pp_max_unsharded_active_stages=1,
+        fsdp_reshard_after_forward="always",
+    )
+    optimizer = _dist_muon_optimizer(
+        model,
+        muon_lr=8e-4,
+        adamw_lr=8e-4,
+        parallelism=parallelism,
+    )
+    training = replace(
+        config.training,
+        max_context_length=seq_len,
+        num_tokens_per_microbatch_per_dp_rank=seq_len,
+        num_tokens_per_train_step=(seq_len * num_pp_microbatches * num_dp_shards),
+        steps=12,
+        disable_cuda_graphs=True,
+        dtype="float32",
+        mixed_precision_param="bfloat16",
+        mixed_precision_reduce="bfloat16",
+    )
+    # Set the complete topology before applying CP. Reconstructing the trainer
+    # here would validate the unconverted attention configs too early.
+    config.model = model
+    config.loss = ChunkedLossWrapper.Config(
+        loss_fn=CrossEntropyLoss.Config(
+            global_vocab_size=decoder_vocab_size(model),
+        )
+    )
+    config.hf_assets_path = _KIMI_K3_MANIFOLD_HF_ASSETS_PATH
+    config.dataloader = _kimi_k3_long_context_dataloader(seq_len)
+    config.metrics = replace(config.metrics, enable_wandb=True)
+    config.optim = replace(config.optim, optimizer=optimizer)
+    config.parallelism = parallelism
+    config.training = training
+    # RegionAC retains the Dist-MoE boundary while recomputing the rest of the
+    # Kimi block, avoiding a second expert forward during backward.
+    config.activation_checkpoint = RegionAC.Config(save_regions=[])
+    config.checkpointer = None
+    config.comm = replace(
+        config.comm,
+        init_timeout_seconds=30 * 60,
+        train_timeout_seconds=30 * 60,
+    )
+    config.profiler = replace(config.profiler, enable_profiling=False)
+    config.dist_moe = _full_recompute_runtime_config()
+    # Factor-one scratch requires exact aggregate balance. The phased source
+    # offsets preserve that bound when CP and DP jointly form the EP64 mesh.
+    config = _use_phased_round_robin_routing(config)
+    config = apply_transforms(
+        config,
+        [
+            ContextParallelTransform(
+                inner_attention_map={
+                    VarlenInnerAttention: UlyssesCPVarlenInnerAttention,
+                    InnerKDA: ContextParallelInnerKDA,
+                }
+            ),
+            DistMoeTransform(
+                expert_precision="mxfp8",
+                block_scaled_config=dist_moe.BlockScaledConfig(fast_math=True),
+            ),
+        ],
+    )
+    return _use_transient_dist_muon_buffers(config)
