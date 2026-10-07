@@ -249,6 +249,67 @@ def test_runtime_selects_pp_activation_slot_from_forward_context() -> None:
     )
 
 
+def test_runtime_scopes_pipeline_metadata_inference() -> None:
+    """Metadata mode spans backward recompute and clears on a real forward."""
+    runtime = _runtime()
+    metadata_info = PipelineStageInfo(
+        stage_index=0,
+        microbatch_index=0,
+        is_metadata_inference=True,
+    )
+    runtime_info = PipelineStageInfo(stage_index=0, microbatch_index=0)
+
+    assert not runtime.is_pipeline_metadata_inference
+    with runtime.forward_context(metadata_info):
+        assert runtime.is_pipeline_metadata_inference
+        runtime.context.select_activation_slot.assert_not_called()
+    assert runtime.is_pipeline_metadata_inference
+    with runtime.forward_context(runtime_info):
+        assert not runtime.is_pipeline_metadata_inference
+    assert not runtime.is_pipeline_metadata_inference
+    runtime.context.select_activation_slot.assert_called_once_with(0, 1)
+
+
+def test_forward_bypasses_dist_moe_during_pipeline_metadata_inference() -> None:
+    """Uninitialized PP placeholders never enter capacity-bounded routing."""
+    module = cast(
+        DistMoeRoutedExperts, DistMoeTransform().transform(_stock_config()).build()
+    )
+    runtime = _runtime()
+    module._runtime = runtime
+    x_TD = torch.full((2, 32), torch.nan, requires_grad=True)
+    info = PipelineStageInfo(
+        stage_index=0,
+        microbatch_index=0,
+        is_metadata_inference=True,
+    )
+
+    with runtime.forward_context(info):
+        pass
+    with (
+        patch(
+            "torchtitan.models.common.dist_moe.routed_experts.dist_moe.routed_experts"
+        ) as execute,
+        patch.object(module, "_weight_operands") as weight_operands,
+    ):
+        out_TD = module(
+            x_TD,
+            torch.empty(2, 2),
+            torch.empty(2, 2, dtype=torch.int64),
+            torch.empty(4, dtype=torch.int64),
+        )
+
+    assert out_TD.shape == x_TD.shape
+    assert out_TD.dtype == x_TD.dtype
+    assert out_TD.requires_grad
+    assert torch.count_nonzero(out_TD) == 0
+    out_TD.sum().backward()
+    assert x_TD.grad is not None
+    assert torch.count_nonzero(x_TD.grad) == 0
+    execute.assert_not_called()
+    weight_operands.assert_not_called()
+
+
 def test_engine_builds_dist_moe_runtime_with_eager_pp_schedule() -> None:
     """Standard forward/backward setup supplies eager PP state to the runtime."""
     runtime = Mock()
