@@ -139,9 +139,9 @@ def test_phased_round_robin_balances_partial_cycle_across_ep_ranks(
     )
 
 
-def test_v4_2_mxfp8_recipe_matches_256_gpu_long_context_workload() -> None:
-    """The Dist-MoE variant preserves V4.2's data and parallel topology."""
-    config = config_registry.kimi_k3_full_long_context_v4_2_dist_moe_mxfp8_gb200_256()
+def test_v4_1_mxfp8_recipe_matches_256_gpu_long_context_workload() -> None:
+    """The Dist-MoE variant preserves V4.1's data and parallel topology."""
+    config = config_registry.kimi_k3_full_long_context_v4_1_dist_moe_mxfp8_gb200_256()
     model = cast(KimiK3Model.Config, config.model)
 
     assert config.parallelism.pipeline_parallel_degree == 4
@@ -162,9 +162,10 @@ def test_v4_2_mxfp8_recipe_matches_256_gpu_long_context_workload() -> None:
     assert config.training.num_tokens_per_train_step == 8_388_608
     assert config.training.steps == 12
     assert config.training.disable_cuda_graphs
-    assert config.training.dtype == "float32"
+    assert config.training.dtype == "bfloat16"
     assert config.training.mixed_precision_param == "bfloat16"
     assert config.training.mixed_precision_reduce == "bfloat16"
+    assert config.training.empty_device_cache_after_step
 
     dataset = config.dataloader.dataset
     assert isinstance(dataset, SingleDatasetConfig)

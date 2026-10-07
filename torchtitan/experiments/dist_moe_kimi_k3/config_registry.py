@@ -411,8 +411,8 @@ def kimi_k3_full_bf16_pretrain_dist_moe_pp8_fsdp64_ep64_gb200_512_v1_5() -> (
     )
 
 
-def kimi_k3_full_long_context_v4_2_dist_moe_mxfp8_gb200_256() -> Trainer.Config:
-    """Mirror the V4.2 32K topology with native MXFP8 Dist-MoE experts."""
+def kimi_k3_full_long_context_v4_1_dist_moe_mxfp8_gb200_256() -> Trainer.Config:
+    """Mirror the V4.1 32K BF16-state topology with MXFP8 Dist-MoE experts."""
     dist_moe = require_dist_moe()
     seq_len = 32_768
     num_dp_shards = 4
@@ -456,9 +456,10 @@ def kimi_k3_full_long_context_v4_2_dist_moe_mxfp8_gb200_256() -> Trainer.Config:
         num_tokens_per_train_step=(seq_len * num_pp_microbatches * num_dp_shards),
         steps=12,
         disable_cuda_graphs=True,
-        dtype="float32",
+        dtype="bfloat16",
         mixed_precision_param="bfloat16",
         mixed_precision_reduce="bfloat16",
+        empty_device_cache_after_step=True,
     )
     # Set the complete topology before applying CP. Reconstructing the trainer
     # here would validate the unconverted attention configs too early.
