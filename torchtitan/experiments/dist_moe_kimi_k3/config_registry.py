@@ -7,7 +7,6 @@
 """Production-shaped Kimi K3 recipes using upstream Dist-MoE integration."""
 
 from dataclasses import dataclass, replace
-from typing import cast
 
 import spmd_types as spmd
 import torch
@@ -205,7 +204,7 @@ def kimi_k3_debugmodel_dist_moe_bf16_recompute_varlen_pp2_fsdp2_ep2() -> (
         fsdp_reshard_after_forward="always",
     )
     optimizer = _dist_muon_optimizer(
-        cast(KimiK3Model.Config, model),
+        model,
         muon_lr=8e-4,
         adamw_lr=8e-4,
         parallelism=parallelism,

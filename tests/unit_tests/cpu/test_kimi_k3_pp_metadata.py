@@ -11,6 +11,7 @@ from unittest.mock import Mock
 
 import torch
 import torch.nn as nn
+from torch.distributed.device_mesh import DeviceMesh, _MeshLayout
 from torch.distributed.pipelining import PipelineStage
 from torch.distributed.pipelining._utils import InferenceMode
 from torch.distributed.pipelining.schedules import Schedule1F1B
@@ -95,8 +96,10 @@ def _loss(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return output.sum()
 
 
-def _get_mesh(*args, **kwargs):
-    return None
+def _get_mesh(
+    mesh_dim_names: tuple[str, ...], mesh_layout: _MeshLayout | None
+) -> DeviceMesh:
+    raise AssertionError("static metadata construction must not request a mesh")
 
 
 class TestStaticMetadataSwap(DTensorTestBase):

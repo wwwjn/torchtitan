@@ -7,6 +7,7 @@
 """Configuration tests for the full-scale Kimi K3 Dist-MoE experiments."""
 
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import patch
 
 import pytest
@@ -46,6 +47,7 @@ def test_full_recipes_preserve_workload_and_use_upstream_runtime(
     assert config.training.dtype == "float32"
     assert config.training.mixed_precision_param == "bfloat16"
     assert config.training.mixed_precision_reduce == "float32"
+    assert "attention_residual" in config.model.local_compile_regions
     assert config.parallelism.pipeline_parallel_degree == 8
     assert config.parallelism.data_parallel_shard_degree == 64
     assert config.parallelism.expert_parallel_degree == 64
@@ -78,7 +80,10 @@ def test_full_recipes_preserve_workload_and_use_upstream_runtime(
 
 def test_phased_round_robin_balances_partial_cycle_across_ep_ranks() -> None:
     """Every EP destination receives the same row count at scratch factor one."""
-    router = SimpleNamespace(num_experts=28, top_k=16)
+    router = cast(
+        config_registry._PhasedRoundRobinTokenChoiceTopKRouter,
+        SimpleNamespace(num_experts=28, top_k=16),
+    )
     scores_TE = torch.empty(256, router.num_experts)
     received_rows = torch.zeros(2, dtype=torch.int64)
 

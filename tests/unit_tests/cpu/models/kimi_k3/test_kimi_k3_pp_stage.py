@@ -46,6 +46,18 @@ class TestCarrier(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "routing expects"):
             _assemble_stack(hidden, delta, [2, 3], store)
 
+    def test_assembly_reuses_an_already_ordered_wire_stack(self):
+        delta = torch.randn(4, 3, 8, requires_grad=True)
+
+        stack, order = _assemble_stack(torch.randn(4, 8), delta, [0, 1, 2], {})
+
+        self.assertEqual(order, [0, 1, 2])
+        self.assertEqual(stack.data_ptr(), delta.data_ptr())
+        self.assertTrue(stack.is_leaf and stack.requires_grad)
+        stack.sum().backward()
+        self.assertIsNotNone(stack.grad)
+        self.assertIsNone(delta.grad)
+
     def test_payload_is_the_routed_columns_of_the_model_stack(self):
         T, D = 4, 8
         stack_out = torch.randn(T, 3, D, requires_grad=True)
@@ -56,6 +68,16 @@ class TestCarrier(unittest.TestCase):
         self.assertEqual(
             tuple(_pack_outgoing_delta(stack_out, [0, 1, 2], []).shape), (T, 0, D)
         )
+
+    def test_payload_reuses_a_fully_routed_model_stack(self):
+        stack_out = torch.randn(4, 3, 8, requires_grad=True)
+
+        payload = _pack_outgoing_delta(stack_out, [0, 1, 2], [0, 1, 2])
+
+        self.assertIs(payload, stack_out)
+        payload.sum().backward()
+        assert stack_out.grad is not None
+        self.assertTrue(torch.equal(stack_out.grad, torch.ones_like(stack_out)))
 
     def test_gradient_split_sends_the_received_and_deposits_the_stored(self):
         T, D = 4, 8
