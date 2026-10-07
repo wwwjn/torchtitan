@@ -57,6 +57,7 @@ from torchtitan.trainer import Trainer
 
 from torchtitan_recipes.models.dist_moe import dist_moe_runtime_config, require_dist_moe
 from torchtitan_recipes.tests.models.kimi_k2_7 import (
+    _align_dist_muon_dense_fsdp_compute_layouts,
     _align_dist_muon_expert_compute_layouts,
     _per_expert_compute_layout,
 )
@@ -401,6 +402,10 @@ class _KimiK3TrainerConfig(Trainer.Config):
     def __post_init__(self) -> None:
         Trainer.Config.__post_init__(self)
         self.optim.optimizer = _align_dist_muon_expert_compute_layouts(
+            self.optim.optimizer,
+            parallelism=self.parallelism,
+        )
+        self.optim.optimizer = _align_dist_muon_dense_fsdp_compute_layouts(
             self.optim.optimizer,
             parallelism=self.parallelism,
         )

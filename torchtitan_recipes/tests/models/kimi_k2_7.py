@@ -545,11 +545,81 @@ def _align_dist_muon_expert_compute_layouts(
     )
 
 
+def _align_dist_muon_dense_fsdp_compute_layouts(
+    optimizer_config: OptimizersContainer.Config,
+    *,
+    parallelism: ParallelismConfig,
+) -> OptimizersContainer.Config:
+    """Align dense compute layouts with FSDP's flattened CP shard axis."""
+    if parallelism.context_parallel_degree == 1:
+        return optimizer_config
+
+    dist_muon_index = next(
+        (
+            index
+            for index, config in enumerate(optimizer_config.optimizers)
+            if isinstance(config, DistMuon.Config)
+        ),
+        None,
+    )
+    if dist_muon_index is None:
+        return optimizer_config
+    dist_muon_config = cast(
+        DistMuon.Config,
+        optimizer_config.optimizers[dist_muon_index],
+    )
+    compute_sharding_by_fqn = cast(
+        dict[str, ComputeLayout],
+        dist_muon_config.compute_sharding_by_fqn,
+    )
+
+    dp_shard_axis = MeshAxisName.DP_SHARD.value
+    # FSDP flattens (dp_shard, cp) into one parameter-storage axis. Muon
+    # layouts name storage axes, so dense declarations must use that name too.
+    fsdp_shard_axis = f"{dp_shard_axis}_{MeshAxisName.CP.value}"
+    aligned_shardings = {}
+    changed = False
+    for fqn, compute_layout in compute_sharding_by_fqn.items():
+        shardings_by_mesh_axis = dict(compute_layout.shardings_by_mesh_axis)
+        if dp_shard_axis not in shardings_by_mesh_axis:
+            aligned_shardings[fqn] = compute_layout
+            continue
+
+        shardings_by_mesh_axis[fsdp_shard_axis] = shardings_by_mesh_axis.pop(
+            dp_shard_axis
+        )
+        shard_order_by_tensor_dim = {
+            tensor_dim: tuple(
+                fsdp_shard_axis if axis == dp_shard_axis else axis
+                for axis in axis_order
+            )
+            for tensor_dim, axis_order in compute_layout.shard_order_by_tensor_dim.items()
+        }
+        aligned_shardings[fqn] = ComputeLayout(
+            shardings_by_mesh_axis=shardings_by_mesh_axis,
+            shard_order_by_tensor_dim=shard_order_by_tensor_dim,
+        )
+        changed = True
+
+    if not changed:
+        return optimizer_config
+    optimizers = list(optimizer_config.optimizers)
+    optimizers[dist_muon_index] = replace(
+        dist_muon_config,
+        compute_sharding_by_fqn=aligned_shardings,
+    )
+    return replace(optimizer_config, optimizers=optimizers)
+
+
 @dataclass(kw_only=True, slots=True)
 class _KimiTrainerConfig(Trainer.Config):
     def __post_init__(self) -> None:
         Trainer.Config.__post_init__(self)
         self.optim.optimizer = _align_dist_muon_expert_compute_layouts(
+            self.optim.optimizer,
+            parallelism=self.parallelism,
+        )
+        self.optim.optimizer = _align_dist_muon_dense_fsdp_compute_layouts(
             self.optim.optimizer,
             parallelism=self.parallelism,
         )
