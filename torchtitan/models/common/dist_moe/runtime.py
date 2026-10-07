@@ -22,14 +22,18 @@ import math
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Literal, TYPE_CHECKING
+from typing import Any, Literal, TYPE_CHECKING
 
 import torch
 from torch.distributed.pipelining import (
     analyze_pipeline_activation_liveness,
     PipelineStageInfo,
 )
-from torch.distributed.pipelining.schedules import PipelineScheduleMulti
+from torch.distributed.pipelining.schedules import (
+    PipelineScheduleMulti,
+    PipelineScheduleSingle,
+    Schedule1F1B,
+)
 from torch.utils.hooks import RemovableHandle
 
 from torchtitan.config import Configurable
@@ -48,6 +52,14 @@ logger = logging.getLogger(__name__)
 __all__ = ["DistMoeRuntime"]
 
 PPActivationSlotPolicy = Literal["stage_microbatch", "microbatch"]
+PipelineSchedule = PipelineScheduleSingle | PipelineScheduleMulti
+
+
+def _pipeline_stages(schedule: PipelineSchedule) -> tuple[Any, ...]:
+    """Return the local stages owned by either PyTorch schedule family."""
+    if isinstance(schedule, PipelineScheduleSingle):
+        return (schedule._stage,)
+    return tuple(schedule._stages)
 
 # Inference picks its BF16 expert-GEMM schedule from the call size, and some
 # schedules round a row differently depending on the call size or on the other
@@ -161,9 +173,9 @@ class DistMoeRuntime(Configurable):
         device: CUDA device that owns the Annex context and buffers.
         num_tokens_per_microbatch_per_dp_rank: Unsharded token count used to
             derive the exact local routing-input shape after CP and TP.
-        pp_schedule: Schedule used for activation-liveness analysis, or
-            ``None`` without pipeline parallelism. Eager PP also executes
-            metadata inference on this schedule.
+        pp_schedule: Runtime schedule used for activation-liveness analysis,
+            or ``None`` without pipeline parallelism. Ordinary 1F1B and
+            multi-stage schedules are supported.
         register_post_metadata_inference_cleanup: Optional registrar for the
             schedule that executes metadata inference when it differs from
             ``pp_schedule``. GraphPP uses this to retain its pre-rewrite
@@ -271,7 +283,7 @@ class DistMoeRuntime(Configurable):
         parallelism_context: ParallelismContext,
         device: torch.device,
         num_tokens_per_microbatch_per_dp_rank: int,
-        pp_schedule: PipelineScheduleMulti | None,
+        pp_schedule: PipelineSchedule | None,
         register_post_metadata_inference_cleanup: (
             Callable[[Callable[[], None]], RemovableHandle] | None
         ) = None,
@@ -324,7 +336,7 @@ class DistMoeRuntime(Configurable):
         if parallelism_context.pp_enabled:
             if pp_schedule is None:
                 raise ValueError(
-                    "Dist-MoE PP activation planning requires a multi-stage schedule"
+                    "Dist-MoE PP activation planning requires the runtime schedule"
                 )
             pp_mesh = parallelism_context.get_optional_mesh(
                 "pp", include_singleton_axes=True
@@ -402,7 +414,7 @@ class DistMoeRuntime(Configurable):
                     self.context.reset
                 )
                 if set_forward_context is None:
-                    for stage in pp_schedule._stages:
+                    for stage in _pipeline_stages(pp_schedule):
                         self._forward_context_handles.append(
                             stage.register_forward_context(self.forward_context)
                         )
@@ -446,6 +458,13 @@ class DistMoeRuntime(Configurable):
                 "swiglu_alpha": module.swiglu_alpha,
                 "swiglu_limit": module.swiglu_limit,
             }
+        elif module.activation == "situglu":
+            assert module.situglu_beta is not None
+            assert module.situglu_linear_beta is not None
+            activation_options = {
+                "situglu_beta": module.situglu_beta,
+                "situglu_linear_beta": module.situglu_linear_beta,
+            }
         return dist_moe.Config(
             max_num_local_input_tokens=max_num_local_input_tokens,
             hidden_dim=module.hidden_dim,
@@ -481,7 +500,7 @@ class DistMoeRuntime(Configurable):
 
     def _plan_pp_activation_slots(
         self,
-        schedule: PipelineScheduleMulti,
+        schedule: PipelineSchedule,
         *,
         pp_rank: int,
         model_parts: Sequence[torch.nn.Module],
@@ -489,11 +508,12 @@ class DistMoeRuntime(Configurable):
         """Derive immutable Dist-MoE slot assignments from the PP schedule."""
         from .routed_experts import DistMoeRoutedExperts
 
-        if len(schedule._stages) != len(model_parts):
+        stages = _pipeline_stages(schedule)
+        if len(stages) != len(model_parts):
             raise RuntimeError("pipeline schedule and model parts disagree")
         modules_by_stage = {
             stage.stage_index: modules
-            for stage, model_part in zip(schedule._stages, model_parts, strict=True)
+            for stage, model_part in zip(stages, model_parts, strict=True)
             if (
                 modules := [
                     module
@@ -506,12 +526,39 @@ class DistMoeRuntime(Configurable):
             raise RuntimeError("no local pipeline stage contains Dist-MoE")
 
         stage_indices = tuple(modules_by_stage)
-        liveness = analyze_pipeline_activation_liveness(
-            schedule,
-            pp_rank=pp_rank,
-            stage_indices=stage_indices,
-            granularity=self.config.pp_activation_slot_policy,
-        )
+        if isinstance(schedule, PipelineScheduleMulti):
+            liveness = analyze_pipeline_activation_liveness(
+                schedule,
+                pp_rank=pp_rank,
+                stage_indices=stage_indices,
+                granularity=self.config.pp_activation_slot_policy,
+            )
+            num_slots = liveness.num_slots
+            activation_slot_id_by_stage_and_microbatch = {
+                (stage_index, microbatch_index): liveness.slot_for(
+                    stage_index,
+                    microbatch_index,
+                )
+                for stage_index in stage_indices
+                for microbatch_index in range(liveness.num_microbatches)
+            }
+        elif isinstance(schedule, Schedule1F1B):
+            stage = stages[0]
+            num_warmup_microbatches = min(
+                schedule._n_microbatches,
+                stage.num_stages - stage.stage_index,
+            )
+            num_slots = num_warmup_microbatches
+            activation_slot_id_by_stage_and_microbatch = {
+                (stage.stage_index, microbatch_index): (
+                    microbatch_index % num_warmup_microbatches
+                )
+                for microbatch_index in range(schedule._n_microbatches)
+            }
+        else:
+            raise ValueError(
+                "Dist-MoE supports ordinary 1F1B or a multi-stage PP schedule"
+            )
         if self.config.pp_activation_slot_policy == "microbatch":
             max_moe_layers_per_activation_slot = sum(
                 len(modules) for modules in modules_by_stage.values()
@@ -520,16 +567,8 @@ class DistMoeRuntime(Configurable):
             max_moe_layers_per_activation_slot = max(
                 len(modules) for modules in modules_by_stage.values()
             )
-        activation_slot_id_by_stage_and_microbatch = {
-            (stage_index, microbatch_index): liveness.slot_for(
-                stage_index,
-                microbatch_index,
-            )
-            for stage_index in stage_indices
-            for microbatch_index in range(liveness.num_microbatches)
-        }
         return _DistMoePipelineActivationPlan(
-            max_live_activation_slots=liveness.num_slots,
+            max_live_activation_slots=num_slots,
             max_moe_layers_per_activation_slot=max_moe_layers_per_activation_slot,
             activation_slot_id_by_stage_and_microbatch=(
                 activation_slot_id_by_stage_and_microbatch

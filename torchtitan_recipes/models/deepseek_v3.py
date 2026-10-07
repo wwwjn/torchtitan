@@ -6,10 +6,7 @@
 
 """Verified DeepSeek V3 model recipes."""
 
-from importlib import import_module
-from types import ModuleType
 from typing import cast
-
 from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
 from torchtitan.components.data.text_datasets import DATASETS
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
@@ -19,7 +16,7 @@ from torchtitan.components.optim import (
     Optim,
     OptimizersContainer,
 )
-from torchtitan.config import Configurable, TrainingConfig
+from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.config.transform import (
     apply_transforms,
@@ -35,30 +32,10 @@ from torchtitan.models.deepseek_v3 import build_model_config, DeepSeekV3Model
 from torchtitan.quantization.nvfp4 import nvfp4_bf16_tail_fqns, nvfp4_ffn_submodules
 from torchtitan.trainer import Trainer
 
-
-def _require_dist_moe() -> ModuleType:
-    """Import the optional Dist-MoE package for a selected Dist-MoE recipe."""
-    try:
-        return import_module("dist_moe")
-    except ModuleNotFoundError as error:
-        if error.name != "dist_moe":
-            raise
-        raise ModuleNotFoundError(
-            "This recipe requires the optional dist_moe package. Install "
-            "it from git+https://github.com/meta-pytorch/dist_moe.git@main "
-            "before selecting it.",
-            name="dist_moe",
-        ) from error
-
-
-def _dist_moe_runtime_config(*, scratch_capacity_factor: float) -> Configurable.Config:
-    """Build the rank-wide activation and scratch policy for Dist-MoE."""
-    from torchtitan.models.common.dist_moe.runtime import DistMoeRuntime
-
-    return DistMoeRuntime.Config(
-        activation_slot_capacity_factor=1.0,
-        scratch_capacity_factor=scratch_capacity_factor,
-    )
+from torchtitan_recipes.models.dist_moe import (
+    dist_moe_runtime_config as _dist_moe_runtime_config,
+    require_dist_moe as _require_dist_moe,
+)
 
 
 def deepseek_v3_mxfp8_linear_converter_config(

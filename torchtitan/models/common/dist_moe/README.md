@@ -7,8 +7,9 @@ dispatch, grouped expert computation, activation storage, scratch storage, and
 combine as one ordered operation.
 
 TorchTitan supports BF16 and asynchronous MXFP8 Dist-MoE training on NVIDIA
-SM100 or newer. The annex also provides NVFP4 inference, which TorchTitan does
-not expose yet. Dist-MoE requires
+SM100 or newer, with SwiGLU or bounded SiTU-GLU expert activations. The annex
+also provides NVFP4 inference, which TorchTitan does not expose yet. Dist-MoE
+requires
 `training.mixed_precision_param="bfloat16"` because FSDP unshards its persistent
 parameters in BF16.
 
@@ -79,12 +80,13 @@ config = apply_transforms(
 )
 ```
 
-Verified 671B recipes live in `torchtitan_recipes.models.deepseek_v3`, while
-debug and 16B CI recipes live in `torchtitan_recipes.tests.models.deepseek_v3`.
+Verified 671B recipes live in `torchtitan_recipes.models.deepseek_v3`. Debug and
+16B DeepSeek recipes live in `torchtitan_recipes.tests.models.deepseek_v3`, and
+Kimi K3 debug recipes live in `torchtitan_recipes.tests.models.kimi_k3`.
 GraphTrainer follows the corresponding `graph_trainer` and
 `tests.graph_trainer` ownership. Recipes use `_dist_moe_bf16` and
-`_dist_moe_mxfp8` suffixes and select CUDA-graph-compatible varlen attention.
-MXFP8 recipes also convert dense projections and the language-model head.
+`_dist_moe_mxfp8` suffixes and select varlen attention. DeepSeek MXFP8 recipes
+also convert dense projections and the language-model head.
 
 ## Configuration Ownership
 
@@ -98,7 +100,9 @@ structured `GroupedLinear` parameter layout:
 
 This preserves parameter, optimizer, FSDP, and checkpoint ownership. The
 transformed module does not construct the stock activation or token dispatcher,
-because the annex performs those operations internally.
+because the annex performs those operations internally. The transform derives
+either SwiGLU or bounded SiTU-GLU directly from the source activation config and
+rejects other activation contracts.
 
 Per-layer settings belong to the transform:
 
@@ -174,11 +178,12 @@ The annex allocates four distinct regions:
 | Device scratch | Rank-local HBM | Forward temporaries, recompute temporaries, and activation gradients, reused by one local layer action at a time. |
 | VMM overflow scratch | Pinned host memory in the same CUDA virtual range | Optional scratch demand above the device factor and within the total factor. |
 
-Without PP there is one activation slot containing all local MoE layers. With
-eager PP, PyTorch analyzes the final schedule before warmup and assigns every
-live `(stage, microbatch)` interval to a reusable slot. The default
-`"stage_microbatch"` policy sizes each slot for the largest local stage and
-reuses it after that stage's backward releases the saved state. The
+Without PP there is one activation slot containing all local MoE layers. For a
+multi-stage eager schedule, PyTorch analyzes the final schedule before warmup
+and assigns every live `(stage, microbatch)` interval to a reusable slot. For
+ordinary 1F1B with one local stage, the runtime allocates the schedule's exact
+warmup depth and reuses slots cyclically after backward. The default
+`"stage_microbatch"` policy sizes each slot for the largest local stage. The
 `"microbatch"` policy keeps one slot across all local stages for a microbatch
 and therefore sizes each slot for their combined MoE depth.
 

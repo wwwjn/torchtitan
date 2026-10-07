@@ -15,7 +15,7 @@ from typing import Any, cast
 
 import torch
 from torch.distributed.fsdp import FSDPModule
-from torch.distributed.pipelining import PipelineStage
+from torch.distributed.pipelining import PipelineStage, PipelineStageInfo
 from torch.distributed.pipelining._utils import flatten_args
 
 from .cache import PPRankLocalCache
@@ -179,7 +179,18 @@ class AttnResPipelineStage(PipelineStage):
         if isinstance(self.submod, FSDPModule) and self.has_backward:
             self.submod.set_manual_backward_finalization(True)
 
-        output = self.forward_maybe_with_nosync(*composite_args, **composite_kwargs)
+        if self._forward_contexts:
+            output = self._call_with_forward_context(
+                PipelineStageInfo(
+                    stage_index=self.stage_index,
+                    microbatch_index=fwd_chunk_id,
+                ),
+                self.forward_maybe_with_nosync,
+                *composite_args,
+                **composite_kwargs,
+            )
+        else:
+            output = self.forward_maybe_with_nosync(*composite_args, **composite_kwargs)
 
         if self.is_last:
             output_tuple = (
