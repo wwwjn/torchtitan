@@ -23,7 +23,7 @@ import torchtitan_recipes.models.deepseek_v3 as eager_production_recipes
 import torchtitan_recipes.tests.models.deepseek_v3 as eager_test_recipes
 import torchtitan_recipes.tests.models.kimi_k3 as kimi_k3_test_recipes
 from torch.distributed.pipelining import PipelineStageInfo
-from torch.distributed.pipelining.schedules import Schedule1F1B
+from torch.distributed.pipelining.schedules import Schedule1F1B, ScheduleGPipe
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.optim import AdamW
 from torchtitan.config.configs import TrainingConfig
@@ -498,6 +498,27 @@ def test_runtime_plans_slots_for_ordinary_one_f_one_b() -> None:
         plan.activation_slot_id_by_stage_and_microbatch[(1, microbatch_index)]
         for microbatch_index in range(8)
     ] == [0, 1, 2, 0, 1, 2, 0, 1]
+
+
+def test_runtime_plans_slots_for_gpipe() -> None:
+    """GPipe keeps every microbatch forward live until backward begins."""
+    module = DistMoeTransform().transform(_stock_config()).build()
+    schedule = ScheduleGPipe.__new__(ScheduleGPipe)
+    schedule._stage = SimpleNamespace(stage_index=2, num_stages=4)
+    schedule._n_microbatches = 3
+
+    plan = _runtime()._plan_pp_activation_slots(
+        schedule,
+        pp_rank=2,
+        model_parts=[torch.nn.Sequential(module)],
+    )
+
+    assert plan.max_live_activation_slots == 3
+    assert plan.max_moe_layers_per_activation_slot == 1
+    assert [
+        plan.activation_slot_id_by_stage_and_microbatch[(2, microbatch_index)]
+        for microbatch_index in range(3)
+    ] == [0, 1, 2]
 
 
 @pytest.mark.parametrize("targets", [("w13",), ("w2",), ("w13", "w2")])

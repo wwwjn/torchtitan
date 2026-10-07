@@ -182,7 +182,9 @@ Without PP there is one activation slot containing all local MoE layers. For a
 multi-stage eager schedule, PyTorch analyzes the final schedule before warmup
 and assigns every live `(stage, microbatch)` interval to a reusable slot. For
 ordinary 1F1B with one local stage, the runtime allocates the schedule's exact
-warmup depth and reuses slots cyclically after backward. The default
+warmup depth and reuses slots cyclically after backward. For GPipe, every
+microbatch has a distinct slot because all forwards remain live until backward
+begins. The default
 `"stage_microbatch"` policy sizes each slot for the largest local stage. The
 `"microbatch"` policy keeps one slot across all local stages for a microbatch
 and therefore sizes each slot for their combined MoE depth.

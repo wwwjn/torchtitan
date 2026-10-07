@@ -33,6 +33,7 @@ from torch.distributed.pipelining.schedules import (
     PipelineScheduleMulti,
     PipelineScheduleSingle,
     Schedule1F1B,
+    ScheduleGPipe,
 )
 from torch.utils.hooks import RemovableHandle
 
@@ -564,6 +565,13 @@ class DistMoeRuntime(Configurable):
                 for stage_index in stage_indices
                 for microbatch_index in range(liveness.num_microbatches)
             }
+        elif isinstance(schedule, ScheduleGPipe):
+            stage = stages[0]
+            num_slots = schedule._n_microbatches
+            activation_slot_id_by_stage_and_microbatch = {
+                (stage.stage_index, microbatch_index): microbatch_index
+                for microbatch_index in range(schedule._n_microbatches)
+            }
         elif isinstance(schedule, Schedule1F1B):
             stage = stages[0]
             num_warmup_microbatches = min(
@@ -579,7 +587,8 @@ class DistMoeRuntime(Configurable):
             }
         else:
             raise ValueError(
-                "Dist-MoE supports ordinary 1F1B or a multi-stage PP schedule"
+                "Dist-MoE supports GPipe, ordinary 1F1B, or a multi-stage PP "
+                "schedule"
             )
         if self.config.pp_activation_slot_policy == "microbatch":
             max_moe_layers_per_activation_slot = sum(
