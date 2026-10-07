@@ -151,6 +151,15 @@ class ParallelismConfig:
     explicit send waits. None adds no hard limit.
     """
 
+    pipeline_parallel_empty_cache_before_gradient_reduction: bool = False
+    """Release unused cached device memory before PP gradient reduction.
+
+    This runs once per local pipeline stage after its backward microbatches
+    finish, not before individual forward or backward actions. It may add a
+    device synchronization, so enable it only when allocator fragmentation
+    would otherwise prevent the reduced-gradient output allocation.
+    """
+
     pp_max_unsharded_active_stages: int | None = None
     """Maximum local pipeline stages whose parameters may remain unsharded.
 

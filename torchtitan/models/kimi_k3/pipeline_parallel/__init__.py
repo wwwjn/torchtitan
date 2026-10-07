@@ -59,6 +59,11 @@ def _as_attn_res_stage(
         group=stage.group,
         dw_builder=stage.dw_builder,
         get_mesh=stage._mesh_cache._get_mesh_cb,
+        empty_cache_before_gradient_reduction=getattr(
+            stage,
+            "empty_cache_before_gradient_reduction",
+            False,
+        ),
         **(stage_metadata or {}),
     )
     # The schedule wrote its stage-to-rank map onto the stage it was handed.

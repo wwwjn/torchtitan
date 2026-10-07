@@ -6,6 +6,7 @@
 
 import dataclasses
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -24,8 +25,34 @@ from torchtitan.distributed.pipeline_parallel import (
     _get_pp_rank_to_stage_indices_mapping,
     _static_stage_metadata,
     _unsupported_static_split,
+    TorchTitanPipelineStage,
 )
 from torchtitan_recipes.tests.models.llama3 import build_model_config
+
+
+def test_pipeline_stage_can_release_cache_before_gradient_reduction():
+    """The opt-in cache release runs once at the reduction boundary."""
+    stage = TorchTitanPipelineStage.__new__(TorchTitanPipelineStage)
+    stage.empty_cache_before_gradient_reduction = True
+    stage.device = torch.device("cuda")
+    stage.submod = Mock()
+    stage._has_backward = True
+    events = []
+    device_module = Mock()
+    device_module.empty_cache.side_effect = lambda: events.append("empty_cache")
+
+    with (
+        patch.object(pipeline_parallel, "FSDPModule", Mock, create=True),
+        patch("torch.get_device_module", return_value=device_module),
+        patch.object(
+            pipeline_parallel.PipelineStage,
+            "perform_reduce_grad",
+            side_effect=lambda _: events.append("reduce"),
+        ),
+    ):
+        stage.perform_reduce_grad(1)
+
+    assert events == ["empty_cache", "reduce"]
 
 
 def test_pipeline_with_first_last_stage_modules_prepends_present_modules(monkeypatch):

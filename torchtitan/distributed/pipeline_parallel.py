@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 from torch.distributed._mesh_layout import _MeshLayout
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.fsdp import FSDPModule
 from torch.distributed.pipelining import PipelineStage
 from torch.distributed.pipelining.schedules import (
     _PipelineSchedule,
@@ -44,7 +45,33 @@ __all__ = [
     "prepare_pipeline_schedule_for_cuda_graph",
     "pipeline_llm",
     "pipeline_with_first_last_stage_modules",
+    "TorchTitanPipelineStage",
 ]
+
+
+class TorchTitanPipelineStage(PipelineStage):
+    """Pipeline stage with TorchTitan's opt-in allocator lifecycle policy."""
+
+    def __init__(
+        self,
+        *args: Any,
+        empty_cache_before_gradient_reduction: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.empty_cache_before_gradient_reduction = (
+            empty_cache_before_gradient_reduction
+        )
+
+    def perform_reduce_grad(self, grad_scale_factor: int) -> None:
+        """Finalize stage gradients after applying the configured cache policy."""
+        if (
+            self.empty_cache_before_gradient_reduction
+            and isinstance(self.submod, FSDPModule)
+            and self.has_backward
+        ):
+            torch.get_device_module(self.device).empty_cache()
+        super().perform_reduce_grad(grad_scale_factor)
 
 
 def _build_get_mesh_callback(
@@ -132,6 +159,9 @@ def pipeline_llm(
         module_names_per_stage,
         get_mesh=get_mesh_cb,
         stage_io=stage_io,
+        empty_cache_before_gradient_reduction=(
+            parallelism.pipeline_parallel_empty_cache_before_gradient_reduction
+        ),
     )
 
     # For PP with looped schedules, each item in model_parts is one stage-model-chunk.
@@ -841,6 +871,7 @@ def _pipeline_module_split(
     module_names_per_stage: list[list[str]],
     get_mesh: Callable | None = None,
     stage_io: _DecoderStageIO | None = None,
+    empty_cache_before_gradient_reduction: bool = False,
 ) -> tuple[list[PipelineStage], list[BaseModel]]:
     """Create pipeline stages based on specified module names for each stage.
 
@@ -890,13 +921,16 @@ def _pipeline_module_split(
     for stage_idx in pp_rank_to_stage_indices:
         module_names = module_names_per_stage[stage_idx]
         model_chunk = _split_module(whole_model, module_names)
-        stage = PipelineStage(
+        stage = TorchTitanPipelineStage(
             model_chunk,
             stage_idx,
             num_stages,
             device,
             group=pp_mesh.get_group("pp"),
             get_mesh=get_mesh,
+            empty_cache_before_gradient_reduction=(
+                empty_cache_before_gradient_reduction
+            ),
             **(
                 _static_stage_metadata(stage_io, stage_idx, num_stages)
                 if stage_io is not None

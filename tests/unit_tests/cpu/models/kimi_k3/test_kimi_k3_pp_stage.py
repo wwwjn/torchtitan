@@ -19,6 +19,7 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
     with_comms,
 )
+from torchtitan.distributed.pipeline_parallel import TorchTitanPipelineStage
 
 from torchtitan.models.kimi_k3.pipeline_parallel import _swap_in_attn_res_stages
 from torchtitan.models.kimi_k3.pipeline_parallel.cache import PPRankLocalCache
@@ -181,12 +182,13 @@ class TestStageSwap(DTensorTestBase):
 
     @staticmethod
     def _stage(index: int, num_stages: int) -> PipelineStage:
-        return PipelineStage(
+        return TorchTitanPipelineStage(
             nn.Linear(2, 2),
             index,
             num_stages,
             torch.device("cpu"),
             get_mesh=_get_mesh,
+            empty_cache_before_gradient_reduction=True,
         )
 
     def _assert_rebuilt(self, old: PipelineStage, new: AttnResPipelineStage) -> None:
@@ -201,6 +203,7 @@ class TestStageSwap(DTensorTestBase):
         self.assertIs(new.group, old.group)
         self.assertIs(new._mesh_cache._get_mesh_cb, old._mesh_cache._get_mesh_cb)
         self.assertEqual(new.stage_index_to_group_rank, old.stage_index_to_group_rank)
+        self.assertTrue(new.empty_cache_before_gradient_reduction)
 
     @with_comms
     def test_forward_enables_fsdp_manual_backward_finalization(self):
