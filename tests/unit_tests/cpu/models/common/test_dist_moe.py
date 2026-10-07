@@ -126,8 +126,10 @@ def _runtime() -> DistMoeRuntime:
     runtime.config = DistMoeRuntime.Config()
     runtime.context = Mock()
     runtime._num_local_input_tokens_per_call = None
+    runtime.context.activation_buffer = Mock()
     runtime._modules = ()
     runtime._closed = False
+    runtime._pending_overflow_check = None
     runtime._forward_context_handles = []
     runtime._metadata_inference_cleanup_handle = None
     runtime._set_forward_context = None
@@ -139,6 +141,27 @@ def _runtime() -> DistMoeRuntime:
         max_moe_layers_per_activation_slot=1,
     )
     return runtime
+
+
+def test_runtime_checks_planner_overflow_before_reuse() -> None:
+    """Runtime delegates the asynchronous capacity check to the annex."""
+    runtime = _runtime()
+    pending = object()
+    scratch_info = object()
+    runtime.context.activation_buffer.begin_check_overflow.return_value = pending
+    runtime.context.activation_buffer.finish_check_overflow.return_value = scratch_info
+
+    runtime.begin_overflow_check()
+    runtime.context.activation_buffer.begin_check_overflow.assert_called_once_with()
+    with pytest.raises(RuntimeError, match="already pending"):
+        runtime.begin_overflow_check()
+
+    assert runtime.finish_overflow_check() is scratch_info
+    runtime.context.activation_buffer.finish_check_overflow.assert_called_once_with(
+        pending
+    )
+    with pytest.raises(RuntimeError, match="no Dist-MoE overflow check"):
+        runtime.finish_overflow_check()
 
 
 class _NativePostprocess(Module):

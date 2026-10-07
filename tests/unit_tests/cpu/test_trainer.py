@@ -884,6 +884,9 @@ def test_optim_step_waits_for_checkpoint() -> None:
             checkpointer=SimpleNamespace(
                 maybe_wait_for_staging=lambda: events.append("checkpoint")
             ),
+            _dist_moe_runtime=SimpleNamespace(
+                finish_overflow_check=lambda: events.append("overflow_check")
+            ),
             optim=optim,
             config=SimpleNamespace(
                 training=SimpleNamespace(empty_device_cache_after_step=False)
@@ -894,7 +897,7 @@ def test_optim_step_waits_for_checkpoint() -> None:
     grad_norm = TrainingEngine.optim_step(engine)
 
     torch.testing.assert_close(grad_norm, torch.tensor(2.0))
-    assert events == ["checkpoint", "optimization_3"]
+    assert events == ["checkpoint", "overflow_check", "optimization_3"]
     assert engine.num_completed_steps == 3
 
 
@@ -935,6 +938,32 @@ def test_optim_step_can_release_device_cache() -> None:
 
     empty_cache.assert_called_once_with()
     assert engine.num_completed_steps == 1
+
+
+def test_dist_moe_overflow_stops_optimizer_commit() -> None:
+    """A planner-capacity failure leaves parameters and step state untouched."""
+    runtime = SimpleNamespace(
+        finish_overflow_check=MagicMock(side_effect=ValueError("overflow"))
+    )
+    optim = SimpleNamespace(step=MagicMock())
+    engine = cast(
+        TrainingEngine,
+        SimpleNamespace(
+            num_completed_steps=4,
+            loss=torch.tensor(1.0),
+            _dist_moe_runtime=runtime,
+            optim=optim,
+            config=SimpleNamespace(
+                training=SimpleNamespace(empty_device_cache_after_step=False)
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="overflow"):
+        TrainingEngine.optim_step(engine)
+
+    optim.step.assert_not_called()
+    assert engine.num_completed_steps == 4
 
 
 @pytest.mark.parametrize(
@@ -1115,6 +1144,7 @@ def test_engine_replay_checks_whole_accumulation() -> None:
         ]
     )
     engine._run_forward_backward = run_forward_backward
+    engine._dist_moe_runtime = MagicMock()
 
     TrainingEngine.forward_backward(
         engine,
@@ -1127,6 +1157,7 @@ def test_engine_replay_checks_whole_accumulation() -> None:
     assert replayer.run_fwd_bwd.call_args.kwargs["step"] == 1
     assert callable(replayer.run_fwd_bwd.call_args.kwargs["get_loss"])
     run_forward_backward.assert_called_once()
+    engine._dist_moe_runtime.begin_overflow_check.assert_called_once_with()
 
 
 def test_replay_failure_propagates_from_engine():
