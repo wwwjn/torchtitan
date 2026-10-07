@@ -8,6 +8,7 @@ import contextlib
 import subprocess
 import sys
 import weakref
+from datetime import timedelta
 from functools import partial
 from types import SimpleNamespace
 from typing import Any, cast
@@ -20,6 +21,7 @@ from torchtitan.components.data.types import (
     TrainingMicrobatch,
 )
 from torchtitan.components.optim import Optim
+from torchtitan.config import CommConfig
 from torchtitan.distributed.cuda_graph import wrap_with_cuda_graph
 from torchtitan.experiments.graph_trainer.trainer import GraphTrainingEngine
 from torchtitan.models.common.aux_loss import AuxLoss
@@ -27,6 +29,32 @@ from torchtitan.observability.metrics import compute_training_performance_metric
 from torchtitan.observability.sdc_replayer import SDCReplayMismatch
 from torchtitan.trainer import Trainer
 from torchtitan.training_engine import ForwardBackwardResult, TrainingEngine
+
+
+@pytest.mark.parametrize(
+    ("backend", "expected_calls"),
+    [("default", 1), ("fake", 0), ("real_pp_fake_spmd", 0)],
+)
+def test_initial_timeout_is_applied_after_real_process_groups_are_created(
+    backend: Any,
+    expected_calls: int,
+) -> None:
+    """Real DeviceMesh groups receive the configured first-step timeout."""
+    comm_config = CommConfig(backend=backend, init_timeout_seconds=1_234)
+    parallelism_context = MagicMock()
+
+    with patch("torchtitan.trainer.dist_utils.set_pg_timeouts") as set_timeouts:
+        Trainer._apply_initial_process_group_timeouts(
+            comm_config,
+            parallelism_context,
+        )
+
+    assert set_timeouts.call_count == expected_calls
+    if expected_calls:
+        set_timeouts.assert_called_once_with(
+            timeout=timedelta(seconds=1_234),
+            parallelism_context=parallelism_context,
+        )
 
 
 def test_common_imports_do_not_require_dist_moe() -> None:

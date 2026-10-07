@@ -23,9 +23,10 @@ from torchtitan.components.data.loader import BaseDataLoader, DataloaderExhauste
 from torchtitan.components.data.types import TrainingMicrobatch
 from torchtitan.components.tokenizer import BaseTokenizer, HuggingFaceTokenizer
 from torchtitan.components.validator import BaseValidator, Validator
-from torchtitan.config import apply_overrides, Configurable, OverrideConfig
+from torchtitan.config import apply_overrides, CommConfig, Configurable, OverrideConfig
 from torchtitan.config.validation import validate_model_training_config
 from torchtitan.distributed import utils as dist_utils
+from torchtitan.distributed.parallelism_context import ParallelismContext
 from torchtitan.models.base.model import BaseModel
 from torchtitan.models.common.aux_loss import collect_aux_loss_metrics
 from torchtitan.observability import structured_logger as sl
@@ -136,6 +137,19 @@ class Trainer(Configurable):
     gradient_accumulation_steps: int
     num_pp_microbatches: int
 
+    @staticmethod
+    def _apply_initial_process_group_timeouts(
+        comm_config: CommConfig,
+        parallelism_context: ParallelismContext,
+    ) -> None:
+        """Apply the initialization timeout to groups created after world init."""
+        if comm_config.backend != "default":
+            return
+        dist_utils.set_pg_timeouts(
+            timeout=timedelta(seconds=comm_config.init_timeout_seconds),
+            parallelism_context=parallelism_context,
+        )
+
     # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
     @record
     def __init__(self, config: Config):
@@ -222,6 +236,14 @@ class Trainer(Configurable):
                 extra_states={DATALOADER: self.dataloader},
                 hf_assets_path=config.hf_assets_path,
                 create_seed_checkpoint=config.create_seed_checkpoint,
+            )
+            # DeviceMesh subgroups are created after init_process_group(), so
+            # they otherwise retain the backend's default timeout during the
+            # first update's lazy compilation instead of the configured
+            # initialization timeout.
+            self._apply_initial_process_group_timeouts(
+                config.comm,
+                parallelism_context,
             )
         except Exception:
             # config.build() cannot return this partially initialized Trainer,
