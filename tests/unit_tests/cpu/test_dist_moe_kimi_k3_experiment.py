@@ -139,16 +139,38 @@ def test_phased_round_robin_balances_partial_cycle_across_ep_ranks(
     )
 
 
-def test_v4_1_mxfp8_recipe_matches_256_gpu_long_context_workload() -> None:
-    """The Dist-MoE variant preserves V4.1's data and parallel topology."""
-    config = config_registry.kimi_k3_full_long_context_v4_1_dist_moe_mxfp8_gb200_256()
+@pytest.mark.parametrize(
+    ("factory", "expected_seq_len", "expected_num_microbatches", "data_root"),
+    [
+        (
+            config_registry.kimi_k3_full_long_context_v4_dist_moe_mxfp8_gb200_256,
+            65_536,
+            32,
+            config_registry._KIMI_K3_LONG_CONTEXT_64K_DATA_ROOT,
+        ),
+        (
+            config_registry.kimi_k3_full_long_context_v4_1_dist_moe_mxfp8_gb200_256,
+            32_768,
+            64,
+            config_registry._KIMI_K3_LONG_CONTEXT_DATA_ROOT,
+        ),
+    ],
+)
+def test_v4_mxfp8_recipes_match_256_gpu_long_context_workloads(
+    factory,
+    expected_seq_len: int,
+    expected_num_microbatches: int,
+    data_root: str,
+) -> None:
+    """The Dist-MoE variants preserve V4's data and parallel topology."""
+    config = factory()
     model = cast(KimiK3Model.Config, config.model)
 
     assert config.parallelism.pipeline_parallel_degree == 4
     assert config.parallelism.pipeline_parallel_schedule == "Interleaved1F1B"
     assert config.parallelism.pipeline_parallel_module_fqns_per_model_part is None
     assert config.parallelism.pipeline_parallel_layers_per_stage == 12
-    assert config.parallelism.num_pp_microbatches == 64
+    assert config.parallelism.num_pp_microbatches == expected_num_microbatches
     assert config.parallelism.pp_max_unsharded_active_stages == 1
     assert config.parallelism.context_parallel_degree == 16
     assert config.parallelism.context_parallel_load_balancer is None
@@ -156,9 +178,9 @@ def test_v4_1_mxfp8_recipe_matches_256_gpu_long_context_workload() -> None:
     assert config.parallelism.expert_parallel_degree == 64
     assert config.parallelism.fsdp_reshard_after_forward == "always"
 
-    assert model.max_context_length == 32_768
-    assert config.training.max_context_length == 32_768
-    assert config.training.num_tokens_per_microbatch_per_dp_rank == 32_768
+    assert model.max_context_length == expected_seq_len
+    assert config.training.max_context_length == expected_seq_len
+    assert config.training.num_tokens_per_microbatch_per_dp_rank == expected_seq_len
     assert config.training.num_tokens_per_train_step == 8_388_608
     assert config.training.steps == 12
     assert config.training.disable_cuda_graphs
@@ -170,8 +192,8 @@ def test_v4_1_mxfp8_recipe_matches_256_gpu_long_context_workload() -> None:
     dataset = config.dataloader.dataset
     assert isinstance(dataset, SingleDatasetConfig)
     assert isinstance(dataset.source, HuggingFaceStreamingSource.Config)
-    assert dataset.source.load_dataset_kwargs["data_files"].endswith(
-        "/seq32768/part-*.json.gz"
+    assert dataset.source.load_dataset_kwargs["data_files"] == (
+        f"{data_root}/seq{expected_seq_len}/part-*.json.gz"
     )
     assert isinstance(
         dataset.processor,

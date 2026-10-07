@@ -63,6 +63,13 @@ _KIMI_K3_LONG_CONTEXT_DATA_ROOT = os.environ.get(
         "c4-kimi-k3-long-context-v1"
     ),
 )
+_KIMI_K3_LONG_CONTEXT_64K_DATA_ROOT = os.environ.get(
+    "KIMI_K3_LONG_CONTEXT_64K_DATA_ROOT",
+    (
+        "/mnt/torchtrain_datasets/tree/shuhuay/k3-oss/datasets/"
+        "c4-kimi-k3-long-context-64k-v1"
+    ),
+)
 
 
 class _PretokenizedLongContextProcessor(SampleProcessor):
@@ -223,9 +230,13 @@ def _kimi_k3_manifold_c4_dataloader() -> GrainDataLoader.Config:
     )
 
 
-def _kimi_k3_long_context_dataloader(seq_len: int) -> GrainDataLoader.Config:
-    """Build the exact-row dataset used by the 32K context workload."""
-    data_files = f"{_KIMI_K3_LONG_CONTEXT_DATA_ROOT}/seq{seq_len}/part-*.json.gz"
+def _kimi_k3_long_context_dataloader(
+    seq_len: int,
+    *,
+    data_root: str = _KIMI_K3_LONG_CONTEXT_DATA_ROOT,
+) -> GrainDataLoader.Config:
+    """Build the exact-row dataset used by a long-context workload."""
+    data_files = f"{data_root}/seq{seq_len}/part-*.json.gz"
     dataset = SingleDatasetConfig(
         source=HuggingFaceStreamingSource.Config(
             path="json",
@@ -411,15 +422,18 @@ def kimi_k3_full_bf16_pretrain_dist_moe_pp8_fsdp64_ep64_gb200_512_v1_5() -> (
     )
 
 
-def kimi_k3_full_long_context_v4_1_dist_moe_mxfp8_gb200_256() -> Trainer.Config:
-    """Mirror the V4.1 32K BF16-state topology with MXFP8 Dist-MoE experts."""
+def _kimi_k3_full_long_context_v4_dist_moe_mxfp8_gb200_256(
+    *,
+    seq_len: int,
+    num_pp_microbatches: int,
+    data_root: str,
+) -> Trainer.Config:
+    """Build the V4 PP4/VP2 BF16-state topology with MXFP8 experts."""
     dist_moe = require_dist_moe()
-    seq_len = 32_768
     num_dp_shards = 4
-    num_pp_microbatches = 64
 
     # The debug flavor is only a container for shared trainer defaults; its
-    # own context limit is lower than the released model's 32K workload.
+    # own context limit is lower than the released model's long-context workload.
     config = kimi_k3_debugmodel()
     model = build_model_config(
         "Kimi-K3",
@@ -470,7 +484,10 @@ def kimi_k3_full_long_context_v4_1_dist_moe_mxfp8_gb200_256() -> Trainer.Config:
         )
     )
     config.hf_assets_path = _KIMI_K3_MANIFOLD_HF_ASSETS_PATH
-    config.dataloader = _kimi_k3_long_context_dataloader(seq_len)
+    config.dataloader = _kimi_k3_long_context_dataloader(
+        seq_len,
+        data_root=data_root,
+    )
     config.metrics = replace(config.metrics, enable_wandb=True)
     config.optim = replace(config.optim, optimizer=optimizer)
     config.parallelism = parallelism
@@ -505,3 +522,21 @@ def kimi_k3_full_long_context_v4_1_dist_moe_mxfp8_gb200_256() -> Trainer.Config:
         ],
     )
     return _use_transient_dist_muon_buffers(config)
+
+
+def kimi_k3_full_long_context_v4_dist_moe_mxfp8_gb200_256() -> Trainer.Config:
+    """Mirror the V4 64K BF16-state topology with MXFP8 Dist-MoE experts."""
+    return _kimi_k3_full_long_context_v4_dist_moe_mxfp8_gb200_256(
+        seq_len=65_536,
+        num_pp_microbatches=32,
+        data_root=_KIMI_K3_LONG_CONTEXT_64K_DATA_ROOT,
+    )
+
+
+def kimi_k3_full_long_context_v4_1_dist_moe_mxfp8_gb200_256() -> Trainer.Config:
+    """Mirror the V4.1 32K BF16-state topology with MXFP8 Dist-MoE experts."""
+    return _kimi_k3_full_long_context_v4_dist_moe_mxfp8_gb200_256(
+        seq_len=32_768,
+        num_pp_microbatches=64,
+        data_root=_KIMI_K3_LONG_CONTEXT_DATA_ROOT,
+    )
