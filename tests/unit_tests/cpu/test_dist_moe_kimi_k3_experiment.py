@@ -12,6 +12,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from torchtitan.components.optim.optimizer import DistMuon
 from torchtitan.distributed.activation_checkpoint import RegionAC
 from torchtitan.experiments.dist_moe_kimi_k3 import config_registry
 from torchtitan.models.common.dist_moe import DistMoeRoutedExperts
@@ -59,6 +60,16 @@ def test_full_recipes_preserve_workload_and_use_upstream_runtime(
     assert runtime.vmm_capacity_factor is None
     assert isinstance(config.activation_checkpoint, RegionAC.Config)
     assert config.activation_checkpoint.save_regions == []
+    dist_muon_configs = [
+        optimizer
+        for optimizer in config.optim.optimizer.optimizers
+        if isinstance(optimizer, DistMuon.Config)
+    ]
+    assert dist_muon_configs
+    assert all(
+        not optimizer.persistent_redistribution_buffers
+        for optimizer in dist_muon_configs
+    )
 
     experts = list(config.model.traverse(DistMoeRoutedExperts.Config))
     assert len(experts) == 92

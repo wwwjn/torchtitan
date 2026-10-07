@@ -25,6 +25,7 @@ from torchtitan.components.data import (
     SingleDatasetConfig,
 )
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
+from torchtitan.components.optim.optimizer import DistMuon
 from torchtitan.config.transform import apply_transforms
 from torchtitan.config.transform.dist_moe import DistMoeTransform
 from torchtitan.distributed.activation_checkpoint import RegionAC
@@ -141,6 +142,23 @@ def _full_recompute_runtime_config() -> DistMoeRuntime.Config:
     )
 
 
+def _use_transient_dist_muon_buffers(config: Trainer.Config) -> Trainer.Config:
+    """Release optimizer-only redistribution storage outside ``step()``."""
+    optimizer = replace(
+        config.optim.optimizer,
+        optimizers=[
+            replace(
+                optimizer_config,
+                persistent_redistribution_buffers=False,
+            )
+            if isinstance(optimizer_config, DistMuon.Config)
+            else optimizer_config
+            for optimizer_config in config.optim.optimizer.optimizers
+        ],
+    )
+    return replace(config, optim=replace(config.optim, optimizer=optimizer))
+
+
 def _kimi_k3_manifold_c4_dataloader() -> GrainDataLoader.Config:
     """Build the packed C4 stream used by the full-scale validation runs."""
     dataset = SingleDatasetConfig(
@@ -213,6 +231,7 @@ def kimi_k3_debugmodel_dist_moe_bf16_recompute_varlen_pp2_fsdp2_ep2() -> (
         dist_moe=_full_recompute_runtime_config(),
     )
     config = _use_phased_round_robin_routing(config)
+    config = _use_transient_dist_muon_buffers(config)
     return apply_transforms(config, [DistMoeTransform()])
 
 
@@ -302,6 +321,7 @@ def _kimi_k3_full_bf16_pretrain_dist_moe_pp8_fsdp64_ep64_gb200_512(
         dist_moe=_full_recompute_runtime_config(),
     )
     config = _use_phased_round_robin_routing(config)
+    config = _use_transient_dist_muon_buffers(config)
     return apply_transforms(config, [DistMoeTransform()])
 
 

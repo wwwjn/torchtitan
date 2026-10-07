@@ -200,6 +200,8 @@ class DistMuon(FlexShardDistMuon, BaseOptimizer):
         adjust_lr_fn: Literal[
             "original", "match_rms_adamw", "spectral_unclamped"
         ] | None = None
+        persistent_redistribution_buffers: bool = True
+        """Keep DistMuon exchange and compute scratch allocated between steps."""
 
     def __init__(
         self,
@@ -219,6 +221,9 @@ class DistMuon(FlexShardDistMuon, BaseOptimizer):
             eps=config.eps,
             ns_steps=config.ns_steps,
             adjust_lr_fn=config.adjust_lr_fn,
+            persistent_redistribution_buffers=(
+                config.persistent_redistribution_buffers
+            ),
         )
 
 

@@ -165,6 +165,7 @@ class DistMuon(Optimizer):
     _direction_row_scale_by_fqn: dict[str, Tensor]
     _redistribution_runtime: _BucketedRedistributionRuntime[_ParameterComputeLayout]
     _param_groups_frozen: bool
+    _persistent_redistribution_buffers: bool
 
     def __init__(
         self,
@@ -180,6 +181,7 @@ class DistMuon(Optimizer):
         eps: float = 1e-7,
         ns_steps: int = 5,
         adjust_lr_fn: str | None = None,
+        persistent_redistribution_buffers: bool = True,
     ) -> None:
         defaults = {
             "lr": lr,
@@ -193,6 +195,7 @@ class DistMuon(Optimizer):
         }
         self._first_step_validated = False
         self._param_groups_frozen = False
+        self._persistent_redistribution_buffers = persistent_redistribution_buffers
         super().__init__(_normalize_param_groups(params), defaults)
         self._validate_groups()
         self._param_groups_frozen = True
@@ -201,6 +204,8 @@ class DistMuon(Optimizer):
             compute_sharding_by_fqn=compute_sharding_by_fqn,
             bucket_configs=bucket_configs,
         )
+        if not self._persistent_redistribution_buffers:
+            self._redistribution_runtime.release_buffers()
 
     @overload
     def step(self, closure: None = None) -> None:
@@ -218,13 +223,22 @@ class DistMuon(Optimizer):
                 loss = closure()
 
         self._preflight_step()
-        self._redistribution_runtime.run(
-            self._bucket_plans,
-            local_tensor_spec=self._local_tensor_spec,
-            prepare=self._prepare_local,
-            compute=self._compute_update,
-            finalize=self._apply_update,
-        )
+        if not self._persistent_redistribution_buffers:
+            self._redistribution_runtime.reserve_buffers(
+                self._bucket_plans,
+                local_tensor_spec=self._local_tensor_spec,
+            )
+        try:
+            self._redistribution_runtime.run(
+                self._bucket_plans,
+                local_tensor_spec=self._local_tensor_spec,
+                prepare=self._prepare_local,
+                compute=self._compute_update,
+                finalize=self._apply_update,
+            )
+        finally:
+            if not self._persistent_redistribution_buffers:
+                self._redistribution_runtime.release_buffers()
         return loss
 
     def add_param_group(self, param_group: dict[str, Any]) -> None:
@@ -2017,6 +2031,8 @@ def _after_load_state_dict(optimizer: Optimizer) -> None:
         muon._bucket_plans,
         local_tensor_spec=muon._local_tensor_spec,
     )
+    if not muon._persistent_redistribution_buffers:
+        muon._redistribution_runtime.release_buffers()
     # init_optim_state may have validated placeholder state before the load.
     muon._first_step_validated = False
 

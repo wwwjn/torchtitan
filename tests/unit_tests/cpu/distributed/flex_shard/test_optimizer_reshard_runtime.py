@@ -12,7 +12,10 @@ import torch
 
 from torchtitan.distributed.flex_shard._optimizer_reshard_runtime import (
     _batched_copy_,
+    _BucketedRedistributionRuntime,
+    _BufferSlot,
     _initialize_all_to_all_communicators,
+    _ReservedBuffers,
 )
 
 
@@ -131,6 +134,32 @@ class TestBatchedCopy(unittest.TestCase):
                 (torch.empty(3), torch.empty(4)),
                 (torch.empty(9), torch.empty(4)),
             )
+
+
+class TestRuntimeBufferLifetime(unittest.TestCase):
+    def test_release_buffers_preserves_context_and_clears_tensor_references(self):
+        device = torch.device("cpu")
+        key = (device, torch.float32)
+        runtime = _BucketedRedistributionRuntime(device)
+        runtime._local_slot.buffers[key] = _ReservedBuffers(
+            compute_scratch=torch.empty(4)
+        )
+        remote_buffers = _BufferSlot(
+            buffers={
+                key: _ReservedBuffers(
+                    storage_exchange=torch.empty(8),
+                    compute_exchange=torch.empty(8),
+                )
+            }
+        )
+        context = SimpleNamespace(slots=(SimpleNamespace(buffers=remote_buffers),))
+        runtime._context = context  # pyrefly: ignore [bad-assignment]
+
+        runtime.release_buffers()
+
+        self.assertEqual(runtime._local_slot.buffers, {})
+        self.assertEqual(remote_buffers.buffers, {})
+        self.assertIs(runtime._context, context)
 
 
 if __name__ == "__main__":
