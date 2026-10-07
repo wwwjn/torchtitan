@@ -118,6 +118,48 @@ def _vision_inputs(
     return pixel_values, grid_thw
 
 
+class TestSelectiveDecoderCPUOffload(DTensorTestBase):
+    @property
+    def world_size(self) -> int:
+        return 1
+
+    @with_comms
+    def test_only_selected_layer_is_offloaded(self) -> None:
+        mesh = self.build_device_mesh()
+        with torch.device("meta"):
+            model = _TinyVLM()
+
+        apply_fsdp_to_decoder(
+            model,
+            mesh,
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.bfloat16,
+            pp_enabled=False,
+            cpu_offload_layer_fqns=("layers.1",),
+        )
+        model.to_empty(device=self.device_type)
+        model.layers["1"].to_empty(device="cpu")
+        with torch.no_grad():
+            model.init_weights()
+
+        assert not isinstance(_offload_policy(model.layers["0"]), CPUOffloadPolicy)
+        assert isinstance(_offload_policy(model.layers["1"]), CPUOffloadPolicy)
+        assert model.layers["0"].w.weight.to_local().device.type == self.device_type
+        assert model.layers["1"].w.weight.to_local().device.type == "cpu"
+
+        tokens = torch.randint(0, 64, (2, 4), device=self.device_type)
+        pixels = torch.randn(
+            2,
+            4,
+            32,
+            device=self.device_type,
+            dtype=torch.bfloat16,
+        )
+        model(tokens, pixels).sum().backward()
+        assert model.layers["1"].w.weight.grad is not None
+        assert model.layers["1"].w.weight.grad.to_local().device.type == "cpu"
+
+
 class TestVisionEncoderCPUOffload(DTensorTestBase):
     @property
     def world_size(self) -> int:

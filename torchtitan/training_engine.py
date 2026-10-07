@@ -148,12 +148,34 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                     "(parallelism.pipeline_parallel_degree=1)."
                 )
 
-            if (
-                self.training.enable_cpu_offload
-                and "dp_shard" not in self.debug.distinct_seed_mesh_axes
-            ):
+            selective_cpu_offload = bool(self.parallelism.fsdp_cpu_offload_layer_fqns)
+            if self.training.enable_cpu_offload and selective_cpu_offload:
                 raise ValueError(
-                    "training.enable_cpu_offload requires 'dp_shard' in "
+                    "training.enable_cpu_offload and "
+                    "parallelism.fsdp_cpu_offload_layer_fqns are mutually "
+                    "exclusive"
+                )
+            pipeline_parts = (
+                self.parallelism.pipeline_parallel_module_fqns_per_model_part
+            )
+            if selective_cpu_offload and pipeline_parts is not None:
+                pipeline_module_fqns = {
+                    module_fqn for part in pipeline_parts for module_fqn in part
+                }
+                missing_fqns = sorted(
+                    set(self.parallelism.fsdp_cpu_offload_layer_fqns)
+                    - pipeline_module_fqns
+                )
+                if missing_fqns:
+                    raise ValueError(
+                        "Selective FSDP CPU-offload layers are absent from the "
+                        "explicit pipeline partition: " + ", ".join(missing_fqns)
+                    )
+            if (
+                self.training.enable_cpu_offload or selective_cpu_offload
+            ) and "dp_shard" not in self.debug.distinct_seed_mesh_axes:
+                raise ValueError(
+                    "FSDP CPU offload requires 'dp_shard' in "
                     "debug.distinct_seed_mesh_axes; otherwise every FSDP shard "
                     "is initialized with the same CPU RNG stream."
                 )
@@ -297,7 +319,10 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         with sl.log_trace_span("torch_distributed_init"):
             topology = dist_utils.init_distributed(
                 config.comm,
-                enable_cpu_backend=config.training.enable_cpu_offload,
+                enable_cpu_backend=(
+                    config.training.enable_cpu_offload
+                    or bool(config.parallelism.fsdp_cpu_offload_layer_fqns)
+                ),
                 base_folder=self.output_dir,
                 pipeline_parallel_degree=config.parallelism.pipeline_parallel_degree,
             )
@@ -350,6 +375,11 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             buffer_device = None
         elif self.config.training.enable_cpu_offload:
             init_device = "cpu"
+            buffer_device = torch.device(self.device.type)
+        elif self.config.parallelism.fsdp_cpu_offload_layer_fqns:
+            init_device = self.device.type
+            # Selectively offloaded layers are materialized on CPU below, but
+            # model buffers remain device-resident.
             buffer_device = torch.device(self.device.type)
         else:
             init_device = self.device.type
@@ -410,6 +440,21 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         with self.parallelism_context.activate_spmd():
             for model_part in self.model_parts:
                 model_part.to_empty(device=init_device)
+                local_offload_layers = []
+                for module_fqn in self.config.parallelism.fsdp_cpu_offload_layer_fqns:
+                    try:
+                        module = model_part.get_submodule(module_fqn)
+                    except AttributeError:
+                        # Pipeline ranks only materialize their local model
+                        # part, so FQNs owned by remote stages are absent.
+                        continue
+                    module.to_empty(device="cpu")
+                    local_offload_layers.append(module_fqn)
+                if local_offload_layers:
+                    logger.info(
+                        "Materialized selective FSDP CPU-offload layers: %s",
+                        ", ".join(local_offload_layers),
+                    )
                 with torch.no_grad():
                     model_part.init_weights(buffer_device=buffer_device)
                 model_part.train()
@@ -648,9 +693,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                 global_loss_token_counts,
             )
 
-        if (
-            dist_moe_runtime := getattr(self, "_dist_moe_runtime", None)
-        ) is not None:
+        if (dist_moe_runtime := getattr(self, "_dist_moe_runtime", None)) is not None:
             dist_moe_runtime.begin_overflow_check()
         self.loss = result.loss
         return result
@@ -879,9 +922,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         current_step = self.num_completed_steps + 1
         if hasattr(self, "checkpointer"):
             self.checkpointer.maybe_wait_for_staging()
-        if (
-            dist_moe_runtime := getattr(self, "_dist_moe_runtime", None)
-        ) is not None:
+        if (dist_moe_runtime := getattr(self, "_dist_moe_runtime", None)) is not None:
             dist_moe_runtime.finish_overflow_check()
         grad_norm = self.optim.step(
             self.loss,
