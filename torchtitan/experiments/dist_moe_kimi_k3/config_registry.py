@@ -427,8 +427,9 @@ def _kimi_k3_full_long_context_v4_dist_moe_mxfp8_gb200_256(
     seq_len: int,
     num_pp_microbatches: int,
     data_root: str,
+    resident_dtype: str,
 ) -> Trainer.Config:
-    """Build the V4 PP4/VP2 BF16-state topology with MXFP8 experts."""
+    """Build the V4 PP4/VP2 topology with MXFP8 Dist-MoE experts."""
     dist_moe = require_dist_moe()
     num_dp_shards = 4
 
@@ -470,7 +471,7 @@ def _kimi_k3_full_long_context_v4_dist_moe_mxfp8_gb200_256(
         num_tokens_per_train_step=(seq_len * num_pp_microbatches * num_dp_shards),
         steps=12,
         disable_cuda_graphs=True,
-        dtype="bfloat16",
+        dtype=resident_dtype,
         mixed_precision_param="bfloat16",
         mixed_precision_reduce="bfloat16",
         empty_device_cache_after_step=True,
@@ -530,6 +531,7 @@ def kimi_k3_full_long_context_v4_dist_moe_mxfp8_gb200_256() -> Trainer.Config:
         seq_len=65_536,
         num_pp_microbatches=32,
         data_root=_KIMI_K3_LONG_CONTEXT_64K_DATA_ROOT,
+        resident_dtype="bfloat16",
     )
 
 
@@ -539,4 +541,15 @@ def kimi_k3_full_long_context_v4_1_dist_moe_mxfp8_gb200_256() -> Trainer.Config:
         seq_len=32_768,
         num_pp_microbatches=64,
         data_root=_KIMI_K3_LONG_CONTEXT_DATA_ROOT,
+        resident_dtype="bfloat16",
+    )
+
+
+def kimi_k3_full_long_context_v4_2_dist_moe_mxfp8_gb200_256() -> Trainer.Config:
+    """Mirror the V4.2 32K FP32-state topology with MXFP8 Dist-MoE experts."""
+    return _kimi_k3_full_long_context_v4_dist_moe_mxfp8_gb200_256(
+        seq_len=32_768,
+        num_pp_microbatches=64,
+        data_root=_KIMI_K3_LONG_CONTEXT_DATA_ROOT,
+        resident_dtype="float32",
     )

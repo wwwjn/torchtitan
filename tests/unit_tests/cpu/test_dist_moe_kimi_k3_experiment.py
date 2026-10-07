@@ -140,19 +140,34 @@ def test_phased_round_robin_balances_partial_cycle_across_ep_ranks(
 
 
 @pytest.mark.parametrize(
-    ("factory", "expected_seq_len", "expected_num_microbatches", "data_root"),
+    (
+        "factory",
+        "expected_seq_len",
+        "expected_num_microbatches",
+        "data_root",
+        "resident_dtype",
+    ),
     [
         (
             config_registry.kimi_k3_full_long_context_v4_dist_moe_mxfp8_gb200_256,
             65_536,
             32,
             config_registry._KIMI_K3_LONG_CONTEXT_64K_DATA_ROOT,
+            "bfloat16",
         ),
         (
             config_registry.kimi_k3_full_long_context_v4_1_dist_moe_mxfp8_gb200_256,
             32_768,
             64,
             config_registry._KIMI_K3_LONG_CONTEXT_DATA_ROOT,
+            "bfloat16",
+        ),
+        (
+            config_registry.kimi_k3_full_long_context_v4_2_dist_moe_mxfp8_gb200_256,
+            32_768,
+            64,
+            config_registry._KIMI_K3_LONG_CONTEXT_DATA_ROOT,
+            "float32",
         ),
     ],
 )
@@ -161,6 +176,7 @@ def test_v4_mxfp8_recipes_match_256_gpu_long_context_workloads(
     expected_seq_len: int,
     expected_num_microbatches: int,
     data_root: str,
+    resident_dtype: str,
 ) -> None:
     """The Dist-MoE variants preserve V4's data and parallel topology."""
     config = factory()
@@ -184,7 +200,7 @@ def test_v4_mxfp8_recipes_match_256_gpu_long_context_workloads(
     assert config.training.num_tokens_per_train_step == 8_388_608
     assert config.training.steps == 12
     assert config.training.disable_cuda_graphs
-    assert config.training.dtype == "bfloat16"
+    assert config.training.dtype == resident_dtype
     assert config.training.mixed_precision_param == "bfloat16"
     assert config.training.mixed_precision_reduce == "bfloat16"
     assert config.training.empty_device_cache_after_step
