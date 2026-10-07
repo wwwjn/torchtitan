@@ -885,6 +885,9 @@ def test_optim_step_waits_for_checkpoint() -> None:
                 maybe_wait_for_staging=lambda: events.append("checkpoint")
             ),
             optim=optim,
+            config=SimpleNamespace(
+                training=SimpleNamespace(empty_device_cache_after_step=False)
+            ),
         ),
     )
 
@@ -908,6 +911,30 @@ def no_registered_aux_losses():
     yield
     AuxLoss._group_counts.clear()
     AuxLoss._group_counts.update(saved_group_counts)
+
+
+def test_optim_step_can_release_device_cache() -> None:
+    engine = cast(
+        TrainingEngine,
+        SimpleNamespace(
+            num_completed_steps=0,
+            loss=torch.tensor(1.0),
+            optim=SimpleNamespace(
+                step=MagicMock(return_value=torch.tensor(2.0)),
+            ),
+            config=SimpleNamespace(
+                training=SimpleNamespace(empty_device_cache_after_step=True)
+            ),
+        ),
+    )
+
+    with patch(
+        "torchtitan.training_engine.utils.device_module.empty_cache"
+    ) as empty_cache:
+        TrainingEngine.optim_step(engine)
+
+    empty_cache.assert_called_once_with()
+    assert engine.num_completed_steps == 1
 
 
 @pytest.mark.parametrize(
@@ -948,6 +975,7 @@ def test_trainer_accumulates_reused_cuda_graph_losses(
                 training=SimpleNamespace(
                     cuda_graph_per_microbatch_group=False,
                     disable_cuda_graphs=False,
+                    empty_device_cache_after_step=False,
                 ),
             ),
             optim=SimpleNamespace(

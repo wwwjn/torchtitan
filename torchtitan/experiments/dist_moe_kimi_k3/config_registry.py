@@ -358,6 +358,9 @@ def _kimi_k3_full_bf16_pretrain_dist_moe_pp8_fsdp64_ep64_gb200_512(
         dtype="float32",
         mixed_precision_param="bfloat16",
         mixed_precision_reduce="float32",
+        # cuDNN SDPA allocates outside PyTorch's caching allocator. Release
+        # inactive pages once per update, after all 64 PP actions complete.
+        empty_device_cache_after_step=True,
     )
     config = replace(
         config,

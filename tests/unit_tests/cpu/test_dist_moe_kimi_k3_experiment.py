@@ -58,6 +58,7 @@ def test_full_recipes_preserve_workload_and_use_upstream_runtime(
     assert config.training.dtype == "float32"
     assert config.training.mixed_precision_param == "bfloat16"
     assert config.training.mixed_precision_reduce == "float32"
+    assert config.training.empty_device_cache_after_step
     assert "attention_residual" in config.model.local_compile_regions
     assert config.parallelism.pipeline_parallel_degree == 8
     assert config.parallelism.data_parallel_shard_degree == 64
