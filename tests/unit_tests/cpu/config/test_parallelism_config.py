@@ -60,6 +60,10 @@ def test_parallelism_config_disables_fsdp_symm_mem_by_default() -> None:
     assert ParallelismConfig().fsdp_symm_mem_scope is None
 
 
+def test_parallelism_config_enables_explicit_backward_prefetch_by_default() -> None:
+    assert ParallelismConfig().fsdp_enable_explicit_backward_prefetch
+
+
 @pytest.mark.parametrize("scope", ["all", "dense"])
 def test_parallelism_config_accepts_fsdp_symm_mem_scopes(
     scope: FSDPSymmMemScope, monkeypatch: pytest.MonkeyPatch

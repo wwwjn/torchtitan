@@ -66,6 +66,44 @@ def test_apply_fsdp_to_decoder_forwards_param_dtype_override_fn() -> None:
     assert mp_policy.param_dtype_override_fn is param_dtype_override_fn
 
 
+@pytest.mark.parametrize("enable_backward_prefetch", [True, False])
+def test_apply_fsdp_to_decoder_configures_explicit_backward_prefetch(
+    enable_backward_prefetch: bool,
+) -> None:
+    """EP models may trade backward communication overlap for peak memory."""
+    model = nn.Module()
+    model.enable_weight_tying = False
+    model.tok_embeddings = nn.Module()
+    model.norm = nn.Module()
+    model.lm_head = nn.Module()
+    layer = nn.Module()
+    layer.moe_enabled = False
+    model.layers = nn.ModuleDict({"0": layer})
+    for module in (model.tok_embeddings, model.norm, model.lm_head, layer):
+        module.set_modules_to_forward_prefetch = mock.Mock()
+        module.set_modules_to_backward_prefetch = mock.Mock()
+    dp_mesh = mock.Mock(mesh_dim_names=("dp_shard",))
+
+    with mock.patch("torchtitan.distributed.fsdp.fully_shard"):
+        apply_fsdp_to_decoder(
+            model,
+            dp_mesh,
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            pp_enabled=True,
+            ep_degree=2,
+            enable_explicit_backward_prefetch=enable_backward_prefetch,
+        )
+
+    model.tok_embeddings.set_modules_to_forward_prefetch.assert_called_once_with(
+        [layer]
+    )
+    assert model.lm_head.set_modules_to_backward_prefetch.called is (
+        enable_backward_prefetch
+    )
+    assert layer.set_modules_to_backward_prefetch.called is enable_backward_prefetch
+
+
 def test_stacked_linear_shard_placements_use_num_linears() -> None:
     module = nn.Module()
     stacked = Linear.Config(
