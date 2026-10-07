@@ -67,7 +67,7 @@ def test_apply_fsdp_to_decoder_forwards_param_dtype_override_fn() -> None:
 
 
 @pytest.mark.parametrize("enable_backward_prefetch", [True, False])
-def test_apply_fsdp_to_decoder_configures_explicit_backward_prefetch(
+def test_apply_fsdp_to_decoder_configures_backward_prefetch_policy(
     enable_backward_prefetch: bool,
 ) -> None:
     """EP models may trade backward communication overlap for peak memory."""
@@ -98,10 +98,16 @@ def test_apply_fsdp_to_decoder_configures_explicit_backward_prefetch(
     model.tok_embeddings.set_modules_to_forward_prefetch.assert_called_once_with(
         [layer]
     )
-    assert model.lm_head.set_modules_to_backward_prefetch.called is (
-        enable_backward_prefetch
-    )
-    assert layer.set_modules_to_backward_prefetch.called is enable_backward_prefetch
+    if enable_backward_prefetch:
+        model.lm_head.set_modules_to_backward_prefetch.assert_called_once_with([layer])
+        layer.set_modules_to_backward_prefetch.assert_called_once_with(
+            [model.tok_embeddings]
+        )
+        model.tok_embeddings.set_modules_to_backward_prefetch.assert_not_called()
+        model.norm.set_modules_to_backward_prefetch.assert_not_called()
+    else:
+        for module in (model.tok_embeddings, model.norm, model.lm_head, layer):
+            module.set_modules_to_backward_prefetch.assert_called_once_with([module])
 
 
 def test_stacked_linear_shard_placements_use_num_linears() -> None:

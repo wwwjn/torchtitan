@@ -506,30 +506,33 @@ def apply_fsdp_to_decoder(
                 [model.norm, model.lm_head]
             )
 
-    if enable_explicit_backward_prefetch:
-        # pyrefly: ignore [no-matching-overload]
-        reversed_transformer_blocks = list(reversed(model.layers.values()))
-        prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
-
-        if (
-            model.norm is not None
-            and model.lm_head is not None
-            and len(model.layers) > 0
-        ):
-            model.lm_head.set_modules_to_backward_prefetch(
-                [reversed_transformer_blocks[0]]
-            )
-
-        for transformer_block, prev_transformer_block in zip(
-            reversed_transformer_blocks, prev_transformer_blocks
-        ):
-            if prev_transformer_block is not None:
-                # pyrefly: ignore [missing-attribute]
-                transformer_block.set_modules_to_backward_prefetch(
-                    [prev_transformer_block]
+    if not enable_explicit_backward_prefetch:
+        # An empty explicit target list enables FSDP's implicit fallback
+        # prefetch. Point each FSDP state at itself instead: the state is
+        # already unsharded when the hook runs, so this is a no-op that also
+        # suppresses the fallback and its extra live parameter unit.
+        for module in model.modules():
+            if callable(
+                set_backward_prefetch := getattr(
+                    module, "set_modules_to_backward_prefetch", None
                 )
-            elif model.tok_embeddings is not None:
-                # pyrefly: ignore [missing-attribute]
-                transformer_block.set_modules_to_backward_prefetch(
-                    [model.tok_embeddings]
-                )
+            ):
+                set_backward_prefetch([module])
+        return
+
+    # pyrefly: ignore [no-matching-overload]
+    reversed_transformer_blocks = list(reversed(model.layers.values()))
+    prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
+
+    if model.norm is not None and model.lm_head is not None and len(model.layers) > 0:
+        model.lm_head.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
+
+    for transformer_block, prev_transformer_block in zip(
+        reversed_transformer_blocks, prev_transformer_blocks
+    ):
+        if prev_transformer_block is not None:
+            # pyrefly: ignore [missing-attribute]
+            transformer_block.set_modules_to_backward_prefetch([prev_transformer_block])
+        elif model.tok_embeddings is not None:
+            # pyrefly: ignore [missing-attribute]
+            transformer_block.set_modules_to_backward_prefetch([model.tok_embeddings])
