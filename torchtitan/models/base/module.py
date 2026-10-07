@@ -17,6 +17,7 @@ import spmd_types as spmd
 import torch
 import torch.nn as nn
 from spmd_types import SpmdType
+from torch.distributed.tensor import DTensor
 from torch.utils._pytree import tree_map
 
 from torchtitan.config import Configurable
@@ -216,7 +217,19 @@ class Module(nn.Module, Configurable):
                 f"{type(self).__name__}. "
                 f"Available: {list(self._param_init.keys())}"
             )
-        self._param_init[name](param)
+        init_target = param
+        if (
+            isinstance(param, DTensor)
+            and param.device.type == "cpu"
+            and param.device_mesh.device_type == "cuda"
+        ):
+            # CPU-offloaded FSDP parameters retain a CUDA DeviceMesh. DTensor
+            # random dispatch does not advance the CPU RNG across repeated
+            # draws, so rejection-sampling initializers may never terminate.
+            # CPU offload requires distinct dp_shard seeds, making direct
+            # local-shard initialization both independent and deterministic.
+            init_target = param.to_local()
+        self._param_init[name](init_target)
 
     def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
         """Initialize this module's own buffers.

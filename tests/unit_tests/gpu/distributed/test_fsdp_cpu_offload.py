@@ -4,11 +4,13 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from functools import partial
+
 import pytest
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.fsdp import CPUOffloadPolicy
+from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard
 from torch.distributed.fsdp._fully_shard._fsdp_state import _get_module_fsdp_state
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
@@ -18,6 +20,7 @@ from torchtitan.distributed.fsdp import (
     apply_fsdp_to_decoder,
     apply_fsdp_to_multimodal_encoder,
 )
+from torchtitan.models.common.linear import Linear
 from torchtitan.models.muse_spark.flavors import muse_spark_navit_encoder_config
 from torchtitan.models.muse_spark.vision_encoder import NaViTEncoder
 
@@ -177,6 +180,34 @@ class TestVisionEncoderCPUOffload(DTensorTestBase):
         model = self._build(cpu_offload=False)
         assert not isinstance(_offload_policy(model.vision_encoder), CPUOffloadPolicy)
         assert not isinstance(_offload_policy(model.tok_embeddings), CPUOffloadPolicy)
+
+    @with_comms
+    def test_rejection_sampling_initializes_offloaded_dtensor(self) -> None:
+        mesh = self.build_device_mesh()
+        bound = 3 / 16
+        with torch.device("meta"):
+            linear = Linear.Config(
+                in_features=256,
+                out_features=2048,
+                param_init={
+                    "weight": partial(
+                        nn.init.trunc_normal_,
+                        std=1 / 16,
+                        a=-bound,
+                        b=bound,
+                    )
+                },
+            ).build()
+
+        fully_shard(linear, mesh=mesh, offload_policy=CPUOffloadPolicy())
+        linear.to_empty(device="cpu")
+        torch.manual_seed(1234 + self.rank)
+        linear.init_states()
+
+        local_weight = linear.weight.to_local()
+        assert local_weight.is_pinned()
+        assert torch.all(local_weight >= -bound)
+        assert torch.all(local_weight <= bound)
 
 
 class TestConditionalVisionFSDP(DTensorTestBase):
