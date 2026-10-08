@@ -56,12 +56,25 @@ class TorchTitanPipelineStage(PipelineStage):
         self,
         *args: Any,
         empty_cache_before_gradient_reduction: bool = False,
+        empty_cache_before_first_backward: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.empty_cache_before_gradient_reduction = (
             empty_cache_before_gradient_reduction
         )
+        self.empty_cache_before_first_backward = empty_cache_before_first_backward
+        self._emptied_cache_before_first_backward = False
+
+    def backward_one_chunk(self, *args: Any, **kwargs: Any):
+        """Run backward after the optional one-time allocator cache release."""
+        if (
+            self.empty_cache_before_first_backward
+            and not self._emptied_cache_before_first_backward
+        ):
+            torch.get_device_module(self.device).empty_cache()
+            self._emptied_cache_before_first_backward = True
+        return super().backward_one_chunk(*args, **kwargs)
 
     def perform_reduce_grad(self, grad_scale_factor: int) -> None:
         """Finalize stage gradients after applying the configured cache policy."""
@@ -161,6 +174,9 @@ def pipeline_llm(
         stage_io=stage_io,
         empty_cache_before_gradient_reduction=(
             parallelism.pipeline_parallel_empty_cache_before_gradient_reduction
+        ),
+        empty_cache_before_first_backward=(
+            parallelism.pipeline_parallel_empty_cache_before_first_backward
         ),
     )
 
@@ -872,6 +888,7 @@ def _pipeline_module_split(
     get_mesh: Callable | None = None,
     stage_io: _DecoderStageIO | None = None,
     empty_cache_before_gradient_reduction: bool = False,
+    empty_cache_before_first_backward: bool = False,
 ) -> tuple[list[PipelineStage], list[BaseModel]]:
     """Create pipeline stages based on specified module names for each stage.
 
@@ -931,6 +948,7 @@ def _pipeline_module_split(
             empty_cache_before_gradient_reduction=(
                 empty_cache_before_gradient_reduction
             ),
+            empty_cache_before_first_backward=empty_cache_before_first_backward,
             **(
                 _static_stage_metadata(stage_io, stage_idx, num_stages)
                 if stage_io is not None

@@ -150,6 +150,8 @@ class TestForwardOnly(unittest.TestCase):
     def test_eval_backward_routes_nothing_and_forgets_the_chunk(self):
         stage = AttnResPipelineStage.__new__(AttnResPipelineStage)
         stage._has_backward = False
+        stage.empty_cache_before_first_backward = False
+        stage._emptied_cache_before_first_backward = False
         stage._forward_chunk_states = {0: object()}
         stage.bwd_cache = {}
         stage._order = {0: [0, 1]}

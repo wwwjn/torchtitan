@@ -64,6 +64,11 @@ def _as_attn_res_stage(
             "empty_cache_before_gradient_reduction",
             False,
         ),
+        empty_cache_before_first_backward=getattr(
+            stage,
+            "empty_cache_before_first_backward",
+            False,
+        ),
         **(stage_metadata or {}),
     )
     # The schedule wrote its stage-to-rank map onto the stage it was handed.

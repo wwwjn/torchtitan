@@ -55,6 +55,30 @@ def test_pipeline_stage_can_release_cache_before_gradient_reduction():
     assert events == ["empty_cache", "reduce"]
 
 
+def test_pipeline_stage_releases_cache_only_before_first_backward():
+    """The startup cache release is bounded to one call per local stage."""
+    stage = TorchTitanPipelineStage.__new__(TorchTitanPipelineStage)
+    stage.empty_cache_before_first_backward = True
+    stage._emptied_cache_before_first_backward = False
+    stage.device = torch.device("cuda")
+    events = []
+    device_module = Mock()
+    device_module.empty_cache.side_effect = lambda: events.append("empty_cache")
+
+    with (
+        patch("torch.get_device_module", return_value=device_module),
+        patch.object(
+            pipeline_parallel.PipelineStage,
+            "backward_one_chunk",
+            side_effect=lambda chunk: events.append(f"backward_{chunk}"),
+        ),
+    ):
+        stage.backward_one_chunk(0)
+        stage.backward_one_chunk(1)
+
+    assert events == ["empty_cache", "backward_0", "backward_1"]
+
+
 def test_pipeline_with_first_last_stage_modules_prepends_present_modules(monkeypatch):
     model = nn.Module()
     model.vision_encoder = nn.Linear(2, 2)

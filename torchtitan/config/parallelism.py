@@ -168,6 +168,14 @@ class ParallelismConfig:
     would otherwise prevent the reduced-gradient output allocation.
     """
 
+    pipeline_parallel_empty_cache_before_first_backward: bool = False
+    """Release unused cached device memory before each PP stage's first backward.
+
+    This runs at most once per local stage for the process lifetime. It is
+    intended to reclaim startup and first-forward allocator fragments without
+    placing cache management on every pipeline action.
+    """
+
     pp_max_unsharded_active_stages: int | None = None
     """Maximum local pipeline stages whose parameters may remain unsharded.
 
