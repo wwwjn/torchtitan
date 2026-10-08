@@ -174,12 +174,14 @@ class TestTraceAnnotationExport(TestCase):
 
     ANNOTATIONS = {42: [{_MODULE_FQN: "layers.0.attention.wq"}]}
 
-    def _run_profiler(self, supports_annotations: bool) -> list[tuple[str, Any]]:
-        """Drive one profile cycle, returning (path, cuda_graph_annotations) per export."""
-        calls: list[tuple[str, Any]] = []
+    def _run_profiler(
+        self, supports_annotations: bool, supports_graph_lanes: bool = True
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """Drive one profile cycle, returning the path and kwargs for each export."""
+        calls: list[tuple[str, dict[str, Any]]] = []
 
         def record_export(self_prof, path, *args, **kwargs):
-            calls.append((path, kwargs.get("cuda_graph_annotations")))
+            calls.append((path, kwargs))
 
         with (
             tempfile.TemporaryDirectory() as tmp,
@@ -191,6 +193,10 @@ class TestTraceAnnotationExport(TestCase):
             patch(
                 "torchtitan.observability.profiler._EXPORT_SUPPORTS_ANNOTATIONS",
                 supports_annotations,
+            ),
+            patch(
+                "torchtitan.observability.profiler._EXPORT_SUPPORTS_GRAPH_LANES",
+                supports_graph_lanes,
             ),
             patch.object(
                 torch.profiler.profile,
@@ -218,18 +224,26 @@ class TestTraceAnnotationExport(TestCase):
     def test_annotations_baked_into_export(self):
         """The trace handler hands the captured annotations to the export rather than
         joining them onto the written file afterwards."""
-        path, passed = self._run_profiler(supports_annotations=True)[0]
+        path, kwargs = self._run_profiler(supports_annotations=True)[0]
         # Profiler exports gzip-compressed traces (.json.gz) since #3483; the exporter
         # keys compression off that suffix and bakes the annotations in as it writes.
         self.assertTrue(path.endswith("rank0_trace.json.gz"))
-        self.assertEqual(passed, self.ANNOTATIONS)
+        self.assertEqual(kwargs["cuda_graph_annotations"], self.ANNOTATIONS)
+        self.assertEqual(kwargs["graph_lanes"], "all")
+
+    def test_annotations_export_without_graph_lane_support(self):
+        """Older torch versions still receive annotations without lane merging."""
+        _, kwargs = self._run_profiler(
+            supports_annotations=True, supports_graph_lanes=False
+        )[0]
+        self.assertEqual(kwargs, {"cuda_graph_annotations": self.ANNOTATIONS})
 
     def test_export_still_runs_without_annotation_support(self):
         """On a torch whose export_chrome_trace predates cuda_graph_annotations the
         trace is still written, just without them."""
-        path, passed = self._run_profiler(supports_annotations=False)[0]
+        path, kwargs = self._run_profiler(supports_annotations=False)[0]
         self.assertTrue(path.endswith("rank0_trace.json.gz"))
-        self.assertIsNone(passed)
+        self.assertEqual(kwargs, {})
 
 
 if __name__ == "__main__":

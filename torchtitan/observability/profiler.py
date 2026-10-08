@@ -12,6 +12,7 @@ import os
 import pickle
 import time
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -28,6 +29,10 @@ logger = logging.getLogger(__name__)
 
 _EXPORT_SUPPORTS_ANNOTATIONS = (
     "cuda_graph_annotations"
+    in inspect.signature(torch.profiler.profile.export_chrome_trace).parameters
+)
+_EXPORT_SUPPORTS_GRAPH_LANES = (
+    "graph_lanes"
     in inspect.signature(torch.profiler.profile.export_chrome_trace).parameters
 )
 
@@ -333,7 +338,20 @@ class Profiler(Configurable):
                     "annotations."
                 )
                 annotations = None
-            extra = {"cuda_graph_annotations": annotations} if annotations else {}
+            extra: dict[str, Any] = {}
+            if annotations:
+                extra["cuda_graph_annotations"] = annotations
+                if _EXPORT_SUPPORTS_GRAPH_LANES:
+                    # CUDA graph replay may place logically related work on hundreds
+                    # of executor streams. Render annotated work on stable logical
+                    # lanes so the trace exposes the intended compute/comms schedule.
+                    extra["graph_lanes"] = "all"
+                else:
+                    logger.warning(
+                        "This torch does not support graph_lanes on "
+                        "export_chrome_trace; CUDA graph replay work will remain "
+                        "scattered across its executor streams."
+                    )
             prof.export_chrome_trace(output_file, **extra)
 
             logger.info(
