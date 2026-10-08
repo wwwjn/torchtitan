@@ -10,12 +10,15 @@ import logging
 import re
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, cast, Literal, overload
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch import Tensor
 from torch.distributed.checkpoint.stateful import Stateful
+from torch.distributed.device_mesh import DeviceMesh
 from torch.optim import Optimizer
 
 from torchtitan.components.checkpointer.utils import canonical_fqn
@@ -183,6 +186,60 @@ class AdamW(torch.optim.AdamW, BaseOptimizer):
             _register_bfloat16_moment_hooks(self)
 
 
+class _DistMuonProcessGroupCache:
+    """Create and reuse isolated NCCL groups for DistMuon redistribution."""
+
+    def __init__(self) -> None:
+        self._groups: dict[tuple[dist.ProcessGroup, int], dist.ProcessGroup] = {}
+
+    def get_or_create(
+        self,
+        mesh: DeviceMesh,
+        *,
+        max_ctas: int,
+    ) -> dist.ProcessGroup:
+        """Return an isolated, CTA-capped copy of a mesh process group."""
+        parent_group = mesh.get_group()
+        key = (parent_group, max_ctas)
+        if key in self._groups:
+            return self._groups[key]
+
+        backend = dist.get_backend(parent_group)
+        if backend == "fake":
+            logger.warning(
+                "DistMuon redistribution_max_ctas is not modeled by the fake "
+                "process group; using the storage-mesh process group"
+            )
+            self._groups[key] = parent_group
+            return parent_group
+        if backend != dist.Backend.NCCL:
+            raise ValueError(
+                "DistMuon redistribution_max_ctas requires an NCCL process group, "
+                f"got {backend!r}"
+            )
+
+        options = dist.ProcessGroupNCCL.Options()
+        options.config.max_ctas = max_ctas
+        # The child must own its resources so its channel policy cannot change
+        # or grow the FSDP parent communicator's transport allocation.
+        options.config.split_share = 0  # pyrefly: ignore [missing-attribute]
+        num_ranks = dist.get_world_size(parent_group)
+        child_group = dist.split_group(
+            parent_pg=parent_group,
+            split_ranks=[list(range(num_ranks))],
+            pg_options=options,
+            group_desc="dist_muon_redistribution",
+            backend="nccl",
+        )
+        assert isinstance(child_group, dist.ProcessGroup)
+        self._groups[key] = child_group
+        logger.info(
+            "Created DistMuon redistribution process group with max_ctas=%d",
+            max_ctas,
+        )
+        return child_group
+
+
 class DistMuon(FlexShardDistMuon, BaseOptimizer):
     """Configurable TorchTitan wrapper around FlexShard's ``DistMuon``."""
 
@@ -202,13 +259,31 @@ class DistMuon(FlexShardDistMuon, BaseOptimizer):
         ] | None = None
         persistent_redistribution_buffers: bool = True
         """Keep DistMuon exchange and compute scratch allocated between steps."""
+        redistribution_max_ctas: int | None = None
+        """Run redistribution on an isolated NCCL group capped at this many CTAs."""
+
+        def __post_init__(self) -> None:
+            if self.redistribution_max_ctas is not None and (
+                type(self.redistribution_max_ctas) is not int
+                or self.redistribution_max_ctas <= 0
+            ):
+                raise ValueError("redistribution_max_ctas must be a positive integer")
 
     def __init__(
         self,
         config: Config,
         *,
         params: Iterable[dict[str, Any]] | Iterable[Tensor],
+        process_group_cache: _DistMuonProcessGroupCache | None = None,
     ) -> None:
+        get_redistribution_process_group = None
+        if config.redistribution_max_ctas is not None:
+            if process_group_cache is None:
+                process_group_cache = _DistMuonProcessGroupCache()
+            get_redistribution_process_group = partial(
+                process_group_cache.get_or_create,
+                max_ctas=config.redistribution_max_ctas,
+            )
         super().__init__(
             cast(Iterable[dict[str, Any]], params),
             compute_sharding_by_fqn=config.compute_sharding_by_fqn,
@@ -224,6 +299,7 @@ class DistMuon(FlexShardDistMuon, BaseOptimizer):
             persistent_redistribution_buffers=(
                 config.persistent_redistribution_buffers
             ),
+            get_redistribution_process_group=get_redistribution_process_group,
         )
 
 
@@ -295,6 +371,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable):
         all_params: list[nn.Parameter] = []
         self.optimizers = []
         self.model_parts = model_parts
+        dist_muon_process_groups = _DistMuonProcessGroupCache()
 
         for part_idx, model in enumerate(self.model_parts):
             claimed: set[str] = set()
@@ -304,7 +381,10 @@ class OptimizersContainer(Optimizer, Stateful, Configurable):
                     optimizer_config,
                     claimed,
                 )
-                optimizer = optimizer_config.build(params=[param_group])
+                build_kwargs: dict[str, Any] = {"params": [param_group]}
+                if isinstance(optimizer_config, DistMuon.Config):
+                    build_kwargs["process_group_cache"] = dist_muon_process_groups
+                optimizer = optimizer_config.build(**build_kwargs)
                 if enable_cuda_graph:
                     if any(
                         "capturable" not in group for group in optimizer.param_groups

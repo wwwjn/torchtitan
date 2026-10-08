@@ -23,6 +23,7 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
     with_comms,
 )
+from torchtitan.components.optim.optimizer import _DistMuonProcessGroupCache
 from torchtitan.components.optim.utils import (
     get_flat_optim_state_dict,
     init_optim_state,
@@ -52,6 +53,48 @@ class TestDistMuon(DTensorTestBase):
     @property
     def device_type(self):
         return "cuda"
+
+    @with_comms
+    def test_isolated_redistribution_process_group(self):
+        mesh = init_device_mesh(
+            self.device_type,
+            (self.world_size,),
+            mesh_dim_names=("dp_shard",),
+        )
+        parent_group = mesh.get_group()
+        cache = _DistMuonProcessGroupCache()
+        redistribution_group = cache.get_or_create(mesh, max_ctas=8)
+
+        self.assertIsNot(redistribution_group, parent_group)
+        self.assertIs(
+            cache.get_or_create(mesh, max_ctas=8),
+            redistribution_group,
+        )
+        self.assertEqual(
+            torch.distributed.get_process_group_ranks(redistribution_group),
+            torch.distributed.get_process_group_ranks(parent_group),
+        )
+
+        device = torch.device(self.device_type, self.rank)
+        input_tensor = torch.arange(
+            self.rank * self.world_size,
+            (self.rank + 1) * self.world_size,
+            device=device,
+        )
+        output_tensor = torch.empty_like(input_tensor)
+        torch.distributed.all_to_all_single(
+            output_tensor,
+            input_tensor,
+            group=redistribution_group,
+        )
+        expected = torch.tensor(
+            [
+                source_rank * self.world_size + self.rank
+                for source_rank in range(self.world_size)
+            ],
+            device=device,
+        )
+        torch.testing.assert_close(output_tensor, expected)
 
     @parametrize("block_sizes", [(4,), (4, 2)])
     @with_comms

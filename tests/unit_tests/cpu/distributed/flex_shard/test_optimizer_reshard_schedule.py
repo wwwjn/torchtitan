@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 import torch.distributed as dist
@@ -22,6 +22,9 @@ from torchtitan.distributed.flex_shard import (
 )
 from torchtitan.distributed.flex_shard._optimizer_reshard_runtime import (
     _BucketedRedistributionRuntime,
+)
+from torchtitan.distributed.flex_shard._optimizer_reshard_schedule import (
+    _RedistributionBucketPlan,
 )
 
 
@@ -70,6 +73,53 @@ class TestMuonPlanConstruction(unittest.TestCase):
                 bucket_configs=[BucketConfig(patterns=(name,)) for name in names],
             )
         build_plan.assert_called_once()
+
+    def test_dedicated_process_group_owns_redistribution_schedules(self):
+        dist.init_process_group("fake", store=FakeStore(), rank=0, world_size=2)
+        self.addCleanup(dist.destroy_process_group)
+        mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("dp_shard",))
+        dedicated_group = dist.new_group(
+            ranks=[0, 1],
+            backend="fake",
+            use_local_synchronization=True,
+        )
+        parameter = torch.nn.Parameter(
+            DTensor.from_local(
+                torch.empty(6, 4),
+                mesh,
+                (Shard(0),),
+                shape=torch.Size((12, 4)),
+                stride=(4, 1),
+            )
+        )
+        fqn = "layers.0.weight"
+        resolve_process_group = Mock(return_value=dedicated_group)
+
+        with patch.object(_BucketedRedistributionRuntime, "reserve_buffers"):
+            optimizer = DistMuon(
+                [{"params": [parameter], "param_names": [fqn]}],
+                compute_sharding_by_fqn={
+                    fqn: ComputeLayout(
+                        {"dp_shard": BlockShard(dim=0, block_sizes=(4,))}
+                    )
+                },
+                bucket_configs=[BucketConfig(patterns=(fqn,))],
+                get_redistribution_process_group=resolve_process_group,
+            )
+            optimizer.load_state_dict(optimizer.state_dict())
+
+        (plan,) = optimizer._bucket_plans
+        self.assertEqual(resolve_process_group.call_count, 2)
+        self.assertIsInstance(plan, _RedistributionBucketPlan)
+        self.assertIs(plan.group.process_group, dedicated_group)
+        self.assertIs(
+            plan.storage_to_compute_schedule.process_group,
+            dedicated_group,
+        )
+        self.assertIs(
+            plan.compute_to_storage_schedule.process_group,
+            dedicated_group,
+        )
 
 
 if __name__ == "__main__":

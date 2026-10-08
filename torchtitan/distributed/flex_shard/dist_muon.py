@@ -16,7 +16,9 @@ from functools import partial
 from typing import Any, cast, NoReturn, overload
 
 import torch
+import torch.distributed as dist
 from torch import Tensor
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.placement_types import _StridedShard
 from torch.optim import Optimizer
@@ -106,7 +108,9 @@ def _initialize_dist_muon(
     local parameter FQN must have one entry in ``compute_sharding_by_fqn``;
     extra compute-sharding entries for parameters on other pipeline stages are
     ignored. Parameter groups, compute layouts, and bucket configuration are
-    frozen because optimizer state and collectives depend on them.
+    frozen because optimizer state and collectives depend on them. A process
+    group resolver may replace each storage-mesh communicator with one that has
+    identical participants and rank order.
     """
     _validate_compute_sharding_configuration(compute_sharding_by_fqn)
 
@@ -157,7 +161,9 @@ class DistMuon(Optimizer):
     Matrix-batch compute views use batched BF16 kernels. They implement the
     same mathematical update as ``torch.optim.Muon`` running one matrix at a
     time, but bitwise equality across the two kernel schedules is not part of
-    the contract.
+    the contract. ``get_redistribution_process_group`` may return a dedicated
+    communicator for each storage mesh, but its participants and rank order
+    must match the storage mesh's existing process group.
     """
 
     _specs: tuple[_BucketSpec, ...]
@@ -166,6 +172,9 @@ class DistMuon(Optimizer):
     _redistribution_runtime: _BucketedRedistributionRuntime[_ParameterComputeLayout]
     _param_groups_frozen: bool
     _persistent_redistribution_buffers: bool
+    _get_redistribution_process_group: (
+        Callable[[DeviceMesh], dist.ProcessGroup] | None
+    )
 
     def __init__(
         self,
@@ -182,6 +191,8 @@ class DistMuon(Optimizer):
         ns_steps: int = 5,
         adjust_lr_fn: str | None = None,
         persistent_redistribution_buffers: bool = True,
+        get_redistribution_process_group: Callable[[DeviceMesh], dist.ProcessGroup]
+        | None = None,
     ) -> None:
         defaults = {
             "lr": lr,
@@ -196,6 +207,7 @@ class DistMuon(Optimizer):
         self._first_step_validated = False
         self._param_groups_frozen = False
         self._persistent_redistribution_buffers = persistent_redistribution_buffers
+        self._get_redistribution_process_group = get_redistribution_process_group
         super().__init__(_normalize_param_groups(params), defaults)
         self._validate_groups()
         self._param_groups_frozen = True
@@ -351,6 +363,7 @@ class DistMuon(Optimizer):
                 ns_steps_by_group=ns_steps_by_group,
             ),
             get_compute_dtype=lambda item: item.compute_dtype,
+            get_redistribution_process_group=(self._get_redistribution_process_group),
         )
 
         def build_views(

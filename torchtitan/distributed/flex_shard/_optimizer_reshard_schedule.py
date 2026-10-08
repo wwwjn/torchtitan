@@ -897,8 +897,13 @@ def _device_mesh_ranks(mesh: DeviceMesh) -> tuple[int, ...]:
     return tuple(mesh.mesh.flatten().tolist())
 
 
-def _redistribution_group(mesh: DeviceMesh) -> _RedistributionGroup:
-    process_group = mesh.get_group()
+def _redistribution_group(
+    mesh: DeviceMesh,
+    *,
+    process_group: dist.ProcessGroup | None = None,
+) -> _RedistributionGroup:
+    """Resolve and validate the process group used by one transport mesh."""
+    process_group = mesh.get_group() if process_group is None else process_group
     participants = tuple(dist.get_process_group_ranks(process_group))
     mesh_axis_participants = _device_mesh_ranks(mesh)
     if set(mesh_axis_participants) != set(participants):
@@ -1071,6 +1076,8 @@ def _build_bucket_plans(
         Sequence[Sequence[_RedistributionPlan | None]],
     ],
     get_compute_dtype: Callable[[_ItemT], torch.dtype],
+    get_redistribution_process_group: Callable[[DeviceMesh], dist.ProcessGroup]
+    | None = None,
 ) -> _BucketPlanningResult[_ItemT]:
     """Build ordered optimizer bucket plans with and without redistribution.
 
@@ -1080,7 +1087,9 @@ def _build_bucket_plans(
     placement and returns ``None`` for compute-ready items or a
     transport-neutral plan for items requiring redistribution. Bucket
     membership and redistribution requirements must be rank-stable within
-    every potential communication group.
+    every potential communication group. ``get_redistribution_process_group``
+    may substitute a communicator with the same participants and rank order;
+    by default the transport mesh's existing process group is used.
     """
     resolved = _resolve_buckets(items, specs, get_fqn=get_fqn)
     buckets = []
@@ -1104,7 +1113,14 @@ def _build_bucket_plans(
         contexts_list.append(
             _BucketPlanningContext(
                 items=bucket,
-                group=_redistribution_group(spec.mesh),
+                group=_redistribution_group(
+                    spec.mesh,
+                    process_group=(
+                        None
+                        if get_redistribution_process_group is None
+                        else get_redistribution_process_group(spec.mesh)
+                    ),
+                ),
                 name=spec.name,
             )
         )
