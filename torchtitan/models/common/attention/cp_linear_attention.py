@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import spmd_types as spmd
 import torch
 import torch.distributed as dist
+from torch.utils import _pytree as pytree
 
 from torchtitan.distributed.context_parallel import get_token_fragments
 from torchtitan.distributed.parallelism_context import MeshAxisName
@@ -48,6 +49,14 @@ class ContextParallelLinearAttentionMetadata(LinearAttentionMetadata):
         for value in vars(self.cp_routing).values():
             if isinstance(value, torch.Tensor):
                 spmd.assert_type(value, self._ROUTING_SPMD_TYPE)
+
+
+# CP metadata crosses CUDA-graph boundaries after the input sharding step.
+# Expose every routing tensor so replay copies current values instead of
+# treating the dataclasses as immutable non-tensor inputs.
+if not is_missing_kernel(ContextParallelRouting):
+    pytree.register_dataclass(ContextParallelRouting)
+pytree.register_dataclass(ContextParallelLinearAttentionMetadata)
 
 
 def prepare_linear_attention_cp_metadata(
