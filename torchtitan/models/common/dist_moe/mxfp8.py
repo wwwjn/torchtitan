@@ -46,6 +46,16 @@ class _DistMoeMXFP8Operands:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _DynamicPreparedWeightCache:
+    """Versioned prepared storage for a weight outside FSDP unshard ownership."""
+
+    logical_weight: torch.Tensor
+    storage: torch.Tensor
+    version: int
+    operands: _DistMoeMXFP8Operands
+
+
 def _prepare_mxfp8_weight(
     weight_EOI: torch.Tensor,
     out: _DistMoeMXFP8Operands | None = None,
@@ -94,8 +104,9 @@ def _dynamic_prepared_weight(
     logical_weight: torch.Tensor,
     *,
     gate_up: bool,
-) -> dist_moe.PreparedWeight:
-    """Prepare a weight when FSDP does not own its unshard lifetime."""
+    cache: _DynamicPreparedWeightCache | None,
+) -> tuple[dist_moe.PreparedWeight, _DynamicPreparedWeightCache]:
+    """Prepare or reuse a weight outside an FSDP-managed unshard lifetime."""
     source = logical_weight.flatten(1, 2) if gate_up else logical_weight
     storage = (
         logical_weight._tensor
@@ -103,9 +114,26 @@ def _dynamic_prepared_weight(
         else logical_weight
     )
     compute_weight = storage.flatten(1, 2) if gate_up else storage
-    with torch.no_grad():
-        operands = _prepare_mxfp8_weight(compute_weight)
-    return operands.prepared(source)
+    version = logical_weight._version
+    if (
+        cache is None
+        or cache.logical_weight is not logical_weight
+        or cache.storage is not storage
+    ):
+        with torch.no_grad():
+            operands = _prepare_mxfp8_weight(compute_weight)
+    elif cache.version != version:
+        with torch.no_grad():
+            operands = _prepare_mxfp8_weight(compute_weight, out=cache.operands)
+    else:
+        operands = cache.operands
+    cache = _DynamicPreparedWeightCache(
+        logical_weight=logical_weight,
+        storage=storage,
+        version=version,
+        operands=operands,
+    )
+    return operands.prepared(source), cache
 
 
 class MXFP8DistMoeRoutedExperts(DistMoeRoutedExperts):
@@ -158,6 +186,8 @@ class MXFP8DistMoeRoutedExperts(DistMoeRoutedExperts):
             _DistMoeW2ShardedTensor(self.w2.weight.data),
             requires_grad=self.w2.weight.requires_grad,
         )
+        self._w13_dynamic_cache: _DynamicPreparedWeightCache | None = None
+        self._w2_dynamic_cache: _DynamicPreparedWeightCache | None = None
 
     def _parallelize(self, parallelism_context: ParallelismContext) -> None:
         # spmd_types returns a plain tensor when EP/TP shards a weight. Restore
@@ -187,14 +217,20 @@ class MXFP8DistMoeRoutedExperts(DistMoeRoutedExperts):
         w13_E2FD = self.w13.weight
         w2_EDF = self.w2.weight
         w13_EFD = w13_E2FD.flatten(1, 2)
-        w13_operand = (
-            w13_E2FD.operands.prepared(w13_EFD)
-            if isinstance(w13_E2FD, _UnshardedFSDPTensor)
-            else _dynamic_prepared_weight(w13_E2FD, gate_up=True)
-        )
-        w2_operand = (
-            w2_EDF.operands.prepared(w2_EDF)
-            if isinstance(w2_EDF, _UnshardedFSDPTensor)
-            else _dynamic_prepared_weight(w2_EDF, gate_up=False)
-        )
+        if isinstance(w13_E2FD, _UnshardedFSDPTensor):
+            w13_operand = w13_E2FD.operands.prepared(w13_EFD)
+        else:
+            w13_operand, self._w13_dynamic_cache = _dynamic_prepared_weight(
+                w13_E2FD,
+                gate_up=True,
+                cache=self._w13_dynamic_cache,
+            )
+        if isinstance(w2_EDF, _UnshardedFSDPTensor):
+            w2_operand = w2_EDF.operands.prepared(w2_EDF)
+        else:
+            w2_operand, self._w2_dynamic_cache = _dynamic_prepared_weight(
+                w2_EDF,
+                gate_up=False,
+                cache=self._w2_dynamic_cache,
+            )
         return w13_operand, w2_operand

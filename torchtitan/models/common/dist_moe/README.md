@@ -258,8 +258,10 @@ prepared-weight tensor lifecycle:
 
 With `reshard_after_forward=False`, pipeline microbatches reuse one prepared
 weight through backward. With `reshard_after_forward=True`, forward and
-backward perform separate unshards and preparations. Without FSDP, the module
-prepares the live parameter directly for each call.
+backward perform separate unshards and preparations. Without an FSDP-managed
+unshard, the module retains one prepared operand set per weight, reuses it while
+the logical parameter version is unchanged, and refills it after an optimizer
+update.
 
 The complete `dist_moe.routed_experts` call is an ordered operation wrapped in
 a non-recomputed remat region. Dist-MoE owns its device-side decision to save or

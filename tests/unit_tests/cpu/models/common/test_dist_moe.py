@@ -19,6 +19,7 @@ dist_moe = pytest.importorskip(
 
 import torchtitan.config.transform as transform_api
 import torchtitan.config.transform.quantization as quantization_transform
+import torchtitan.models.common.dist_moe.mxfp8 as dist_moe_mxfp8
 import torchtitan_recipes.models.deepseek_v3 as eager_production_recipes
 import torchtitan_recipes.tests.models.deepseek_v3 as eager_test_recipes
 import torchtitan_recipes.tests.models.kimi_k3 as kimi_k3_test_recipes
@@ -786,6 +787,46 @@ def test_mxfp8_transform_is_independent_and_uses_prepared_weights() -> None:
     assert isinstance(module.w13.weight, _ShardedFSDPTensor)
     assert isinstance(module.w2.weight, _ShardedFSDPTensor)
     assert list(module.state_dict()) == ["w13.weight", "w2.weight"]
+
+
+def test_mxfp8_dynamic_weights_reuse_prepared_storage_until_update() -> None:
+    """Non-FSDP weights prepare once per parameter version and refill in place."""
+    transformed = DistMoeTransform(expert_precision="mxfp8").transform(_stock_config())
+    module = cast(MXFP8DistMoeRoutedExperts, transformed.build())
+    prepare_calls: list[
+        tuple[torch.Tensor, dist_moe_mxfp8._DistMoeMXFP8Operands | None]
+    ] = []
+
+    def prepare(
+        weight_EOI: torch.Tensor,
+        out: dist_moe_mxfp8._DistMoeMXFP8Operands | None = None,
+    ) -> dist_moe_mxfp8._DistMoeMXFP8Operands:
+        prepare_calls.append((weight_EOI, out))
+        if out is not None:
+            return out
+        return dist_moe_mxfp8._DistMoeMXFP8Operands(
+            qdata=torch.empty(1),
+            fprop_scale=torch.empty(1),
+            dgrad_scale=torch.empty(1),
+        )
+
+    with patch.object(dist_moe_mxfp8, "_prepare_mxfp8_weight", side_effect=prepare):
+        first_w13, first_w2 = module._weight_operands()
+        second_w13, second_w2 = module._weight_operands()
+        assert len(prepare_calls) == 2
+        assert first_w13.fprop_data is second_w13.fprop_data
+        assert first_w2.fprop_data is second_w2.fprop_data
+
+        with torch.no_grad():
+            module.w13.weight.add_(1)
+            module.w2.weight.add_(1)
+        third_w13, third_w2 = module._weight_operands()
+
+    assert len(prepare_calls) == 4
+    assert prepare_calls[2][1] is not None
+    assert prepare_calls[3][1] is not None
+    assert third_w13.fprop_data is first_w13.fprop_data
+    assert third_w2.fprop_data is first_w2.fprop_data
 
 
 @pytest.mark.parametrize(
