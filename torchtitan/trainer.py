@@ -9,6 +9,7 @@ import dataclasses
 import json
 import logging
 import os
+import sys
 import time
 from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass, field
@@ -529,7 +530,7 @@ class Trainer(Configurable):
             # The entry point also calls close() for checkpoint and graph
             # cleanup; close the profiler here so direct train() callers get
             # balanced lifecycle handling.
-            engine.close_profiler()
+            engine.close_profiler(*sys.exc_info())
 
         if torch.distributed.get_rank() == 0:
             logger.info("Sleeping 2 seconds for other ranks to complete")

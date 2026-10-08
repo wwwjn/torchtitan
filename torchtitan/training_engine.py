@@ -8,6 +8,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
+from types import TracebackType
 from typing import Any, cast, NamedTuple, TYPE_CHECKING, TypeAlias
 
 import spmd_types as spmd
@@ -964,10 +965,15 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         """Signal that one training-loop iteration has completed."""
         self.profiler.step()
 
-    def close_profiler(self) -> None:
-        """Close the profiler if it was started."""
+    def close_profiler(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_val: BaseException | None = None,
+        exc_tb: TracebackType | None = None,
+    ) -> None:
+        """Close the profiler and preserve any active failure context."""
         if hasattr(self, "profiler"):
-            self.profiler.__exit__(None, None, None)
+            self.profiler.__exit__(exc_type, exc_val, exc_tb)
             del self.profiler
 
     def close(self) -> None:
