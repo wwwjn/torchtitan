@@ -19,9 +19,14 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
     with_comms,
 )
+from torch.utils import _pytree as pytree
 
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.config import TrainingConfig
+from torchtitan.models.common.attention import (
+    LinearAttentionMetadata,
+    VarlenAttentionMetadata,
+)
 from torchtitan.models.kimi_k3.pipeline_parallel import (
     _build_attn_res_stage_metadata,
     _swap_in_attn_res_stages,
@@ -51,6 +56,23 @@ def _metadata(loss_fn):
 
 
 class TestAttnResStageMetadata(unittest.TestCase):
+    def test_kda_metadata_exposes_sequence_offsets_as_pytree_leaves(self):
+        offsets = torch.tensor([0, 4], dtype=torch.int32)
+        metadata = LinearAttentionMetadata(
+            varlen=VarlenAttentionMetadata(offsets, offsets, 4, 4),
+            num_conv_history_tokens=3,
+        )
+
+        leaves, tree_spec = pytree.tree_flatten(metadata)
+        self.assertIs(leaves[0], offsets)
+        self.assertIs(leaves[1], offsets)
+        self.assertEqual(leaves[2:], [4, 4, 3])
+        rebuilt = pytree.tree_unflatten(leaves, tree_spec)
+        self.assertIsInstance(rebuilt, LinearAttentionMetadata)
+        self.assertIs(rebuilt.varlen.cu_seq_q, offsets)
+        self.assertIs(rebuilt.varlen.cu_seq_k, offsets)
+        self.assertEqual(rebuilt.num_conv_history_tokens, 3)
+
     def test_metadata_describes_each_carrier_boundary(self):
         metadata = _metadata(ChunkedLossWrapper(ChunkedLossWrapper.Config()))
 
