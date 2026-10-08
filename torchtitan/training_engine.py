@@ -33,6 +33,7 @@ from torchtitan.distributed.cuda_graph import (
     cuda_graph_teardown,
     cuda_graphs_supported,
     NUM_CUDA_GRAPH_WARMUP_STEPS,
+    run_eager_on_cuda_graph_stream,
     wrap_fwd_bwd_with_cuda_graph,
     wrap_with_cuda_graph,
 )
@@ -502,13 +503,21 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             pp_has_last_stage=self.pp_has_last_stage,
         )
         if self.config.optim.initialize_state_before_training:
-            self.optim.optimizers.initialize_state()
+            initialize_state = self.optim.optimizers.initialize_state
+            uses_cuda_graph_stream = (
+                not self.config.training.disable_cuda_graphs and cuda_graphs_supported()
+            )
+            if uses_cuda_graph_stream:
+                run_eager_on_cuda_graph_stream(initialize_state)
+            else:
+                initialize_state()
             if self.device.type != "cpu":
                 # State initialization uses temporary gradients and may also use
-                # optimizer scratch. Release those idle blocks before another
-                # stream establishes the CUDA-graph warmup allocation layout.
+                # optimizer scratch. Graph training retains those idle blocks on
+                # its warmup stream for reuse; eager training releases them.
                 utils.device_module.synchronize()
-                utils.device_module.empty_cache()
+                if not uses_cuda_graph_stream:
+                    utils.device_module.empty_cache()
         self.model_cls._register_optimizer_hooks(
             self.optim.optimizers,
             self.model_parts,
