@@ -43,6 +43,8 @@ class Optim(Configurable):
         """Maximum norm used for gradient clipping."""
         enable_cuda_graph: bool = False
         """Capture gradient clipping and optimizer updates in one CUDA graph."""
+        initialize_state_before_training: bool = False
+        """Materialize lazy optimizer state before the first forward/backward."""
 
         def __post_init__(self) -> None:
             if self.max_norm < 0:

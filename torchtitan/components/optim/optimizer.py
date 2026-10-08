@@ -486,6 +486,11 @@ class OptimizersContainer(Optimizer, Stateful, Configurable):
         for optimizer in self.optimizers:
             optimizer.zero_grad(set_to_none=set_to_none)
 
+    def initialize_state(self) -> None:
+        """Materialize every inner optimizer's lazily created state."""
+        for optimizer in self.optimizers:
+            init_optim_state(optimizer)
+
     def state_dict(self) -> dict[str, Any]:
         """Return a flat, FQN-keyed optimizer state dict for all optimizers.
 

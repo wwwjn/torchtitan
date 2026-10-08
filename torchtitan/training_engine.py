@@ -501,6 +501,14 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             training_steps=self.config.training.steps,
             pp_has_last_stage=self.pp_has_last_stage,
         )
+        if self.config.optim.initialize_state_before_training:
+            self.optim.optimizers.initialize_state()
+            if self.device.type != "cpu":
+                # State initialization uses temporary gradients and may also use
+                # optimizer scratch. Release those idle blocks before another
+                # stream establishes the CUDA-graph warmup allocation layout.
+                utils.device_module.synchronize()
+                utils.device_module.empty_cache()
         self.model_cls._register_optimizer_hooks(
             self.optim.optimizers,
             self.model_parts,
