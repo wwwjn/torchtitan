@@ -13,6 +13,7 @@ import spmd_types as spmd
 import torch
 import torch_remat as remat
 
+from torchtitan.distributed.local_compile import local_compile
 from torchtitan.models.common.linear import Linear
 
 from .attention import InnerAttention
@@ -35,6 +36,7 @@ __all__ = [
 # P = packed per-head KV channels (N + V)
 
 
+@local_compile("mla_kv", batch_invariant=True)
 def materialize_mla_kv(
     q_THK: torch.Tensor,
     kv_THP: torch.Tensor,
@@ -46,6 +48,10 @@ def materialize_mla_kv(
     k_nope_THN, v_THV = torch.split(kv_THP, [nope_head_dim, value_head_dim], dim=-1)
     k_shared_THR = k_shared_TR.unsqueeze(1).expand(-1, k_nope_THN.shape[1], -1)
     k_THK = torch.cat((k_nope_THN, k_shared_THR), dim=-1)
+    # A fresh V lets compiled backward write the complete packed KV gradient.
+    # Eager execution and inference retain the cheaper split view.
+    if torch.compiler.is_compiling() and torch.is_grad_enabled():
+        v_THV = v_THV.contiguous()
     return k_THK, v_THV
 
 
