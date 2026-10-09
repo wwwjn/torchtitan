@@ -17,6 +17,9 @@ import spmd_types as spmd
 
 import torch
 import torch.distributed as dist
+from torch.distributed._functional_collectives import (
+    all_to_all_single as functional_all_to_all_single,
+)
 
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed.context_parallel import cp_all_gather_tensors
@@ -257,6 +260,8 @@ class AllGatherKVSlidingWindowFlexInnerAttention(
 class Ulysses(CPInnerAttention[_GlobalAttentionMetadataT, _GlobalAttentionMetadataT]):
     """Base for Ulysses CP attention with global attention metadata."""
 
+    all_to_all_backend: Literal["list", "single"]
+
     @dataclass(kw_only=True, slots=True)
     class Config(CPInnerAttention.Config):
         pass
@@ -291,24 +296,81 @@ class UlyssesInnerAttention(Ulysses[_GlobalAttentionMetadataT]):
                 "CP attention requires an active multi-rank CP mesh axis."
             )
         # Shard heads instead of tokens: (T/cp, H, *) -> (T, H/cp, *).
-        q_THK, k_THK, v_THV = (
-            spmd.redistribute(
-                x,
-                cp_group,
-                src=spmd.S(_TOKEN_DIM),
-                dst=spmd.S(_HEAD_DIM),
+        if self.all_to_all_backend == "single":
+            q_THK, k_THK, v_THV = (
+                _ulysses_seq_to_heads_single(x, cp_group) for x in (q_THK, k_THK, v_THV)
             )
-            for x in (q_THK, k_THK, v_THV)
-        )
+        else:
+            q_THK, k_THK, v_THV = (
+                spmd.redistribute(
+                    x,
+                    cp_group,
+                    src=spmd.S(_TOKEN_DIM),
+                    dst=spmd.S(_HEAD_DIM),
+                )
+                for x in (q_THK, k_THK, v_THV)
+            )
         # super() follows the concrete class MRO to its inner attention.
         out_THV = super().forward(q_THK, k_THK, v_THV, **kwargs)
         # Back to sharded tokens: (T, H/cp, V) -> (T/cp, H, V).
+        if self.all_to_all_backend == "single":
+            return _ulysses_heads_to_seq_single(out_THV, cp_group)
         return spmd.redistribute(
             out_THV,
             cp_group,
             src=spmd.S(_HEAD_DIM),
             dst=spmd.S(_TOKEN_DIM),
         )
+
+
+def _ulysses_seq_to_heads_single(
+    x_THD: torch.Tensor,
+    cp_group: dist.ProcessGroup,
+) -> torch.Tensor:
+    """Exchange equal head shards and concatenate the received token shards."""
+    cp_size = dist.get_world_size(cp_group)
+    tokens, heads, dim = x_THD.shape
+    if heads % cp_size:
+        raise ValueError(
+            f"Ulysses head count ({heads}) must be divisible by CP size ({cp_size})."
+        )
+    send_CTHD = (
+        x_THD.reshape(tokens, cp_size, heads // cp_size, dim).movedim(1, 0).contiguous()
+    )
+    recv_CTHD = functional_all_to_all_single(
+        send_CTHD,
+        output_split_sizes=None,
+        input_split_sizes=None,
+        group=cp_group,
+    )
+    return recv_CTHD.flatten(0, 1)
+
+
+def _ulysses_heads_to_seq_single(
+    x_THD: torch.Tensor,
+    cp_group: dist.ProcessGroup,
+) -> torch.Tensor:
+    """Exchange equal token shards and concatenate the received head shards."""
+    cp_size = dist.get_world_size(cp_group)
+    global_tokens, local_heads, dim = x_THD.shape
+    if global_tokens % cp_size:
+        raise ValueError(
+            "Ulysses global token count "
+            f"({global_tokens}) must be divisible by CP size ({cp_size})."
+        )
+    local_tokens = global_tokens // cp_size
+    send_CTHD = x_THD.reshape(cp_size, local_tokens, local_heads, dim).contiguous()
+    recv_CTHD = functional_all_to_all_single(
+        send_CTHD,
+        output_split_sizes=None,
+        input_split_sizes=None,
+        group=cp_group,
+    )
+    return recv_CTHD.movedim(0, 1).reshape(
+        local_tokens,
+        cp_size * local_heads,
+        dim,
+    )
 
 
 class UlyssesFlexInnerAttention(
@@ -318,7 +380,12 @@ class UlyssesFlexInnerAttention(
 
     @dataclass(kw_only=True, slots=True)
     class Config(UlyssesInnerAttention.Config, FlexInnerAttention.Config):
-        pass
+        all_to_all_backend: Literal["list", "single"] = "list"
+        """Collective used to exchange equal token and head shards."""
+
+    def __init__(self, config: Config) -> None:
+        FlexInnerAttention.__init__(self, config)
+        self.all_to_all_backend = config.all_to_all_backend
 
 
 class UlyssesSlidingWindowFlexInnerAttention(
@@ -331,7 +398,12 @@ class UlyssesSlidingWindowFlexInnerAttention(
         UlyssesInnerAttention.Config,
         SlidingWindowFlexInnerAttention.Config,
     ):
-        pass
+        all_to_all_backend: Literal["list", "single"] = "list"
+        """Collective used to exchange equal token and head shards."""
+
+    def __init__(self, config: Config) -> None:
+        SlidingWindowFlexInnerAttention.__init__(self, config)
+        self.all_to_all_backend = config.all_to_all_backend
 
 
 class UlyssesVarlenInnerAttention(
@@ -341,4 +413,9 @@ class UlyssesVarlenInnerAttention(
 
     @dataclass(kw_only=True, slots=True)
     class Config(UlyssesInnerAttention.Config, VarlenInnerAttention.Config):
-        pass
+        all_to_all_backend: Literal["list", "single"] = "list"
+        """Collective used to exchange equal token and head shards."""
+
+    def __init__(self, config: Config) -> None:
+        VarlenInnerAttention.__init__(self, config)
+        self.all_to_all_backend = config.all_to_all_backend

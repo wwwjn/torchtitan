@@ -958,6 +958,35 @@ class TestUlysses(unittest.TestCase):
         self.assertEqual(spmd.S(1), src)
         self.assertEqual(spmd.S(0), dst)
 
+    def test_single_backend_packs_four_tensor_collectives(self):
+        q, k, v = (torch.randn(8, 4, 16) for _ in range(3))
+        calls = []
+
+        def record(x, output_split_sizes, input_split_sizes, group):
+            calls.append((x.shape, output_split_sizes, input_split_sizes, group))
+            return x
+
+        kernel = UlyssesFlexInnerAttention(
+            UlyssesFlexInnerAttention.Config(all_to_all_backend="single")
+        )
+        with _in_mesh(2), mock.patch(
+            "torchtitan.models.common.attention.cp_attention."
+            "functional_all_to_all_single",
+            side_effect=record,
+        ), mock.patch.object(
+            FlexInnerAttention, "forward", lambda self, q, *a, **kw: q
+        ):
+            result = kernel.forward(q, k, v)
+
+        self.assertEqual(q.shape, result.shape)
+        self.assertEqual(4, len(calls))
+        for _, output_splits, input_splits, group in calls:
+            self.assertIsNone(output_splits)
+            self.assertIsNone(input_splits)
+            self.assertEqual(2, group.size())
+        self.assertEqual([(2, 8, 2, 16)] * 3, [call[0] for call in calls[:3]])
+        self.assertEqual((2, 8, 2, 16), calls[3][0])
+
 
 class TestMLAContextParallelAttention(unittest.TestCase):
     def test_mla_flex_materializes_per_head_kv_at_kernel_boundary(self):
