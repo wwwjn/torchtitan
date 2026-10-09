@@ -235,6 +235,7 @@ class KimiK3Model(MultimodalModel):
                 "fp32_to_bf16_split",
                 "attention_residual",
                 "mla_kv",
+                "router_postprocess",
             ]
         )
 
