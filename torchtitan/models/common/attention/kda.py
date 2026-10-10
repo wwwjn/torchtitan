@@ -62,6 +62,12 @@ class KDAKernel(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         lower_bound: float = -5.0
+        kernel_options: KernelOptions | None = None
+        """Explicit local chunk-kernel options; None preserves automatic selection.
+
+        Context-parallel KDA uses Attention Gym's separate distributed entry
+        point and does not invoke this local chunk kernel.
+        """
 
         def __post_init__(self):
             if not -5.0 <= self.lower_bound < 0.0:
@@ -75,6 +81,7 @@ class KDAKernel(Module):
         require_attn_gym(chunk_kda, bound_gate, l2norm)
         super().__init__()
         self.lower_bound = config.lower_bound
+        self.kernel_options = config.kernel_options
 
     def forward(
         self,
@@ -104,7 +111,11 @@ class KDAKernel(Module):
             beta_1TH,
             cu_seqlens=cu_seqlens,
             autotune=not torch.are_deterministic_algorithms_enabled(),
-            kernel_options=chunk_kernel_options(q_1THK),
+            kernel_options=(
+                self.kernel_options
+                if self.kernel_options is not None
+                else chunk_kernel_options(q_1THK)
+            ),
         )
         return output_1THV
 
