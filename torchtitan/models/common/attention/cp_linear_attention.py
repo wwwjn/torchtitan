@@ -92,15 +92,23 @@ def prepare_linear_attention_cp_metadata(
             f"{family} metadata preparation requires an active multi-rank CP "
             "mesh axis."
         )
+    fragments = get_token_fragments(
+        cu_seqlens_global[-1],
+        cp_size=group.size(),
+        permutation=permutation,
+    )
+    # Local document cuts vary even when the global offsets are padded.
+    # Each additional fragment can split one document into another local
+    # subsequence. Preserve that capacity at the CUDA-graph input boundary.
+    max_subsequences = (
+        len(cu_seqlens_global) - 1 + max(len(owned) for owned in fragments) - 1
+    )
     routing = ContextParallelRouting.from_fragments(
         cu_seqlens_global=cu_seqlens_global,
-        fragments=get_token_fragments(
-            cu_seqlens_global[-1],
-            cp_size=group.size(),
-            permutation=permutation,
-        ),
+        fragments=fragments,
         cp_rank=dist.get_rank(group),
         device=device,
+        max_subsequences=max_subsequences,
         conv_history=attention_metadata.num_conv_history_tokens,
     )
     return ContextParallelLinearAttentionMetadata(
