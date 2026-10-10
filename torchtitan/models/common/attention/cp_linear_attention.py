@@ -53,10 +53,15 @@ class ContextParallelLinearAttentionMetadata(LinearAttentionMetadata):
 
 # CP metadata crosses CUDA-graph boundaries after the input sharding step.
 # Expose every routing tensor so replay copies current values instead of
-# treating the dataclasses as immutable non-tensor inputs.
-if not is_missing_kernel(ContextParallelRouting):
+# treating either dataclass as an immutable non-tensor input. Guard the
+# registration because test reloads can execute this module more than once.
+if (
+    not is_missing_kernel(ContextParallelRouting)
+    and ContextParallelRouting not in pytree.SUPPORTED_NODES
+):
     pytree.register_dataclass(ContextParallelRouting)
-pytree.register_dataclass(ContextParallelLinearAttentionMetadata)
+if ContextParallelLinearAttentionMetadata not in pytree.SUPPORTED_NODES:
+    pytree.register_dataclass(ContextParallelLinearAttentionMetadata)
 
 
 def prepare_linear_attention_cp_metadata(

@@ -29,7 +29,7 @@ from torchtitan.models.common.attention import (
     VarlenAttentionMetadata,
 )
 from torchtitan.models.common.attention.cp_kda import (
-    ContextParallelKDAAttentionMetadata,
+    ContextParallelLinearAttentionMetadata,
 )
 from torchtitan.models.kimi_k3.pipeline_parallel import (
     _build_attn_res_stage_metadata,
@@ -86,7 +86,7 @@ class TestAttnResStageMetadata(unittest.TestCase):
             device="cpu",
             conv_history=3,
         )
-        metadata = ContextParallelKDAAttentionMetadata(
+        metadata = ContextParallelLinearAttentionMetadata(
             varlen=VarlenAttentionMetadata(offsets, offsets, 4, 4),
             num_conv_history_tokens=3,
             cp_routing=routing,
@@ -101,7 +101,7 @@ class TestAttnResStageMetadata(unittest.TestCase):
                 self.assertTrue(any(value is leaf for leaf in leaves))
 
         rebuilt = pytree.tree_unflatten(leaves, tree_spec)
-        self.assertIsInstance(rebuilt, ContextParallelKDAAttentionMetadata)
+        self.assertIsInstance(rebuilt, ContextParallelLinearAttentionMetadata)
         self.assertIsInstance(rebuilt.cp_routing, ContextParallelRouting)
         self.assertIs(rebuilt.varlen.cu_seq_q, offsets)
         for name, value in vars(routing).items():
