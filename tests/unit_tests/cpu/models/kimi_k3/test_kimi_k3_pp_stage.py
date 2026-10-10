@@ -13,7 +13,6 @@ from unittest.mock import Mock, patch
 
 import torch
 import torch.nn as nn
-from torch.distributed.pipelining import PipelineStage
 from torch.distributed.pipelining.schedules import Schedule1F1B, ScheduleInterleaved1F1B
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
@@ -183,7 +182,9 @@ class TestStageSwap(DTensorTestBase):
         return 1
 
     @staticmethod
-    def _stage(index: int, num_stages: int) -> PipelineStage:
+    def _stage(
+        index: int, num_stages: int, *, backward_reshard: bool = False
+    ) -> TorchTitanPipelineStage:
         return TorchTitanPipelineStage(
             nn.Linear(2, 2),
             index,
@@ -191,9 +192,12 @@ class TestStageSwap(DTensorTestBase):
             torch.device("cpu"),
             get_mesh=_get_mesh,
             empty_cache_before_gradient_reduction=True,
+            fsdp_reshard_after_backward=backward_reshard,
         )
 
-    def _assert_rebuilt(self, old: PipelineStage, new: AttnResPipelineStage) -> None:
+    def _assert_rebuilt(
+        self, old: TorchTitanPipelineStage, new: AttnResPipelineStage
+    ) -> None:
         self.assertIsInstance(new, AttnResPipelineStage)
         self.assertIsNot(new, old)
         # The same module object, so the model parts core returned stay valid.
@@ -206,6 +210,10 @@ class TestStageSwap(DTensorTestBase):
         self.assertIs(new._mesh_cache._get_mesh_cb, old._mesh_cache._get_mesh_cb)
         self.assertEqual(new.stage_index_to_group_rank, old.stage_index_to_group_rank)
         self.assertTrue(new.empty_cache_before_gradient_reduction)
+        self.assertEqual(
+            new.fsdp_reshard_after_backward,
+            old.fsdp_reshard_after_backward,
+        )
 
     @with_comms
     def test_forward_enables_fsdp_manual_backward_finalization(self):
@@ -250,9 +258,18 @@ class TestStageSwap(DTensorTestBase):
         self.assertIs(schedule._stage, new)
 
     @with_comms
+    def test_single_stage_preserves_backward_resharding(self):
+        """Rebuilding K3's custom stage must retain the FSDP memory policy."""
+        old = self._stage(0, 1, backward_reshard=True)
+        schedule = Schedule1F1B(old, n_microbatches=1, loss_fn=_loss)
+        (new,) = _swap_in_attn_res_stages(schedule)
+        self._assert_rebuilt(old, new)
+        self.assertTrue(new._reshard_after_backward)
+
+    @with_comms
     def test_multi_stage_schedule(self):
         old = [self._stage(index, 2) for index in range(2)]
-        schedule = ScheduleInterleaved1F1B(old, n_microbatches=2, loss_fn=_loss)
+        schedule = ScheduleInterleaved1F1B([*old], n_microbatches=2, loss_fn=_loss)
         new = _swap_in_attn_res_stages(schedule)
         self.assertEqual(len(new), 2)
         for old_stage, new_stage in zip(old, new, strict=True):

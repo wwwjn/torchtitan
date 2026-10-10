@@ -69,6 +69,11 @@ def _as_attn_res_stage(
             "empty_cache_before_first_backward",
             False,
         ),
+        fsdp_reshard_after_backward=getattr(
+            stage,
+            "fsdp_reshard_after_backward",
+            False,
+        ),
         **(stage_metadata or {}),
     )
     # The schedule wrote its stage-to-rank map onto the stage it was handed.

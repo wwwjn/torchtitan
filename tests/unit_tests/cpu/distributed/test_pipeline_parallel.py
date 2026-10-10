@@ -79,6 +79,41 @@ def test_pipeline_stage_releases_cache_only_before_first_backward():
     assert events == ["empty_cache", "backward_0", "backward_1"]
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_pipeline_stage_configures_opt_in_backward_resharding(enabled):
+    """The default retains parameters; the opt-in invokes the PyTorch API."""
+    with (
+        patch.object(pipeline_parallel.PipelineStage, "__init__", return_value=None),
+        patch.object(
+            pipeline_parallel.PipelineStage,
+            "set_reshard_after_backward",
+            create=True,
+        ) as configure,
+    ):
+        stage = TorchTitanPipelineStage(fsdp_reshard_after_backward=enabled)
+    assert stage.fsdp_reshard_after_backward is enabled
+    if enabled:
+        configure.assert_called_once_with(True)
+    else:
+        configure.assert_not_called()
+
+
+def test_pipeline_stage_rejects_missing_backward_resharding_api():
+    """An older PyTorch cannot silently ignore the requested memory policy."""
+    with (
+        patch.object(pipeline_parallel.PipelineStage, "__init__", return_value=None),
+        patch.object(
+            pipeline_parallel.PipelineStage,
+            "set_reshard_after_backward",
+            None,
+            create=True,
+        ),
+    ):
+        TorchTitanPipelineStage()
+        with pytest.raises(RuntimeError, match="set_reshard_after_backward API"):
+            TorchTitanPipelineStage(fsdp_reshard_after_backward=True)
+
+
 def test_pipeline_with_first_last_stage_modules_prepends_present_modules(monkeypatch):
     model = nn.Module()
     model.vision_encoder = nn.Linear(2, 2)

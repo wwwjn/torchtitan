@@ -50,13 +50,14 @@ __all__ = [
 
 
 class TorchTitanPipelineStage(PipelineStage):
-    """Pipeline stage with TorchTitan's opt-in allocator lifecycle policy."""
+    """Pipeline stage with TorchTitan's opt-in memory lifecycle policies."""
 
     def __init__(
         self,
         *args: Any,
         empty_cache_before_gradient_reduction: bool = False,
         empty_cache_before_first_backward: bool = False,
+        fsdp_reshard_after_backward: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -65,6 +66,15 @@ class TorchTitanPipelineStage(PipelineStage):
         )
         self.empty_cache_before_first_backward = empty_cache_before_first_backward
         self._emptied_cache_before_first_backward = False
+        self.fsdp_reshard_after_backward = fsdp_reshard_after_backward
+        if fsdp_reshard_after_backward:
+            configure_resharding = getattr(self, "set_reshard_after_backward", None)
+            if configure_resharding is None:
+                raise RuntimeError(
+                    "Pipeline backward resharding requires PyTorch's "
+                    "PipelineStage.set_reshard_after_backward API"
+                )
+            configure_resharding(True)
 
     def backward_one_chunk(self, *args: Any, **kwargs: Any):
         """Run backward after the optional one-time allocator cache release."""
@@ -177,6 +187,9 @@ def pipeline_llm(
         ),
         empty_cache_before_first_backward=(
             parallelism.pipeline_parallel_empty_cache_before_first_backward
+        ),
+        fsdp_reshard_after_backward=(
+            parallelism.pipeline_parallel_reshard_after_backward
         ),
     )
 
@@ -889,6 +902,7 @@ def _pipeline_module_split(
     stage_io: _DecoderStageIO | None = None,
     empty_cache_before_gradient_reduction: bool = False,
     empty_cache_before_first_backward: bool = False,
+    fsdp_reshard_after_backward: bool = False,
 ) -> tuple[list[PipelineStage], list[BaseModel]]:
     """Create pipeline stages based on specified module names for each stage.
 
@@ -915,6 +929,8 @@ def _pipeline_module_split(
         get_mesh: Callback used to reconstruct DTensor inputs after PP receives.
         stage_io: Static tensors describing decoder stage boundaries. Fake PP
             requires these because it cannot exchange metadata dynamically.
+        fsdp_reshard_after_backward: Release parameters after each full
+            microbatch backward without enabling per-microbatch reductions.
 
     Returns:
         Tuple of (stages, models) where stages are PipelineStage objects and models are the
@@ -949,6 +965,7 @@ def _pipeline_module_split(
                 empty_cache_before_gradient_reduction
             ),
             empty_cache_before_first_backward=empty_cache_before_first_backward,
+            fsdp_reshard_after_backward=fsdp_reshard_after_backward,
             **(
                 _static_stage_metadata(stage_io, stage_idx, num_stages)
                 if stage_io is not None

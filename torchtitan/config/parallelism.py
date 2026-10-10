@@ -176,6 +176,16 @@ class ParallelismConfig:
     placing cache management on every pipeline action.
     """
 
+    pipeline_parallel_reshard_after_backward: bool = False
+    """Reshard FSDP parameters after each pipeline microbatch backward.
+
+    Gradient reduction remains deferred until the schedule's reduction action.
+    This reduces unsharded-parameter residency at the cost of additional
+    all-gathers. Only full-backward pipeline schedules are supported, and
+    PyTorch must provide ``PipelineStage.set_reshard_after_backward``.
+    The default preserves the pipeline's existing parameter-retention policy.
+    """
+
     pp_max_unsharded_active_stages: int | None = None
     """Maximum local pipeline stages whose parameters may remain unsharded.
 
