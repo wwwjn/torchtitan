@@ -2018,16 +2018,22 @@ def _zeropower_via_newtonschulz(
         for _ in range(ns_steps):
             gram = result @ result.T
             gram_update = torch.addmm(gram, gram, gram, beta=b, alpha=c)
+            del gram
             result = torch.addmm(result, gram_update, result, beta=a)
+            del gram_update
     else:
         original_shape = result.shape
         matrices = result.reshape(-1, *original_shape[-2:])
+        # The loop replaces matrices; do not retain the initial BF16 storage.
+        del result
         # Batched kernels and independent matrix calls can use different BF16
         # reduction orders.
         for _ in range(ns_steps):
             gram = matrices @ matrices.transpose(-2, -1)
             gram_update = torch.baddbmm(gram, gram, gram, beta=b, alpha=c)
+            del gram
             matrices = torch.baddbmm(matrices, gram_update, matrices, beta=a)
+            del gram_update
         result = matrices.reshape(original_shape)
 
     return result.transpose(-2, -1) if transposed else result
