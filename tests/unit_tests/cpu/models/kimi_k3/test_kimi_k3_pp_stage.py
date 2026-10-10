@@ -183,7 +183,11 @@ class TestStageSwap(DTensorTestBase):
 
     @staticmethod
     def _stage(
-        index: int, num_stages: int, *, backward_reshard: bool = False
+        index: int,
+        num_stages: int,
+        *,
+        backward_reshard: bool = False,
+        current_stream_reduction: bool = False,
     ) -> TorchTitanPipelineStage:
         return TorchTitanPipelineStage(
             nn.Linear(2, 2),
@@ -193,6 +197,7 @@ class TestStageSwap(DTensorTestBase):
             get_mesh=_get_mesh,
             empty_cache_before_gradient_reduction=True,
             fsdp_reshard_after_backward=backward_reshard,
+            fsdp_reduce_scatter_on_current_stream=current_stream_reduction,
         )
 
     def _assert_rebuilt(
@@ -213,6 +218,10 @@ class TestStageSwap(DTensorTestBase):
         self.assertEqual(
             new.fsdp_reshard_after_backward,
             old.fsdp_reshard_after_backward,
+        )
+        self.assertEqual(
+            new.fsdp_reduce_scatter_on_current_stream,
+            old.fsdp_reduce_scatter_on_current_stream,
         )
 
     @with_comms
@@ -260,7 +269,7 @@ class TestStageSwap(DTensorTestBase):
     @with_comms
     def test_single_stage_preserves_backward_resharding(self):
         """Rebuilding K3's custom stage must retain the FSDP memory policy."""
-        old = self._stage(0, 1, backward_reshard=True)
+        old = self._stage(0, 1, backward_reshard=True, current_stream_reduction=True)
         schedule = Schedule1F1B(old, n_microbatches=1, loss_fn=_loss)
         (new,) = _swap_in_attn_res_stages(schedule)
         self._assert_rebuilt(old, new)

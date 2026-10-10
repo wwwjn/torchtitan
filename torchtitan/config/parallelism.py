@@ -186,6 +186,16 @@ class ParallelismConfig:
     The default preserves the pipeline's existing parameter-retention policy.
     """
 
+    pipeline_parallel_reduce_scatter_on_current_stream: bool = False
+    """Reduce deferred pipeline gradients on the caller's current stream.
+
+    This can reuse backward's cached CUDA-graph storage for reduced gradients,
+    at the cost of packing/reduction overlap during schedule finalization.
+    Dtypes, process groups, and gradient accumulation are unchanged. The
+    default keeps FSDP's communication stream. PyTorch must provide
+    ``FSDPModule.set_reduce_scatter_on_current_stream``.
+    """
+
     pp_max_unsharded_active_stages: int | None = None
     """Maximum local pipeline stages whose parameters may remain unsharded.
 

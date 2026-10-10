@@ -58,6 +58,7 @@ class TorchTitanPipelineStage(PipelineStage):
         empty_cache_before_gradient_reduction: bool = False,
         empty_cache_before_first_backward: bool = False,
         fsdp_reshard_after_backward: bool = False,
+        fsdp_reduce_scatter_on_current_stream: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -67,6 +68,9 @@ class TorchTitanPipelineStage(PipelineStage):
         self.empty_cache_before_first_backward = empty_cache_before_first_backward
         self._emptied_cache_before_first_backward = False
         self.fsdp_reshard_after_backward = fsdp_reshard_after_backward
+        self.fsdp_reduce_scatter_on_current_stream = (
+            fsdp_reduce_scatter_on_current_stream
+        )
         if fsdp_reshard_after_backward:
             configure_resharding = getattr(self, "set_reshard_after_backward", None)
             if configure_resharding is None:
@@ -87,7 +91,21 @@ class TorchTitanPipelineStage(PipelineStage):
         return super().backward_one_chunk(*args, **kwargs)
 
     def perform_reduce_grad(self, grad_scale_factor: int) -> None:
-        """Finalize stage gradients after applying the configured cache policy."""
+        """Finalize gradients under the configured stream and cache policies."""
+        if (
+            self.fsdp_reduce_scatter_on_current_stream
+            and isinstance(self.submod, FSDPModule)
+            and self.has_backward
+        ):
+            configure_stream = getattr(
+                self.submod, "set_reduce_scatter_on_current_stream", None
+            )
+            if configure_stream is None:
+                raise RuntimeError(
+                    "Current-stream pipeline reduction requires PyTorch's "
+                    "FSDPModule.set_reduce_scatter_on_current_stream API"
+                )
+            configure_stream(True)
         if (
             self.empty_cache_before_gradient_reduction
             and isinstance(self.submod, FSDPModule)
@@ -190,6 +208,9 @@ def pipeline_llm(
         ),
         fsdp_reshard_after_backward=(
             parallelism.pipeline_parallel_reshard_after_backward
+        ),
+        fsdp_reduce_scatter_on_current_stream=(
+            parallelism.pipeline_parallel_reduce_scatter_on_current_stream
         ),
     )
 
@@ -903,6 +924,7 @@ def _pipeline_module_split(
     empty_cache_before_gradient_reduction: bool = False,
     empty_cache_before_first_backward: bool = False,
     fsdp_reshard_after_backward: bool = False,
+    fsdp_reduce_scatter_on_current_stream: bool = False,
 ) -> tuple[list[PipelineStage], list[BaseModel]]:
     """Create pipeline stages based on specified module names for each stage.
 
@@ -931,6 +953,8 @@ def _pipeline_module_split(
             requires these because it cannot exchange metadata dynamically.
         fsdp_reshard_after_backward: Release parameters after each full
             microbatch backward without enabling per-microbatch reductions.
+        fsdp_reduce_scatter_on_current_stream: Run deferred reductions on the
+            current stream to enable same-stream CUDA-graph buffer reuse.
 
     Returns:
         Tuple of (stages, models) where stages are PipelineStage objects and models are the
@@ -966,6 +990,9 @@ def _pipeline_module_split(
             ),
             empty_cache_before_first_backward=empty_cache_before_first_backward,
             fsdp_reshard_after_backward=fsdp_reshard_after_backward,
+            fsdp_reduce_scatter_on_current_stream=(
+                fsdp_reduce_scatter_on_current_stream
+            ),
             **(
                 _static_stage_metadata(stage_io, stage_idx, num_stages)
                 if stage_io is not None

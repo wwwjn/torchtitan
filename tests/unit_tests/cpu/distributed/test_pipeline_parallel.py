@@ -34,6 +34,7 @@ def test_pipeline_stage_can_release_cache_before_gradient_reduction():
     """The opt-in cache release runs once at the reduction boundary."""
     stage = TorchTitanPipelineStage.__new__(TorchTitanPipelineStage)
     stage.empty_cache_before_gradient_reduction = True
+    stage.fsdp_reduce_scatter_on_current_stream = False
     stage.device = torch.device("cuda")
     stage.submod = Mock()
     stage._has_backward = True
@@ -112,6 +113,46 @@ def test_pipeline_stage_rejects_missing_backward_resharding_api():
         TorchTitanPipelineStage()
         with pytest.raises(RuntimeError, match="set_reshard_after_backward API"):
             TorchTitanPipelineStage(fsdp_reshard_after_backward=True)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_pipeline_stage_configures_current_stream_reduction(enabled):
+    """Only the opt-in configures FSDP, before schedule finalization."""
+    with patch.object(pipeline_parallel.PipelineStage, "__init__", return_value=None):
+        stage = TorchTitanPipelineStage(fsdp_reduce_scatter_on_current_stream=enabled)
+    stage.submod = Mock()
+    stage._has_backward = True
+    events = []
+    stage.submod.set_reduce_scatter_on_current_stream.side_effect = (
+        lambda _: events.append("configure")
+    )
+    with (
+        patch.object(pipeline_parallel, "FSDPModule", Mock),
+        patch.object(
+            pipeline_parallel.PipelineStage,
+            "perform_reduce_grad",
+            side_effect=lambda _: events.append("reduce"),
+        ),
+    ):
+        stage.perform_reduce_grad(1)
+    assert events == (["configure", "reduce"] if enabled else ["reduce"])
+    if enabled:
+        stage.submod.set_reduce_scatter_on_current_stream.assert_called_once_with(True)
+    else:
+        stage.submod.set_reduce_scatter_on_current_stream.assert_not_called()
+
+
+def test_pipeline_stage_rejects_missing_current_stream_reduction_api():
+    """An older PyTorch cannot silently ignore the requested stream policy."""
+    with patch.object(pipeline_parallel.PipelineStage, "__init__", return_value=None):
+        stage = TorchTitanPipelineStage(fsdp_reduce_scatter_on_current_stream=True)
+    stage.submod = Mock(set_reduce_scatter_on_current_stream=None)
+    stage._has_backward = True
+    with patch.object(pipeline_parallel, "FSDPModule", Mock):
+        with pytest.raises(
+            RuntimeError, match="set_reduce_scatter_on_current_stream API"
+        ):
+            stage.perform_reduce_grad(1)
 
 
 def test_pipeline_with_first_last_stage_modules_prepends_present_modules(monkeypatch):

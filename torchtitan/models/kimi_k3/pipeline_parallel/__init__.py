@@ -74,6 +74,11 @@ def _as_attn_res_stage(
             "fsdp_reshard_after_backward",
             False,
         ),
+        fsdp_reduce_scatter_on_current_stream=getattr(
+            stage,
+            "fsdp_reduce_scatter_on_current_stream",
+            False,
+        ),
         **(stage_metadata or {}),
     )
     # The schedule wrote its stage-to-rank map onto the stage it was handed.
