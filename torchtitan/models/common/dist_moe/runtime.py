@@ -237,6 +237,10 @@ class DistMoeRuntime(Configurable):
                 planning with no saved activations, and a per-step row count
                 instead of the planned maximum. The activation-slot controls
                 must stay ``None``; ``dist_moe`` rejects them for inference.
+            routing_gradient_via_dgrad: Enable the backend's experimental BF16
+                routing-gradient rewrite. Requires a supporting package and
+                plain weighted route reduction; block-scaled experts are not
+                supported. The default preserves existing gradient arithmetic.
         """
 
         activation_slot_bytes: int | None = None
@@ -245,8 +249,11 @@ class DistMoeRuntime(Configurable):
         vmm_capacity_factor: float | None = None
         pp_activation_slot_policy: PPActivationSlotPolicy = "stage_microbatch"
         inference: bool = False
+        routing_gradient_via_dgrad: bool = False
 
         def __post_init__(self) -> None:
+            if not isinstance(self.routing_gradient_via_dgrad, bool):
+                raise TypeError("routing_gradient_via_dgrad must be a bool")
             if (
                 self.activation_slot_bytes is not None
                 and self.activation_slot_capacity_factor is not None
@@ -466,6 +473,15 @@ class DistMoeRuntime(Configurable):
         wgrad_dtype: torch.dtype | None = None,
     ) -> dist_moe.Config:
         """Build the annex context configuration for one local expert module."""
+        routing_gradient_options: dict[str, bool] = {}
+        if self.config.routing_gradient_via_dgrad:
+            if "routing_gradient_via_dgrad" not in getattr(
+                dist_moe.Config, "__dataclass_fields__", {}
+            ):
+                raise ValueError(
+                    "Installed Dist-MoE does not support routing_gradient_via_dgrad"
+                )
+            routing_gradient_options["routing_gradient_via_dgrad"] = True
         vmm = (
             None
             if self.config.vmm_capacity_factor is None
@@ -507,6 +523,7 @@ class DistMoeRuntime(Configurable):
             activation=module.activation,
             wgrad_dtype=wgrad_dtype,
             inference=self.config.inference,
+            **routing_gradient_options,
             **activation_options,
         )
 
