@@ -528,6 +528,45 @@ def test_pull_model_state_dict_pulls_every_generator():
     asyncio.run(_run())
 
 
+def test_max_concurrent_prefetches_serializes_fetches_but_not_applies():
+    async def _run():
+        actors = [_Actor(f"gen{i}", wait_prefetch=True) for i in range(3)]
+        router = InterGeneratorRouter(
+            InterGeneratorRouter.Config(
+                strategy=LeastLoadedRoutingStrategy.Config(),
+                hot_swap=True,
+                max_concurrent_prefetches=1,
+            ),
+            generators=actors,
+        )
+
+        pull_task = asyncio.create_task(router._pull_model_state_dict(policy_version=5))
+        for i, actor in enumerate(actors):
+            await actor.prefetch_model_state_dict.started.wait()
+            for _ in range(5):
+                await asyncio.sleep(0)
+            # Only this generator fetches; every earlier one has already applied.
+            assert [len(a.prefetch_model_state_dict.calls) for a in actors] == [
+                1 if j <= i else 0 for j in range(len(actors))
+            ]
+            assert [len(a.pull_model_state_dict.calls) for a in actors] == [
+                1 if j < i else 0 for j in range(len(actors))
+            ]
+            actor.prefetch_model_state_dict.release.set()
+        await pull_task
+
+        assert [actor.pull_model_state_dict.calls for actor in actors] == [
+            [((5,), {})]
+        ] * 3
+
+    asyncio.run(_run())
+
+
+def test_max_concurrent_prefetches_rejects_negative():
+    with pytest.raises(ValueError, match="max_concurrent_prefetches"):
+        InterGeneratorRouter.Config(max_concurrent_prefetches=-1)
+
+
 class _StreamEndpoint:
     """An endpoint whose ``stream()`` yields one reply per rank, in arrival order."""
 

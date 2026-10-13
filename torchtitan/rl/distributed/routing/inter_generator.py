@@ -86,6 +86,14 @@ class InterGeneratorRouter(Actor, Configurable):
         generator. Other options: ``LeastLoadedRoutingStrategy.Config()``,
         ``RoundRobinRoutingStrategy.Config()``."""
 
+        max_concurrent_prefetches: int = 0
+        """How many generators fetch new weights from TorchStore at once; 0 fetches
+        all at once. Every fetch reads the trainer's CPU-staged weights, so the
+        load on the trainer hosts serving them grows with the number of concurrent
+        fetches; bound it for large models with many generators. Each generator
+        still applies its weights (the local CPU-to-GPU copy) as soon as its own
+        fetch finishes."""
+
         hot_swap: bool = True
         """When True, pulls model's state dict concurrently with in-flight
         generation (no draining). When False, each generator is drained before
@@ -96,6 +104,13 @@ class InterGeneratorRouter(Actor, Configurable):
         idle, so a weight sync may land mid-rollout and successive turns can run
         under different policy versions. A turn whose session is pinned to a
         draining generator waits for it instead of moving to another one."""
+
+        def __post_init__(self):
+            if self.max_concurrent_prefetches < 0:
+                raise ValueError(
+                    "max_concurrent_prefetches must be >= 0 (0 means unbounded), "
+                    f"got {self.max_concurrent_prefetches}"
+                )
 
     def __init__(
         self,
@@ -247,9 +262,16 @@ class InterGeneratorRouter(Actor, Configurable):
             policy_version: Trainer policy version whose state dict to pull.
         """
 
+        limit = self._config.max_concurrent_prefetches
+        prefetch_slots = asyncio.Semaphore(limit) if limit > 0 else None
+
         async def _pull_one(h: _GeneratorHandle) -> None:
             # Transfer over RDMA while the generator remains available
-            await h.actor.prefetch_model_state_dict.call()
+            if prefetch_slots is None:
+                await h.actor.prefetch_model_state_dict.call()
+            else:
+                async with prefetch_slots:
+                    await h.actor.prefetch_model_state_dict.call()
             if self._config.hot_swap:
                 # Hot swap: pull concurrently with in-flight generation, without
                 # draining. Whether the pull is genuinely concurrent and safe is
@@ -268,12 +290,9 @@ class InterGeneratorRouter(Actor, Configurable):
                 finally:
                     self._set_serving(h, serving=True)
 
-        # Start the pulls in parallel. Technically we could do rolling sync to
-        # maintain availability during weight sync, but that's not a priority
-        # for now.
-        # TODO(perf): stagger the per-generator fetches when num_generators is large so they don't
-        #   all read the trainer's CPU-staged weights at once -- bounds trainer host RAM. Matters for
-        #   big models / many generators, not at small scale.
+        # Start the pulls in parallel; ``max_concurrent_prefetches`` bounds how many
+        # fetches run at once. Technically we could do rolling sync to maintain
+        # availability during weight sync, but that's not a priority for now.
         await asyncio.gather(*[_pull_one(h) for h in self._generators])
 
     @concurrent_endpoint
