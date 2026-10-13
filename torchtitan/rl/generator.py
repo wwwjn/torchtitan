@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import datetime
 import enum
 import gc
 import logging
@@ -867,6 +868,15 @@ class VLLMGenerator(Configurable):
         vllm_stat_logger: VllmOtelStatLogger.Config | None = None
         """Optional logger instantiated on TP rank 0 to export vLLM metrics."""
 
+        loop_decision_timeout_s: float = 6 * 3600
+        """How long ranks other than 0 wait for rank 0's next `LoopDecision` broadcast.
+
+        Rank 0 decides only when it has work (a generation call, a weight pull or a
+        close), so the other ranks wait in this gloo broadcast whenever the generator
+        is idle, e.g. while the trainer runs a step or rollouts wait on their
+        environments. gloo's 30-minute default timeout would end the engine loop after
+        an idle stretch that long."""
+
         def __post_init__(self):
             # The generator runs vLLM full expert parallelism: vLLM forms the EP
             # group from all DP*TP ranks, so expert_parallel_degree must equal
@@ -891,6 +901,11 @@ class VLLMGenerator(Configurable):
                 raise ValueError(
                     "batch_invariant requires reset_kv_cache_on_weight_sync=True so "
                     "cached KV cannot cross a policy update"
+                )
+            if self.loop_decision_timeout_s <= 0:
+                raise ValueError(
+                    "loop_decision_timeout_s must be positive, got "
+                    f"{self.loop_decision_timeout_s}"
                 )
 
     def __init__(
@@ -1124,7 +1139,10 @@ class VLLMGenerator(Configurable):
         self._prefetched_model_state_dict = model._prefetched_model_state_dict
 
         # --- Continuous-batching state (see the class docstring) ---
-        self._broadcast_group = dist.new_group(backend="gloo")  # for LoopDecisions
+        self._broadcast_group = dist.new_group(  # for LoopDecisions
+            backend="gloo",
+            timeout=datetime.timedelta(seconds=config.loop_decision_timeout_s),
+        )
 
         # --- Request dispatch ---
         # The dispatcher owns the DP/TP rank layout and the request dispatch /
