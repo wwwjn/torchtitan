@@ -347,7 +347,9 @@ def test_recipes_share_the_loop_and_keep_fp32_master_weights(name: str) -> None:
 
     Master weights stay fp32 (the default): at a 1e-6 learning rate bf16
     parameters round most updates away. The env server must run every rollout
-    the controller keeps in flight, or the excess queues and the generators idle.
+    the controller keeps in flight, or the excess queues and the generators idle,
+    and no worker may carry more rollouts than its executor threads can serve
+    while sandboxes are set up.
     """
     config = _terminal_bench_config(name)
     assert config.trainer.training.dtype == "float32"
@@ -366,3 +368,4 @@ def test_recipes_share_the_loop_and_keep_fp32_master_weights(name: str) -> None:
     assert serve.pool.num_workers * serve.max_concurrent >= (
         loop.max_active_rollout_groups * loop.num_samples_per_prompt
     )
+    assert serve.max_concurrent <= 8
