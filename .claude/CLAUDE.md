@@ -162,3 +162,18 @@ this for the comments and docstrings you are adding or rewriting.
    recipe (check the selected config function and its model configuration).
 5. **Keep model code minimal.** After model changes, ensure original checkpoints
    still load correctly. Document reasons for model changes.
+
+## Local Dist-MoE Experiment Policy
+
+- Local CUDA execution uses physical GPUs 0 and 1 only. Do not use GPUs 2 or 3
+  without a new explicit user approval.
+- Before every cluster submission, construct all logical pipeline ranks under
+  FakePG and document a hardware-tagged throughput estimate in tokens/s/GPU or
+  model TFLOP/s/GPU, together with its assumptions and memory accounting.
+- FakePG construction is not a throughput measurement. Label compute-only
+  estimates, roofline bounds, calibrated predictions, and actual cluster
+  measurements separately; fake collectives do not measure network time.
+- Record estimated versus actual throughput after the run, with the clean
+  update window and limitations. Keep representative-rank profiling enabled.
+- Keep at most two nonterminal 512-GPU experiment jobs at a time, including
+  queued jobs, so simultaneous scheduling cannot exceed the user's limit.
