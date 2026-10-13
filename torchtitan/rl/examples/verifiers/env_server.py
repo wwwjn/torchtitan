@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
+import logging
+import math
 import multiprocessing
 import os
 import sys
@@ -19,8 +21,10 @@ from typing import Any
 
 from verifiers.v1.configs.env import EnvConfig as VerifiersEnvConfig
 from verifiers.v1.configs.serve import (
+    ElasticPoolConfig as VerifiersElasticPoolConfig,
     pool_serve_kwargs,
     ServeConfig as VerifiersServeConfig,
+    StaticPoolConfig as VerifiersStaticPoolConfig,
 )
 from verifiers.v1.serve import env_config_data, serve_env
 from verifiers.v1.utils.loaders import resolve_env_config
@@ -28,6 +32,60 @@ from verifiers.v1.utils.logging import setup_logging
 
 from torchtitan.config import Configurable
 from torchtitan.rl.examples.verifiers.data import register_local_taskset_alias
+
+logger = logging.getLogger(__name__)
+
+
+def size_serve_config(
+    serve: VerifiersServeConfig,
+    *,
+    rollout_concurrency: int,
+    rollouts_per_worker: int,
+) -> VerifiersServeConfig:
+    """Size the env-server pool for ``rollout_concurrency`` rollouts in flight.
+
+    A ``serve`` config that sets neither ``pool`` nor ``max_concurrent`` gets
+    ``ceil(rollout_concurrency / rollouts_per_worker)`` static workers that each
+    run at most ``rollouts_per_worker`` rollouts. A config that sets either is
+    kept as is, with a warning if it holds fewer rollouts than are in flight:
+    the excess queues in the env server while the generators idle.
+
+    Args:
+        serve: The configured Verifiers serve block.
+        rollout_concurrency: Rollouts the controller keeps in flight.
+        rollouts_per_worker: Upper bound on rollouts per env-server worker.
+    """
+    assert rollout_concurrency > 0, rollout_concurrency
+    if not {"pool", "max_concurrent"} & serve.model_fields_set:
+        per_worker = min(rollouts_per_worker, rollout_concurrency)
+        return serve.model_copy(
+            update={
+                "pool": VerifiersStaticPoolConfig(
+                    num_workers=math.ceil(rollout_concurrency / per_worker)
+                ),
+                "max_concurrent": per_worker,
+            }
+        )
+    pool = serve.pool
+    num_workers = (
+        pool.max_workers
+        if isinstance(pool, VerifiersElasticPoolConfig)
+        else pool.num_workers
+    )
+    if num_workers is not None and serve.max_concurrent is not None:
+        capacity = num_workers * serve.max_concurrent
+        if capacity < rollout_concurrency:
+            logger.warning(
+                "The configured Verifiers env server runs at most %d rollouts "
+                "(%d workers x %d), but the controller keeps %d in flight; the "
+                "excess queues in the env server. Leave serve.pool and "
+                "serve.max_concurrent unset to size the pool automatically.",
+                capacity,
+                num_workers,
+                serve.max_concurrent,
+                rollout_concurrency,
+            )
+    return serve
 
 
 def _run_env_server_process(
@@ -75,7 +133,12 @@ class VerifiersEnvServer(Configurable):
         serve: VerifiersServeConfig = field(
             default_factory=lambda: VerifiersServeConfig(address="tcp://127.0.0.1:0")
         )
-        """Typed Verifiers worker-pool and bind-address configuration."""
+        """Typed Verifiers worker-pool and bind-address configuration.
+
+        Leave ``pool`` and ``max_concurrent`` unset to have ``size_pool`` size the
+        pool from the controller's rollout concurrency at setup; setting either
+        pins the pool (see ``size_serve_config``).
+        """
 
         # TODO: pass the taskset to build() and derive its module there, removing
         # this field from the user-facing configuration entirely.
@@ -99,10 +162,19 @@ class VerifiersEnvServer(Configurable):
 
     def __init__(self, config: Config) -> None:
         self.config = config
+        self.serve: VerifiersServeConfig = config.serve
         self.process: Any = None
         self.address_queue: Any = None
         self.parent_conn: Any = None
         self.address: str | None = None
+
+    def size_pool(self, *, rollout_concurrency: int, rollouts_per_worker: int) -> None:
+        """Size the worker pool for the controller's rollouts in flight; call before ``start``."""
+        self.serve = size_serve_config(
+            self.config.serve,
+            rollout_concurrency=rollout_concurrency,
+            rollouts_per_worker=rollouts_per_worker,
+        )
 
     async def start(self) -> str:
         """Start the server and return its resolved ZMQ address."""
@@ -116,7 +188,7 @@ class VerifiersEnvServer(Configurable):
             target=_run_env_server_process,
             args=(
                 env_config_data(self.config.environment),
-                self.config.serve,
+                self.serve,
                 self.config.local_taskset_module,
                 address_queue,
                 child_conn,
