@@ -127,6 +127,16 @@ class VerifiersRollouter(Rollouter):
         connection_timeout_sec: float = 120.0
         """Maximum time to wait for the Verifiers server to become healthy."""
 
+        rollouts_per_env_worker: int = 8
+        """Most rollouts one env-server worker runs when setup sizes the pool.
+
+        A worker runs its rollouts on one asyncio loop whose default executor has
+        32 threads. Sandbox providers that block a thread while a rollout waits
+        for a sandbox starve the other rollouts' setup calls once too many share
+        a worker; 8 is the prime-rl reference value. Ignored when the env server's
+        ``serve`` config pins the pool.
+        """
+
         def __post_init__(self) -> None:
             Rollouter.Config.__post_init__(self)
             configured_taskset = self.verifiers_env_server.environment.taskset
@@ -154,6 +164,8 @@ class VerifiersRollouter(Rollouter):
                 raise ValueError("renderer_multiplex must be positive")
             if self.connection_timeout_sec <= 0:
                 raise ValueError("connection_timeout_sec must be positive")
+            if self.rollouts_per_env_worker <= 0:
+                raise ValueError("rollouts_per_env_worker must be positive")
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
@@ -171,8 +183,10 @@ class VerifiersRollouter(Rollouter):
         tokenizer_config: HuggingFaceTokenizer.Config,
         renderer_config: RendererConfig,
         hf_assets_path: str,
+        rollout_concurrency: int,
     ) -> None:
-        """Start the EnvServer and connect it to TorchTitan generation."""
+        """Start the EnvServer, sized for ``rollout_concurrency`` rollouts, and
+        connect it to TorchTitan generation."""
         del tokenizer_config
         if self._verifiers_env_client is not None:
             return
@@ -188,6 +202,10 @@ class VerifiersRollouter(Rollouter):
         # TODO: remove this bridge when the controller can provide a generator
         # HTTP endpoint directly.
         generation_server = self._verifiers_config.generation_server.build()
+        self._verifiers_env_server.size_pool(
+            rollout_concurrency=rollout_concurrency,
+            rollouts_per_worker=self._verifiers_config.rollouts_per_env_worker,
+        )
         verifiers_server_address = await self._verifiers_env_server.start()
         verifiers_env_client = None
         try:

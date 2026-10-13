@@ -161,8 +161,15 @@ class Rollouter(Configurable):
         tokenizer_config: HuggingFaceTokenizer.Config,
         renderer_config: RendererConfig,
         hf_assets_path: str,
+        rollout_concurrency: int,
     ) -> None:
-        """Spawn and initialize the owned worker proc mesh and actor pool."""
+        """Spawn and initialize the owned worker proc mesh and actor pool.
+
+        ``rollout_concurrency`` is the number of rollouts the controller keeps in
+        flight. This worker pool is sized by ``worker_pool_size`` instead;
+        rollouters that own an external environment service size it from this.
+        """
+        del rollout_concurrency
         # Import lazily to avoid a circular dependency through Rollouter.Config.
         from torchtitan.rl.distributed.monarch_actors.rollout_worker import (
             RolloutWorkerActor,

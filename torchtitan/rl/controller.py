@@ -647,6 +647,7 @@ class Controller(Configurable):
                 tokenizer_config=config.tokenizer,
                 renderer_config=config.renderer,
                 hf_assets_path=config.hf_assets_path,
+                rollout_concurrency=rollout_concurrency,
             )
 
         # Initialize TorchStore for weight sync between trainer and generator.

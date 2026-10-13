@@ -119,6 +119,7 @@ async def _setup(
         tokenizer_config="tokenizer_config",
         renderer_config="renderer_config",
         hf_assets_path="hf_assets_path",
+        rollout_concurrency=1,
     )
     return worker_mesh
 
@@ -134,6 +135,7 @@ def test_setup_spawns_worker_pool_on_controller_host(monkeypatch) -> None:
             tokenizer_config="tokenizer_config",
             renderer_config="renderer_config",
             hf_assets_path="hf_assets_path",
+            rollout_concurrency=1,
         )
 
         assert host.spawn_kwargs == {"per_host": {"cpus": 3}}
