@@ -487,6 +487,7 @@ def verifiers_rollout_logs(verifiers_episode: Any, trace: Any) -> dict[str, Any]
     """
     timing = trace.timing
     call_seconds = [call.time.duration for call in trace.calls]
+    model_sec = _model_busy_seconds(trace)
     return {
         "verifiers_trace_id": trace.id,
         "task": trace.task.key,
@@ -497,13 +498,34 @@ def verifiers_rollout_logs(verifiers_episode: Any, trace: Any) -> dict[str, Any]
         ],
         "setup_sec": timing.setup.duration,
         "agent_sec": timing.agent.duration,
-        "model_sec": timing.agent.model.duration,
-        "harness_sec": timing.agent.harness.duration,
+        "model_sec": model_sec,
+        "harness_sec": timing.agent.duration - model_sec,
         "scoring_sec": timing.scoring.duration,
         "model_calls": len(call_seconds),
         "failed_model_calls": sum(call.error is not None for call in trace.calls),
         "slowest_model_call_sec": max(call_seconds, default=0.0),
     }
+
+
+def _model_busy_seconds(trace: Any) -> float:
+    """Seconds of the agent span with at least one model call in flight.
+
+    Verifiers splits agent time by summing call durations, which counts calls the
+    agent overlaps (e.g. OpenCode's title call beside its first turn) twice; once
+    the sum reaches the agent span, it reports no harness time at all.
+    """
+    span = trace.timing.agent
+    busy = 0.0
+    covered_until = span.start
+    for start, end in sorted(
+        (call.time.start, call.time.end) for call in trace.calls if call.time.end
+    ):
+        start = max(start, covered_until)
+        end = min(end, span.end) if span.end else end
+        if end > start:
+            busy += end - start
+            covered_until = end
+    return busy
 
 
 def log_failed_rollout(logs: dict[str, Any], *, group_id: int, rollout_id: int) -> None:
