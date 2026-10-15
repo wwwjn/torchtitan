@@ -842,6 +842,14 @@ class VLLMGenerator(Configurable):
         this config (e.g. ``max_num_batched_tokens``), raise a ``ValueError``; see
         ``add_extra_vllm_engine_args``."""
 
+        profile_engine_on_start: bool = False
+        """Start vLLM's profiler once the engine is built. ``profiler_config`` in
+        ``extra_vllm_engine_args`` picks the profiler, the trace directory and the
+        recorded engine steps, e.g. ``{"profiler": "torch", "torch_profiler_dir":
+        "/abs/dir", "delay_iterations": 20000, "max_iterations": 64,
+        "ignore_frontend": True}``; vLLM stops and writes each worker's trace after
+        ``max_iterations``."""
+
         cuda_graph: VLLMCudaGraphConfig = field(default_factory=VLLMCudaGraphConfig)
         """CUDA graph capture settings for the vLLM engine."""
 
@@ -1103,6 +1111,8 @@ class VLLMGenerator(Configurable):
                     engine_args, stat_loggers=stat_loggers
                 )
             )
+            if config.profile_engine_on_start:
+                self._call_on_engine_thread(self._engine.start_profile)
             # The prefetch buffers below and each prefetch's TorchStore read pin memory through
             # the CUDA runtime, on the calling thread's device. Both run on this thread, which
             # would otherwise use device 0, rank 0's GPU.
