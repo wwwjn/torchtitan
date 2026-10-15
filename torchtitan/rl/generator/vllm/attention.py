@@ -12,12 +12,16 @@ from typing import Any, ClassVar
 import spmd_types as spmd
 
 import torch
+import torch.nn.functional as F
 from torch.nn.attention import (
     activate_flash_attention_impl,
     current_flash_attention_impl,
 )
 from torch.nn.attention.varlen import AuxRequest
-from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.attention import (
+    Attention,
+    MLAAttention as VLLMNativeMLAAttention,
+)
 from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionType
 from vllm.v1.attention.backends.flash_attn import (
@@ -35,8 +39,9 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_b
 from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
 from torchtitan.models.base.module import Module
 from torchtitan.models.base.sharding import ShardingConfig
-from torchtitan.models.common.attention import InnerAttention
+from torchtitan.models.common.attention import InnerAttention, MLAAttention
 from torchtitan.models.common.decoder_sharding import dense_param_placement
+from torchtitan.models.common.linear import Linear
 from torchtitan.observability.logging import warn_once
 from torchtitan.tools.utils import get_cuda_flash_attention_impl
 
@@ -455,6 +460,172 @@ class VLLMInnerAttention(InnerAttention):
         num_tokens = q_THK.shape[0]
         out_TD = out_TD.narrow(0, 0, num_tokens)
         return out_TD.view(num_tokens, -1, self.value_head_dim)
+
+
+class VLLMMLAAttention(MLAAttention):
+    """MLA adapter caching materialized K/V, matching the trainer's attention ops."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(MLAAttention.Config):
+        pass
+
+
+class _VLLMKVBProj:
+    """Expose a TorchTitan ``Linear`` through the ``kv_b_proj`` interface vLLM MLA reads."""
+
+    quant_method = None
+
+    def __init__(self, linear: Linear) -> None:
+        self.linear = linear
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.linear.weight
+
+    @property
+    def params_dtype(self) -> torch.dtype:
+        return self.linear.weight.dtype
+
+    def __call__(self, x: torch.Tensor) -> tuple[torch.Tensor, None]:
+        return F.linear(x, self.linear.weight, self.linear.bias), None
+
+
+class _VLLMNativeMLAAttention(VLLMNativeMLAAttention, Module):
+    """vLLM MLA attention that participates in the TorchTitan Module protocol."""
+
+    absorbed_weight_names: ClassVar[tuple[str, ...]] = ("W_UK_T", "W_UV")
+
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        """Derive the absorbed decode weights as non-persistent buffers."""
+        self._act_dtype = act_dtype
+        super().process_weights_after_loading(act_dtype)
+        for name in self.absorbed_weight_names:
+            weight = self._parameters.pop(name, None)
+            if weight is not None:
+                self.register_buffer(name, weight.data, persistent=False)
+
+    def refresh_absorbed_weights(self) -> None:
+        """Re-derive the absorbed weights after ``wkv_b`` changed in place."""
+        with torch.inference_mode():
+            self.process_weights_after_loading(self._act_dtype)
+
+
+class VLLMMLAInnerAttention(InnerAttention):
+    """Adapter from compact TorchTitan MLA inputs to vLLM's native MLA layer."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(InnerAttention.Config):
+        num_heads: int
+        kv_lora_rank: int
+        qk_nope_head_dim: int
+        qk_rope_head_dim: int
+        v_head_dim: int
+        scale: float
+
+        @property
+        def is_full_attention(self) -> bool:
+            return True
+
+    def __init__(self, config: Config, *, kv_b_proj: Linear) -> None:
+        super().__init__()
+
+        from vllm.config import get_current_vllm_config
+
+        vllm_config = get_current_vllm_config()
+        tp_degree = vllm_config.parallel_config.tensor_parallel_size
+        if config.num_heads % tp_degree != 0:
+            raise ValueError(
+                f"num_heads ({config.num_heads}) must be divisible by "
+                f"tensor_parallel_size ({tp_degree})"
+            )
+        self.num_heads = config.num_heads // tp_degree
+        self.v_head_dim = config.v_head_dim
+
+        layer_id = next(VLLMInnerAttention._layer_counter)
+        self.vllm_mla = _VLLMNativeMLAAttention(
+            num_heads=self.num_heads,
+            scale=config.scale,
+            qk_nope_head_dim=config.qk_nope_head_dim,
+            qk_rope_head_dim=config.qk_rope_head_dim,
+            v_head_dim=config.v_head_dim,
+            q_lora_rank=None,
+            kv_lora_rank=config.kv_lora_rank,
+            kv_b_proj=_VLLMKVBProj(kv_b_proj),
+            cache_config=vllm_config.cache_config,
+            quant_config=None,
+            prefix=f"model.layers.{layer_id}.attention.inner_attention",
+        )
+        replicated_dense = dense_param_placement(tp=spmd.R)
+        self.vllm_mla._sharding_config = ShardingConfig(
+            state_shardings={
+                name: replicated_dense
+                for name in VLLMInnerAttention.vllm_attn_scale_buffer_names
+            },
+        )
+
+    def forward(
+        self,
+        q_THK: torch.Tensor,
+        kv_c_normed_TL: torch.Tensor,
+        k_shared_TR: torch.Tensor,
+        *,
+        attention_metadata: None = None,
+        scale: float | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Run vLLM MLA attention on local (non-DTensor) tensors.
+
+        Args:
+            q_THK: ``(num_tokens, num_heads, qk_nope_head_dim + qk_rope_head_dim)``
+            kv_c_normed_TL: ``(num_tokens, kv_lora_rank)``
+            k_shared_TR: ``(num_tokens, qk_rope_head_dim)``, shared by all heads
+
+        Returns:
+            ``(num_tokens, num_heads, v_head_dim)``.
+        """
+        if attention_metadata is not None:
+            raise ValueError(
+                "VLLMMLAInnerAttention does not support attention_metadata; vLLM "
+                "manages causal masking and the KV-cache internally."
+            )
+        if scale is not None and scale != self.vllm_mla.scale:
+            raise ValueError(
+                f"Attention scale {scale} differs from the vLLM MLA scale "
+                f"{self.vllm_mla.scale} fixed at construction."
+            )
+        num_tokens = q_THK.shape[0]
+        out_TD = self.vllm_mla(
+            q_THK,
+            kv_c_normed_TL,
+            k_shared_TR.unsqueeze(1),
+            output_shape=(num_tokens, self.num_heads * self.v_head_dim),
+        )
+        return out_TD.view(num_tokens, -1, self.v_head_dim)
+
+
+class VLLMCompressedMLAAttention(MLAAttention):
+    """MLA adapter whose vLLM paged cache stores ``[kv_c_normed, k_pe]``."""
+
+    inner_attention: VLLMMLAInnerAttention
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(MLAAttention.Config):
+        pass
+
+    def __init__(self, config: Config) -> None:
+        InnerAttention.__init__(self)
+        self.wkv_b = config.wkv_b.build()
+        self.packed_kv_head_dim = config.packed_kv_head_dim
+        self.inner_attention = config.inner_attention.build(kv_b_proj=self.wkv_b)
+
+    def forward(
+        self,
+        q_THK: torch.Tensor,
+        kv_c_normed_TL: torch.Tensor,
+        k_shared_TR: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        return self.inner_attention(q_THK, kv_c_normed_TL, k_shared_TR, **kwargs)
 
 
 def get_attention_dimensions(

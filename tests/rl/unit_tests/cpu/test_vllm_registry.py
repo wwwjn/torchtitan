@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import dataclasses
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -11,12 +12,19 @@ import pytest
 import torch
 
 from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.models.common.attention import LinearAttention, VarlenInnerAttention
+from torchtitan.models.common.attention import (
+    LinearAttention,
+    MLAAttention,
+    VarlenInnerAttention,
+)
 from torchtitan.models.common.attention.gdn import GDN
 from torchtitan.models.common.attention.kda import KDA
 from torchtitan.models.qwen3_5 import build_model_config
-from torchtitan.rl.generator.vllm import gdn, kda
-from torchtitan.rl.generator.vllm.registry import model_config_to_hf_config_dict
+from torchtitan.rl.generator.vllm import gdn, kda, registry
+from torchtitan.rl.generator.vllm.registry import (
+    model_config_to_hf_config_dict,
+    VLLM_MLA_LATENT_HEAD_DIMS,
+)
 
 from transformers import GenerationConfig, PretrainedConfig
 
@@ -213,3 +221,59 @@ def test_batch_invariant_kda_registers_attention_gym_replay_state(monkeypatch):
         temporal_copy,
         *(temporal_copy for _ in range(6)),
     )
+
+
+def _kimi_k3_config_with_latent_rank(kv_lora_rank: int):
+    from torchtitan.models.kimi_k3 import build_model_config as build_kimi_k3_config
+
+    config = build_kimi_k3_config(
+        "debugmodel", parallelism=ParallelismConfig(), attn_backend="varlen"
+    )
+    for layer in config.layers:
+        if isinstance(layer.attention.inner_attention, MLAAttention.Config):
+            layer.attention = dataclasses.replace(
+                layer.attention, kv_lora_rank=kv_lora_rank
+            )
+    return config
+
+
+def test_vllm_mla_latent_head_dims_match_vllm():
+    from vllm.model_executor.layers.attention.mla_attention import MLACommonBackend
+
+    assert VLLM_MLA_LATENT_HEAD_DIMS == frozenset(
+        MLACommonBackend.get_supported_head_sizes()
+    )
+
+
+def test_compressed_mla_hf_config_and_backend():
+    config = _kimi_k3_config_with_latent_rank(512)
+    mla_attention = registry.first_mla_attention(config)
+    assert mla_attention is not None
+
+    assert registry.uses_vllm_compressed_mla(config)
+    assert registry.vllm_attention_backend(config) is None
+    hf = model_config_to_hf_config_dict(config)
+    assert hf["head_dim"] == 512 + mla_attention.qk_rope_head_dim
+    assert hf["num_key_value_heads"] == 1
+    assert hf["kv_lora_rank"] == 512
+    assert hf["qk_nope_head_dim"] == mla_attention.qk_nope_head_dim
+    assert hf["qk_rope_head_dim"] == mla_attention.qk_rope_head_dim
+    assert hf["v_head_dim"] == mla_attention.v_head_dim
+
+
+def test_batch_invariant_mla_keeps_materialized_kv(monkeypatch):
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    config = _kimi_k3_config_with_latent_rank(512)
+    monkeypatch.setattr(registry, "is_in_batch_invariant_mode", lambda: True)
+
+    assert not registry.uses_vllm_compressed_mla(config)
+    assert registry.vllm_attention_backend(config) == AttentionBackendEnum.CUSTOM
+    assert "kv_lora_rank" not in model_config_to_hf_config_dict(config)
+
+
+def test_unsupported_mla_latent_rank_keeps_materialized_kv():
+    config = _kimi_k3_config_with_latent_rank(64)
+
+    assert not registry.uses_vllm_compressed_mla(config)
+    assert "kv_lora_rank" not in model_config_to_hf_config_dict(config)
