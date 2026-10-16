@@ -223,20 +223,6 @@ def test_batch_invariant_kda_registers_attention_gym_replay_state(monkeypatch):
     )
 
 
-def _kimi_k3_config_with_latent_rank(kv_lora_rank: int):
-    from torchtitan.models.kimi_k3 import build_model_config as build_kimi_k3_config
-
-    config = build_kimi_k3_config(
-        "debugmodel", parallelism=ParallelismConfig(), attn_backend="varlen"
-    )
-    for layer in config.layers:
-        if isinstance(layer.attention.inner_attention, MLAAttention.Config):
-            layer.attention = dataclasses.replace(
-                layer.attention, kv_lora_rank=kv_lora_rank
-            )
-    return config
-
-
 def test_vllm_mla_latent_head_dims_match_vllm():
     from vllm.model_executor.layers.attention.mla_attention import MLACommonBackend
 
@@ -246,7 +232,14 @@ def test_vllm_mla_latent_head_dims_match_vllm():
 
 
 def test_compressed_mla_hf_config_and_backend():
-    config = _kimi_k3_config_with_latent_rank(512)
+    from torchtitan.models.kimi_k3 import build_model_config as build_kimi_k3_config
+
+    config = build_kimi_k3_config(
+        "debugmodel", parallelism=ParallelismConfig(), attn_backend="varlen"
+    )
+    for layer in config.layers:
+        if isinstance(layer.attention.inner_attention, MLAAttention.Config):
+            layer.attention = dataclasses.replace(layer.attention, kv_lora_rank=512)
     mla_attention = registry.first_mla_attention(config)
     assert mla_attention is not None
 
@@ -262,9 +255,15 @@ def test_compressed_mla_hf_config_and_backend():
 
 
 def test_batch_invariant_mla_keeps_materialized_kv(monkeypatch):
+    from torchtitan.models.kimi_k3 import build_model_config as build_kimi_k3_config
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-    config = _kimi_k3_config_with_latent_rank(512)
+    config = build_kimi_k3_config(
+        "debugmodel", parallelism=ParallelismConfig(), attn_backend="varlen"
+    )
+    for layer in config.layers:
+        if isinstance(layer.attention.inner_attention, MLAAttention.Config):
+            layer.attention = dataclasses.replace(layer.attention, kv_lora_rank=512)
     monkeypatch.setattr(registry, "is_in_batch_invariant_mode", lambda: True)
 
     assert not registry.uses_vllm_compressed_mla(config)
@@ -273,7 +272,11 @@ def test_batch_invariant_mla_keeps_materialized_kv(monkeypatch):
 
 
 def test_unsupported_mla_latent_rank_keeps_materialized_kv():
-    config = _kimi_k3_config_with_latent_rank(64)
+    from torchtitan.models.kimi_k3 import build_model_config as build_kimi_k3_config
+
+    config = build_kimi_k3_config(
+        "debugmodel", parallelism=ParallelismConfig(), attn_backend="varlen"
+    )
 
     assert not registry.uses_vllm_compressed_mla(config)
     assert "kv_lora_rank" not in model_config_to_hf_config_dict(config)

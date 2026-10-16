@@ -186,9 +186,8 @@ def model_config_to_hf_config_dict(cfg: Decoder.Config) -> dict[str, Any]:
         "eos_token_id": None,
     }
 
-    if uses_vllm_compressed_mla(cfg):
-        mla_attention = first_mla_attention(cfg)
-        assert mla_attention is not None
+    mla_attention = first_mla_attention(cfg)
+    if mla_attention is not None and uses_vllm_compressed_mla(cfg):
         hf["head_dim"] = mla_attention.kv_lora_rank + mla_attention.qk_rope_head_dim
         hf["num_key_value_heads"] = 1
         hf["kv_lora_rank"] = mla_attention.kv_lora_rank

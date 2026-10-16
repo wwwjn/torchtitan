@@ -615,7 +615,6 @@ class VLLMCompressedMLAAttention(MLAAttention):
     def __init__(self, config: Config) -> None:
         InnerAttention.__init__(self)
         self.wkv_b = config.wkv_b.build()
-        self.packed_kv_head_dim = config.packed_kv_head_dim
         self.inner_attention = config.inner_attention.build(kv_b_proj=self.wkv_b)
 
     def forward(
