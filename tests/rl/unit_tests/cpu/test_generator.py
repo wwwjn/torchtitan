@@ -145,13 +145,16 @@ def _generator():
         sampling=SamplingConfig(temperature=0.0, top_p=1.0, max_tokens=4),
         debug=SimpleNamespace(seed=None),
         reset_kv_cache_on_model_state_dict_load=False,
+        warm_up_weight_transport=False,
     )
+    generator._weight_transport_warm_up = None
     return generator
 
 
 def test_initialize_torchstore_client_uses_requester_index():
     async def main():
         generator = VLLMGenerator.__new__(VLLMGenerator)
+        generator.config = SimpleNamespace(warm_up_weight_transport=False)
         client = AsyncMock()
         with patch.object(generator_module.ts, "client", client):
             await generator.initialize_torchstore_client(requester_index=3)
@@ -210,6 +213,61 @@ def _dispatcher(*, rank=0, dp_degree=1, tp_degree=1, dp_routing_strategy=None):
 
 
 # --- completion (token-out) ---
+
+
+def test_weight_transport_warm_up_registers_buffers_before_first_fetch():
+    async def main():
+        generator = _generator()
+        generator.config.warm_up_weight_transport = True
+        weight, bias, empty = torch.ones(4), torch.ones(2), torch.empty(0)
+        generator._prefetched_model_state_dict = {
+            "weight": weight,
+            "bias": bias,
+            "empty": empty,
+        }
+        events = []
+        cache = SimpleNamespace(
+            register=lambda tensor: events.append(("register", tensor))
+        )
+        transport_context = SimpleNamespace(get=lambda cache_type: cache)
+        client = AsyncMock(
+            return_value=SimpleNamespace(
+                strategy=SimpleNamespace(transport_context=transport_context)
+            )
+        )
+
+        async def get_state_dict(*args, **kwargs):
+            events.append(("fetch", None))
+
+        with (
+            patch.object(generator_module.ts, "client", client),
+            patch.object(generator_module.ts, "get_state_dict", get_state_dict),
+            patch.object(generator_module, "nixl_available", lambda: True),
+        ):
+            await generator.initialize_torchstore_client(requester_index=0)
+            assert generator._weight_transport_warm_up is not None
+            await generator.prefetch_model_state_dict()
+
+        # Every non-empty buffer is registered once, all before the first fetch.
+        assert [kind for kind, _ in events] == ["register", "register", "fetch"]
+        assert events[0][1] is weight and events[1][1] is bias
+        assert generator._weight_transport_warm_up is None
+
+    asyncio.run(main())
+
+
+def test_weight_transport_warm_up_needs_nixl():
+    async def main():
+        generator = _generator()
+        generator.config.warm_up_weight_transport = True
+        with (
+            patch.object(generator_module.ts, "client", AsyncMock()),
+            patch.object(generator_module, "nixl_available", lambda: False),
+        ):
+            await generator.initialize_torchstore_client(requester_index=0)
+        assert generator._weight_transport_warm_up is None
+
+    asyncio.run(main())
 
 
 def test_process_finished_requests_resolves_reply_with_completion():
