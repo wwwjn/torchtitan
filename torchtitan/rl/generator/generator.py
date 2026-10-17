@@ -24,6 +24,7 @@ import torch
 import torch.distributed as dist
 import torchstore as ts
 from torchstore import RankRole
+from torchstore.transport.nixl import nixl_available, NixlAgentCache
 from vllm import EngineArgs, LLMEngine, SamplingParams
 from vllm.config import AttentionConfig, CompilationConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode, PassConfig
@@ -35,6 +36,7 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.config import Configurable, DebugConfig
 from torchtitan.distributed.batch_invariant import set_batch_invariance
+from torchtitan.distributed.utils import get_local_tensor
 from torchtitan.models.common.attention import FlexInnerAttention, VarlenInnerAttention
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.dist_moe import DistMoeRuntime
@@ -861,6 +863,13 @@ class VLLMGenerator(Configurable):
         Every generation call is queued for execution by the `engine_loop`. A higher value enables buffering
         of more requests to avoid a prefill between every engine decode step, which is inefficient."""
 
+        warm_up_weight_transport: bool = False
+        """Create TorchStore's NIXL agent and register the pinned weight buffers in the
+        background once the TorchStore client starts, instead of during the first weight
+        fetch; the first fetch waits for it. TorchStore does both lazily on first use, so
+        they otherwise add to the first weight sync on the startup path. No effect
+        without the NIXL transport."""
+
         reset_kv_cache_on_model_state_dict_load: bool = False
         """Reset cached and running-request KV after each model state dict load.
 
@@ -1147,6 +1156,7 @@ class VLLMGenerator(Configurable):
         self._group_min_policy_versions: dict[int, int] = {}
         model = self._get_model()
         self._prefetched_model_state_dict = model._prefetched_model_state_dict
+        self._weight_transport_warm_up: asyncio.Task[None] | None = None
 
         # --- Continuous-batching state (see the class docstring) ---
         self._broadcast_group = dist.new_group(backend="gloo")  # for LoopDecisions
@@ -1662,6 +1672,32 @@ class VLLMGenerator(Configurable):
             requester_index: Index used to namespace this generator mesh.
         """
         await ts.client(role=RankRole.REQUESTER, group=requester_index)
+        if self.config.warm_up_weight_transport and nixl_available():
+            self._weight_transport_warm_up = asyncio.create_task(
+                self._warm_up_weight_transport()
+            )
+
+    async def _warm_up_weight_transport(self) -> None:
+        """Create TorchStore's process-local NIXL agent and register each pinned weight
+        buffer, the setup TorchStore otherwise does during the first weight fetch."""
+        start = time.perf_counter()
+        client = await ts.client()
+        cache = client.strategy.transport_context.get(NixlAgentCache)
+        num_registered = 0
+        for tensor in self._prefetched_model_state_dict.values():
+            local_tensor = get_local_tensor(tensor)
+            # NIXL cannot register zero-byte tensors; TorchStore skips them too.
+            if local_tensor.numel() == 0:
+                continue
+            cache.register(local_tensor)
+            num_registered += 1
+            # Each registration blocks; let other actor calls run between them.
+            await asyncio.sleep(0)
+        logger.info(
+            "Weight transport ready: NIXL agent and %d buffer registrations in %.1f s",
+            num_registered,
+            time.perf_counter() - start,
+        )
 
     @sl.log_trace_span("load_model_state_dict")
     async def load_model_state_dict(self, version: int) -> None:
@@ -1688,6 +1724,9 @@ class VLLMGenerator(Configurable):
     @sl.log_trace_span("prefetch_model_state_dict")
     async def prefetch_model_state_dict(self) -> None:
         """Fetch weights into pinned CPU memory without interrupting generation."""
+        if self._weight_transport_warm_up is not None:
+            await self._weight_transport_warm_up
+            self._weight_transport_warm_up = None
         await ts.get_state_dict(
             "model_state_dict",
             user_state_dict=self._prefetched_model_state_dict,
