@@ -123,13 +123,21 @@ def _build_attn_res_stage_metadata(
     model_config: Decoder.Config,
     loss_fn: LossFunction,
     layout: BlockLayoutTables,
+    context_parallel_degree: int = 1,
 ) -> dict[int, dict[str, Any]]:
     """Describe every K3 PP boundary without executing the full pipeline.
 
     Dynamic inference would run a serial forward and backward through all PP
     stages before step 1. That setup pass is prohibitively slow for full K3.
     """
-    num_tokens = training.num_tokens_per_microbatch_per_dp_rank
+    num_tokens, remainder = divmod(
+        training.num_tokens_per_microbatch_per_dp_rank, context_parallel_degree
+    )
+    if remainder:
+        raise ValueError(
+            "Static Kimi K3 pipeline metadata requires the microbatch token "
+            f"count to be divisible by CP ({context_parallel_degree})."
+        )
     hidden_dim = model_config.dim
     dtype = TORCH_DTYPE_MAP[training.mixed_precision_param]
 
@@ -195,7 +203,8 @@ def _require_loop_style(
     schedule: _PipelineSchedule, stage_to_rank: dict[int, int], pp: int
 ) -> None:
     """The rank store keeps a block for the rank's later stages, so the cached transport
-    needs the loop-style assignment, stage s on rank s % pp; any other one is refused."""
+    needs the loop-style assignment, stage s on rank s % pp; any other one is refused.
+    """
     for stage in sorted(stage_to_rank):
         rank = stage_to_rank[stage]
         if rank != stage % pp:
@@ -249,15 +258,16 @@ def pipeline_kimi_k3(model: BaseModel, *, attn_res_cache: bool = True, **kwargs)
 
     stage_metadata_by_index = None
     parallelism_context = kwargs["parallelism_context"]
-    if parallelism_context.tp == 1 and parallelism_context.cp == 1:
+    if parallelism_context.tp == 1:
         stage_metadata_by_index = _build_attn_res_stage_metadata(
             training=kwargs["training"],
             model_config=model_config,
             loss_fn=kwargs["loss_fn"],
             layout=layout,
+            context_parallel_degree=parallelism_context.cp,
         )
-    # TODO: Describe TP- and CP-sharded K3 boundaries with DTensor metadata so
-    # those configurations can also avoid dynamic pipeline metadata inference.
+    # SPMD CP boundaries carry plain tensors with CP-local token counts.
+    # TODO: Describe TP-sharded K3 boundaries to avoid dynamic inference there.
     stages = _swap_in_attn_res_stages(pp_schedule, stage_metadata_by_index)
     store = PPRankLocalCache()
     for stage in stages:

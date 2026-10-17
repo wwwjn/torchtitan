@@ -60,6 +60,36 @@ def _metadata(loss_fn):
 
 
 class TestAttnResStageMetadata(unittest.TestCase):
+    def test_cp_metadata_uses_local_tokens_for_all_forward_and_backward_carriers(self):
+        metadata = _build_attn_res_stage_metadata(
+            training=TrainingConfig(
+                num_tokens_per_microbatch_per_dp_rank=65_536,
+                mixed_precision_param="bfloat16",
+            ),
+            model_config=Mock(dim=8, vocab_size=16),
+            loss_fn=ChunkedLossWrapper(ChunkedLossWrapper.Config()),
+            layout=_layout(),
+            context_parallel_degree=16,
+        )
+        for stage_metadata in metadata.values():
+            for field in ("input_args", "output_args", "input_grads", "output_grads"):
+                for tensor in stage_metadata[field]:
+                    if tensor is not None:
+                        self.assertEqual(tensor.shape[0], 4096)
+                        self.assertEqual(type(tensor), torch.Tensor)
+        self.assertEqual(metadata[3]["input_args"][1].shape, (4096, 3, 8))
+        self.assertEqual(metadata[3]["output_args"][1].shape, (4096, 4, 8))
+
+    def test_cp_metadata_rejects_truncated_partition_shapes(self):
+        with self.assertRaisesRegex(ValueError, "divisible by CP"):
+            _build_attn_res_stage_metadata(
+                training=TrainingConfig(num_tokens_per_microbatch_per_dp_rank=17),
+                model_config=Mock(dim=8, vocab_size=16),
+                loss_fn=ChunkedLossWrapper(ChunkedLossWrapper.Config()),
+                layout=_layout(),
+                context_parallel_degree=16,
+            )
+
     def test_kda_metadata_exposes_sequence_offsets_as_pytree_leaves(self):
         offsets = torch.tensor([0, 4], dtype=torch.int32)
         metadata = LinearAttentionMetadata(
