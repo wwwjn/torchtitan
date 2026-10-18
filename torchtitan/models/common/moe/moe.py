@@ -147,14 +147,7 @@ class RoutedExperts(Module):
             # w13 and w2 declare their own remat regions (<fqn>.grouped_mm).
             # The bf16 cast reads the dispatched tokens with bare ops.
             remat.recompute_needs_tensor(routed_input_RD)
-            gate_up_R2F = self.w13(routed_input_RD.bfloat16(), offsets_E)
-            remat.recompute_needs_tensor(gate_up_R2F)
-            # Rows vary with routing under EP>1 and across CUDA-graph capture sizes (constant
-            # at EP=1), and a capture cannot compile a new shape: compile for any row count.
-            if not torch.compiler.is_compiling():
-                torch._dynamo.maybe_mark_dynamic(gate_up_R2F, 0)
-            hidden_RF = self.activation_fn(gate_up_R2F, offsets=offsets_E)
-            routed_output_RD = self.w2(hidden_RF, offsets_E)
+            routed_output_RD = self._expert_mlp(routed_input_RD, offsets_E)
             # A real dtype cast and the output postprocess read the w2 output with
             # bare ops, so pin it only then. In the common bf16 case without a
             # postprocess, type_as is a no-op and the w2 output goes straight to
@@ -174,6 +167,24 @@ class RoutedExperts(Module):
             x_TD,
         )
         return out_TD
+
+    def _expert_mlp(
+        self, routed_input_RD: torch.Tensor, offsets_E: torch.Tensor
+    ) -> torch.Tensor:
+        """Run w13, the activation and w2 over the dispatcher's expert-sorted rows.
+
+        Args:
+            routed_input_RD: rows grouped by expert, as the token dispatcher returns them.
+            offsets_E: end row of each expert's group (the grouped GEMMs' ``offs``).
+        """
+        gate_up_R2F = self.w13(routed_input_RD.bfloat16(), offsets_E)
+        remat.recompute_needs_tensor(gate_up_R2F)
+        # Rows vary with routing under EP>1 and across CUDA-graph capture sizes (constant
+        # at EP=1), and a capture cannot compile a new shape: compile for any row count.
+        if not torch.compiler.is_compiling():
+            torch._dynamo.maybe_mark_dynamic(gate_up_R2F, 0)
+        hidden_RF = self.activation_fn(gate_up_R2F, offsets=offsets_E)
+        return self.w2(hidden_RF, offsets_E)
 
 
 class TokenChoiceTopKRouter(Module):
