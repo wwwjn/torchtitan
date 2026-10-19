@@ -238,3 +238,49 @@ def test_sampler_samples_padding_rows_greedily():
     )
     assert token_ids.shape == (3,)
     assert torch.equal(token_ids[1:], logits[1:].argmax(dim=-1))
+
+
+def test_release_sessions_closes_this_ranks_sessions():
+    """A release closes the named sessions and every session of the named groups,
+    skipping sessions this rank never tagged, in sorted order."""
+    from torchtitan.rl.generator.sglang.engine import SGLangEngine
+    from torchtitan.rl.generator.types import EngineRequest, SamplingConfig
+
+    closed = []
+    engine = SGLangEngine.__new__(SGLangEngine)
+    engine.config = SGLangEngine.Config(hold_session_kv=True)
+    engine._reset_kv_cache_on_model_state_dict_load = True
+    engine._max_context_length = 64
+    engine._vocab_size = 100
+    engine._session_groups = {}
+    engine._group_sessions = {}
+    engine._scheduler = SimpleNamespace(
+        process_input_requests=lambda requests: None,
+        waiting_queue=[],
+        close_session=lambda request: closed.append(request.session_id),
+    )
+    requests = []
+    for group_id, session_id in [
+        (1, "g1/s0"),
+        (1, "g1/s1"),
+        (2, "g2/s1"),
+        (2, "g2/s0"),
+    ]:
+        request = EngineRequest(
+            request_id=session_id,
+            prompt_token_ids=[1, 2, 3],
+            sampling=SamplingConfig(max_tokens=4),
+            group_id=group_id,
+            routing_session_id=session_id,
+            arrival_time=0.0,
+        )
+        request.min_policy_version = 0
+        requests.append(request)
+    assert engine.add_requests(requests) == []
+
+    engine.release_sessions(["g1/s1", "on-another-rank"], [])
+    assert closed == ["g1/s1"]
+    engine.release_sessions([], [2])
+    assert closed == ["g1/s1", "g2/s0", "g2/s1"]
+    engine.release_sessions(["g2/s0"], [1])
+    assert closed == ["g1/s1", "g2/s0", "g2/s1", "g1/s0"]

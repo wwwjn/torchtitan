@@ -21,6 +21,12 @@ share a prompt (prefix-cache hits). ``--admission`` changes the batches each eng
 sees, and ``--weight-update-at-step`` reloads the current weights through
 ``load_prefetched_model_state_dict`` while requests are in flight; neither may change
 the outputs.
+
+``--turns`` makes every request a multi-turn session: each later turn sends the
+previous prompt, its output and a short tool response. ``--filler-prompts`` runs
+single-turn sessions between turns and releases each when it finishes, so they churn
+the KV cache while the sessions wait; ``--hold-session-kv`` turns on the
+engine's session KV holding. The dump records each request's cached prompt tokens.
 """
 
 from torchtitan.rl._env import apply_env_defaults
@@ -234,15 +240,21 @@ def _build_engine(args):
         from torchtitan.rl.generator.vllm.config import VLLMCudaGraphConfig
         from torchtitan.rl.generator.vllm.engine import VLLMEngine
 
+        from torchtitan.rl.generator.vllm.session_kv_holder import VLLMSessionKVHolder
+
         engine_config = VLLMEngine.Config(
             cuda_graph=VLLMCudaGraphConfig(mode="FULL" if args.cuda_graph else "NONE"),
             extra_engine_args=json.loads(args.vllm_extra_engine_args),
+            session_kv_holder=(
+                VLLMSessionKVHolder.Config() if args.hold_session_kv else None
+            ),
         )
     else:
         from torchtitan.rl.generator.sglang.engine import SGLangEngine
 
         engine_config = SGLangEngine.Config(
             enable_cuda_graph=args.cuda_graph,
+            hold_session_kv=args.hold_session_kv,
             extra_server_args=json.loads(args.sglang_extra_server_args),
         )
     model_path = args.model_path or os.path.abspath(default_model_path)
@@ -259,7 +271,7 @@ def _build_engine(args):
         ),
         dist_moe_runtime=None,
         debug=debug,
-        reset_kv_cache_on_model_state_dict_load=True,
+        reset_kv_cache_on_model_state_dict_load=not args.no_kv_reset,
         rank=int(os.environ.get("RANK", "0")),
         generator_name="engine_parity",
         output_dir="/tmp/engine_parity",
@@ -267,25 +279,88 @@ def _build_engine(args):
     return engine, model_path, model_config.vocab_size
 
 
+def _next_turn(
+    request: EngineRequest, output_token_ids: list[int], tool_response: list[int]
+) -> EngineRequest:
+    """The session's next turn: its history, the output, then a tool response."""
+    base_id, _, turn = request.request_id.partition("/turn=")
+    turn = int(turn or 1) + 1
+    seed = request.sampling.seed
+    next_request = EngineRequest(
+        request_id=f"{base_id}/turn={turn}",
+        prompt_token_ids=request.prompt_token_ids + output_token_ids + tool_response,
+        sampling=SamplingConfig(
+            temperature=request.sampling.temperature,
+            max_tokens=request.sampling.max_tokens,
+            seed=None if seed is None else seed + 100_000 * (turn - 1),
+            stop_token_ids=request.sampling.stop_token_ids,
+        ),
+        group_id=request.group_id,
+        routing_session_id=request.routing_session_id,
+        arrival_time=request.arrival_time,
+    )
+    next_request.min_policy_version = 0
+    return next_request
+
+
+def _filler_requests(args, prompts: list[list[int]], turn: int) -> list[EngineRequest]:
+    """Greedy single-turn sessions run between turns ``turn - 1`` and ``turn``."""
+    stop_token_ids = [int(t) for t in args.stop_token_ids.split(",")]
+    requests = []
+    for m, prompt in enumerate(prompts):
+        request = EngineRequest(
+            request_id=f"filler-{turn}-{m}",
+            prompt_token_ids=prompt,
+            sampling=SamplingConfig(
+                temperature=0.0,
+                max_tokens=args.max_tokens,
+                stop_token_ids=stop_token_ids,
+            ),
+            # After every session's group: lowest priority.
+            group_id=1_000_000 + turn,
+            routing_session_id=f"filler-{turn}-{m}",
+            arrival_time=0.0,
+        )
+        request.min_policy_version = 0
+        requests.append(request)
+    return requests
+
+
 def generate(args) -> None:
     engine, model_path, vocab_size = _build_engine(args)
-    requests = _build_requests(
-        args, _build_prompts(model_path, args.num_prompts, vocab_size)
-    )
+    num_fillers = args.filler_prompts * (args.turns - 1)
+    prompts = _build_prompts(model_path, args.num_prompts + num_fillers, vocab_size)
+    session_prompts = prompts[: args.num_prompts]
+    filler_prompts = prompts[args.num_prompts :]
+    requests = _build_requests(args, session_prompts)
     results: dict[str, dict] = {}
     num_steps = 0
+    reload_steps = {args.weight_update_at_step}
+
+    # Request id -> session id of the requests whose sessions end when they finish.
+    single_turn_sessions: dict[str, str] = {}
 
     def step() -> None:
         nonlocal num_steps
-        if num_steps == args.weight_update_at_step:
+        if num_steps in reload_steps:
             _copy_live_weights_into_prefetched(engine)
             engine.load_prefetched_model_state_dict()
-        for finished in engine.step():
-            results[finished.request_id] = {
-                "token_ids": finished.token_ids,
-                "token_logprobs": finished.token_logprobs,
-                "finish_reason": finished.finish_reason,
-            }
+        finished_requests = engine.step()
+        for finished in finished_requests:
+            results[finished.request_id].update(
+                token_ids=finished.token_ids,
+                token_logprobs=finished.token_logprobs,
+                finish_reason=finished.finish_reason,
+                num_cached_tokens=finished.metrics_inputs.num_cached_tokens,
+            )
+        engine.release_sessions(
+            [
+                single_turn_sessions.pop(finished.request_id)
+                for finished in finished_requests
+                if finished.request_id in single_turn_sessions
+            ],
+            [],
+        )
         num_steps += 1
 
     # As the generator does, each DP rank admits its own share of the requests;
@@ -308,24 +383,58 @@ def generate(args) -> None:
         dist.all_reduce(flag_tensor, op=dist.ReduceOp.MAX)
         return bool(flag_tensor.item())
 
-    if args.admission == "all":
-        assert not engine.add_requests(requests)
-        while engine.has_unfinished_requests():
-            step()
-    elif args.admission == "sequential":
-        pending = list(requests)
-        while any_rank(bool(pending)):
-            if pending:
-                assert not engine.add_requests([pending.pop(0)])
+    def run(requests: list[EngineRequest], admission: str, release: bool = False):
+        """Admit ``requests`` per ``admission`` and step until all finish; with
+        ``release``, release each request's session once it finishes."""
+        for request in requests:
+            results[request.request_id] = {
+                "num_prompt_tokens": len(request.prompt_token_ids)
+            }
+            if release:
+                single_turn_sessions[request.request_id] = request.routing_session_id
+        if admission == "all":
+            assert not engine.add_requests(requests)
             while engine.has_unfinished_requests():
                 step()
-    else:  # staggered: admit one request per step
-        pending = list(requests)
-        while any_rank(bool(pending)) or engine.has_unfinished_requests():
-            if pending:
-                assert not engine.add_requests([pending.pop(0)])
-            if engine.has_unfinished_requests():
-                step()
+        elif admission == "sequential":
+            pending = list(requests)
+            while any_rank(bool(pending)):
+                if pending:
+                    assert not engine.add_requests([pending.pop(0)])
+                while engine.has_unfinished_requests():
+                    step()
+        else:  # staggered: admit one request per step
+            pending = list(requests)
+            while any_rank(bool(pending)) or engine.has_unfinished_requests():
+                if pending:
+                    assert not engine.add_requests([pending.pop(0)])
+                if engine.has_unfinished_requests():
+                    step()
+
+    run(requests, args.admission)
+    for turn in range(2, args.turns + 1):
+        fillers = _filler_requests(
+            args,
+            filler_prompts[(turn - 2) * args.filler_prompts :][: args.filler_prompts],
+            turn,
+        )
+        run(fillers[dp_rank::dp_size], "all", release=True)
+        if turn == args.weight_update_during_turn:
+            # Two steps in: some of the turn's requests run, the rest still wait.
+            reload_steps.add(num_steps + 2)
+        # Another session's prompt start stands in for the tool response.
+        requests = [
+            _next_turn(
+                request,
+                results[request.request_id]["token_ids"],
+                session_prompts[(request.group_id + turn) % len(session_prompts)][
+                    : args.tool_response_tokens
+                ],
+            )
+            for request in requests
+        ]
+        run(requests, args.admission)
+    engine.release_sessions([], sorted({request.group_id for request in requests}))
 
     all_results = [None] * (dist.get_world_size() if dist.is_initialized() else 1)
     if dist.is_initialized():
@@ -390,6 +499,12 @@ def main() -> None:
         "--admission", choices=["all", "sequential", "staggered"], default="all"
     )
     parser.add_argument("--weight-update-at-step", type=int, default=-1)
+    parser.add_argument("--turns", type=int, default=1)
+    parser.add_argument("--tool-response-tokens", type=int, default=32)
+    parser.add_argument("--filler-prompts", type=int, default=0, help="per turn gap")
+    parser.add_argument("--weight-update-during-turn", type=int, default=-1)
+    parser.add_argument("--hold-session-kv", action="store_true")
+    parser.add_argument("--no-kv-reset", action="store_true")
     parser.add_argument("--cuda-graph", action="store_true")
     parser.add_argument("--sglang-extra-server-args", default="{}")
     parser.add_argument("--vllm-extra-engine-args", default="{}")

@@ -27,7 +27,10 @@ __all__ = ["sglang_engine"]
     description="Run the RL generator's TorchTitan model in SGLang",
 )
 def sglang_engine(
-    cfg: VLLMEngine.Config, *, enable_cuda_graph: bool | None = None
+    cfg: VLLMEngine.Config,
+    *,
+    enable_cuda_graph: bool | None = None,
+    hold_session_kv: bool | None = None,
 ) -> SGLangEngine.Config:
     """Return the SGLang engine config for a vLLM engine config.
 
@@ -35,9 +38,10 @@ def sglang_engine(
         cfg: The recipe's vLLM engine config.
         enable_cuda_graph: Capture SGLang's decode CUDA graphs. None: capture them
             unless the recipe's vLLM CUDA graph mode is ``"NONE"``.
+        hold_session_kv: Keep multi-turn sessions' KV cached between turns (see
+            ``SGLangEngine.Config.hold_session_kv``). None: keep it when the recipe
+            sets ``session_kv_holder``.
     """
-    if cfg.session_kv_holder is not None:
-        raise ValueError("SGLangEngine does not support session_kv_holder")
     if cfg.extra_engine_args:
         raise ValueError(
             "extra_engine_args are vLLM EngineArgs; set SGLangEngine.Config."
@@ -45,4 +49,8 @@ def sglang_engine(
         )
     if enable_cuda_graph is None:
         enable_cuda_graph = cfg.cuda_graph.mode != "NONE"
-    return SGLangEngine.Config(enable_cuda_graph=enable_cuda_graph)
+    if hold_session_kv is None:
+        hold_session_kv = cfg.session_kv_holder is not None
+    return SGLangEngine.Config(
+        enable_cuda_graph=enable_cuda_graph, hold_session_kv=hold_session_kv
+    )
