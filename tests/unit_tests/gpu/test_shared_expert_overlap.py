@@ -12,7 +12,8 @@ from dataclasses import replace
 import pytest
 import torch
 
-from torchtitan.distributed.activation_checkpoint import FullAC
+from torchtitan.distributed.activation_remat import FullActivationRematConfig
+from torchtitan.models.base.module import Module, ModuleDict
 from torchtitan.models.common.activation import Sigmoid, SiTUGLU
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.hi_mid_lo_linear import HiMidLoLinear
@@ -21,7 +22,6 @@ from torchtitan.models.common.moe import MoE, RoutedExperts, TokenChoiceTopKRout
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.token_dispatcher import LocalTokenDispatcher
 from torchtitan.models.kimi_k3.moe import KimiLatentMoE
-from torchtitan.protocols.module import Module, ModuleDict
 from torchtitan_recipes.overrides.shared_expert_overlap import shared_expert_overlap
 
 
@@ -111,8 +111,8 @@ def test_shared_overlap_preserves_exact_training(
                 parameter.uniform_(-0.05, 0.05)
         overlapped.load_state_dict(deepcopy(serial.state_dict()))
         if checkpoint:
-            FullAC.Config().build().apply(serial)
-            FullAC.Config().build().apply(overlapped)
+            FullActivationRematConfig().apply(serial)
+            FullActivationRematConfig().apply(overlapped)
         for _ in range(12):
             input_TD = torch.randn(32, 128, device="cuda", dtype=torch.bfloat16)
             results = []
@@ -151,7 +151,7 @@ def test_shared_overlap_cuda_graph_replay(checkpoint: bool) -> None:
         for parameter in model.parameters():
             parameter.uniform_(-0.05, 0.05)
     if checkpoint:
-        FullAC.Config().build().apply(model)
+        FullActivationRematConfig().apply(model)
     x_TD = torch.randn(32, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     warmup = torch.cuda.Stream()
     warmup.wait_stream(torch.cuda.current_stream())

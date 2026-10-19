@@ -337,7 +337,7 @@ def test_engine_builds_dist_moe_runtime_with_eager_pp_schedule() -> None:
     engine.parallelism_context = SimpleNamespace(pp_enabled=True)
     runtime_schedule = SimpleNamespace()
     engine.pp_schedule = runtime_schedule
-    engine.device = torch.device("cuda")
+    engine.device = torch.device("cpu")
     engine._dist_moe_runtime = None
     engine._forward_backward_body = Mock()
 
@@ -1192,13 +1192,13 @@ def test_kimi_k3_dist_moe_recipes_preserve_situglu(factory, expected_type) -> No
     assert all(expert.activation == "situglu" for _, expert, _, _ in experts)
     assert all(expert.situglu_beta == 4.0 for _, expert, _, _ in experts)
     assert all(expert.situglu_linear_beta == 25.0 for _, expert, _, _ in experts)
-    assert isinstance(config.dist_moe, DistMoeRuntime.Config)
-    assert config.dist_moe.scratch_capacity_factor == 1.0
+    assert isinstance(config.dist_moe_runtime, DistMoeRuntime.Config)
+    assert config.dist_moe_runtime.scratch_capacity_factor == 1.0
     assert isinstance(
-        config.model.first_base_attention.inner_attention,
+        config.model.first_full_attention.inner_attention,
         VarlenInnerAttention.Config,
     )
-    assert config.activation_checkpoint is None
+    assert config.activation_remat is None
 
 
 def test_eager_dist_moe_recipe_supports_cuda_graphs_with_pipeline_parallelism():

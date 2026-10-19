@@ -8,13 +8,12 @@
 
 from dataclasses import replace
 
-from torchtitan.config import override
 from torchtitan.distributed.activation_remat import ActivationRematConfig
+from torchtitan.models.common.attention.kda import KDA
 from torchtitan.models.kimi_k3.model import KimiK3Model
 from torchtitan.trainer import Trainer
 
 
-@override(target=ActivationRematConfig)
 def retain_kda(
     config: ActivationRematConfig, *, block_fqns: list[str]
 ) -> ActivationRematConfig:
@@ -26,7 +25,7 @@ def retain_kda(
 
     Returns:
         An additive remat policy. Existing recompute rules still win over
-        saves. This checkpoint-only override composes with model overrides.
+        saves. This recipe-time remat policy composes with model overrides.
     """
     if not block_fqns:
         raise ValueError("retain_kda requires at least one block FQN")
@@ -35,8 +34,8 @@ def retain_kda(
     }
     for block_fqn in block_fqns:
         regions = block_regions.setdefault(block_fqn, [])
-        if "delta_attention.inner_attention" not in regions:
-            regions.append("delta_attention.inner_attention")
+        if "attention.inner_attention" not in regions:
+            regions.append("attention.inner_attention")
     return ActivationRematConfig(
         save_regions=list(config.save_regions),
         recompute_regions=list(config.recompute_regions),
@@ -60,7 +59,7 @@ def retain_last_kda(config: Trainer.Config) -> Trainer.Config:
     layer_ids = [
         layer_id
         for layer_id, layer in enumerate(config.model.layers)
-        if layer.delta_attention is not None
+        if isinstance(layer.attention, KDA.Config)
     ]
     if not layer_ids:
         raise ValueError("retain_last_kda requires a KDA layer")

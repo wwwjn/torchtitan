@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -17,7 +16,6 @@ from typing import Any, cast, TYPE_CHECKING
 
 import spmd_types as spmd
 import torch
-import torch.cuda.nccl
 from spmd_types import SpmdType
 
 # TODO(acisseJZhong): Move these implementations into TorchTitan to avoid
@@ -43,7 +41,6 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "cp_all_gather_tensors",
-    "configure_ulysses_nccl_graph_registration",
     "ContextParallelLoadBalancer",
     "HeadTailCPLoadBalancer",
     "PTRRFlexAttentionCPLoadBalancer",
@@ -75,61 +72,6 @@ def cp_all_gather_tensors(
         )
         for tensor in tensors
     )
-
-
-def configure_ulysses_nccl_graph_registration(
-    model_config: Configurable.Config,
-) -> None:
-    """Disable unsafe Ulysses graph registration on NCCL before 2.32.3.
-
-    Call before process-group initialization, for CUDA-graph-enabled training
-    with real NCCL context parallelism. NCCL can reuse an incomplete graph IPC
-    mapping for another buffer view, causing invalid accesses during replay.
-    See https://github.com/NVIDIA/nccl/pull/2362.
-
-    Args:
-        model_config: Config tree containing the selected attention backends.
-
-    Raises:
-        RuntimeError: A process group was initialized before the required
-            NCCL_GRAPH_REGISTER=0 setting was applied.
-    """
-    from torchtitan.models.common.attention.cp_attention import (
-        UlyssesCPFlexInnerAttention,
-        UlyssesCPInnerAttention,
-        UlyssesCPSlidingWindowFlexInnerAttention,
-        UlyssesCPVarlenInnerAttention,
-    )
-
-    if not any(
-        isinstance(
-            config,
-            (
-                UlyssesCPFlexInnerAttention.Config,
-                UlyssesCPSlidingWindowFlexInnerAttention.Config,
-                UlyssesCPVarlenInnerAttention.Config,
-            ),
-        )
-        and config.all_to_all_backend in ("list", "single")
-        for _, config, _, _ in model_config.traverse(UlyssesCPInnerAttention.Config)
-    ):
-        return
-
-    nccl_version = torch.cuda.nccl.version()
-    if nccl_version >= (2, 32, 3) or os.environ.get("NCCL_GRAPH_REGISTER") == "0":
-        return
-    if torch.distributed.is_initialized():
-        raise RuntimeError(
-            "Ulysses CUDA graphs on NCCL before 2.32.3 require "
-            "NCCL_GRAPH_REGISTER=0 before process-group initialization. "
-            "Set it in the launcher and restart the process."
-        )
-    logger.warning(
-        "Setting NCCL_GRAPH_REGISTER=0 for Ulysses CUDA graphs on NCCL %s "
-        "to avoid invalid graph IPC mappings (fixed in NCCL 2.32.3).",
-        nccl_version,
-    )
-    os.environ["NCCL_GRAPH_REGISTER"] = "0"
 
 
 class ContextParallelLoadBalancer(Configurable, ABC):

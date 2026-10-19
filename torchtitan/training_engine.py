@@ -29,14 +29,11 @@ from torchtitan.distributed.activation_remat import (
     DefaultActivationRematConfig,
 )
 from torchtitan.distributed.batch_invariant import set_batch_invariance
-from torchtitan.distributed.context_parallel import (
-    configure_ulysses_nccl_graph_registration,
-)
 from torchtitan.distributed.cuda_graph import (
+    _run_eager_on_cuda_graph_stream,
     cuda_graph_teardown,
     cuda_graphs_supported,
     NUM_CUDA_GRAPH_WARMUP_STEPS,
-    run_eager_on_cuda_graph_stream,
     wrap_fwd_bwd_with_cuda_graph,
     wrap_with_cuda_graph,
 )
@@ -303,16 +300,6 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         self._dist_moe_runtime = None
         self.preprocess_inputs_kwargs: dict[str, Any] = {}
         self.loss_metrics = {}
-        # Configure NCCL before the runtime hook, including subclass PG setup.
-        if (
-            config.parallelism.context_parallel_degree > 1
-            and not config.training.disable_cuda_graphs
-            and config.comm.backend == "default"
-            and utils.device_type == "cuda"
-            and torch.version.hip is None
-            and torch.distributed.is_nccl_available()
-        ):
-            configure_ulysses_nccl_graph_registration(model_config)
         self._initialize_distributed_runtime()
 
     def _initialize_distributed_runtime(self) -> None:
@@ -521,7 +508,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                 not self.config.training.disable_cuda_graphs and cuda_graphs_supported()
             )
             if uses_cuda_graph_stream:
-                run_eager_on_cuda_graph_stream(initialize_state)
+                _run_eager_on_cuda_graph_stream(initialize_state)
             else:
                 initialize_state()
             if self.device.type != "cpu":

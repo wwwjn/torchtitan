@@ -15,12 +15,6 @@ import numpy as np
 import spmd_types as spmd
 import torch
 
-from torchtitan_recipes.models.dist_moe import require_dist_moe
-from torchtitan_recipes.tests.models.kimi_k3 import (
-    _dist_muon_optimizer,
-    kimi_k3_debugmodel,
-)
-
 from torchtitan.components.data import (
     ConcatThenSplitPackingConfig,
     DatasetBuildContext,
@@ -30,24 +24,28 @@ from torchtitan.components.data import (
     SingleDatasetConfig,
     TextSequence,
 )
+from torchtitan.components.data.text_datasets import TextProcessor
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.optim.optimizer import DistMuon
 from torchtitan.config.transform import apply_transforms, ContextParallelTransform
 from torchtitan.config.transform.dist_moe import DistMoeTransform
-from torchtitan.distributed.activation_checkpoint import RegionAC
+from torchtitan.distributed.activation_remat import ActivationRematConfig
 from torchtitan.distributed.spmd_types import spmd_sparse_mesh
-from torchtitan.hf_datasets.text_datasets import TextProcessor
 from torchtitan.models.common.attention import VarlenInnerAttention
-from torchtitan.models.common.attention.cp_attention import (
-    UlyssesCPVarlenInnerAttention,
-)
+from torchtitan.models.common.attention.cp_attention import UlyssesVarlenInnerAttention
 from torchtitan.models.common.attention.cp_kda import ContextParallelInnerKDA
 from torchtitan.models.common.attention.kda import InnerKDA
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.common.dist_moe.runtime import DistMoeRuntime
 from torchtitan.models.common.moe import MoE, RoundRobinTokenChoiceTopKRouter
-from torchtitan.models.kimi_k3 import build_model_config, KimiK3Model
+from torchtitan.models.kimi_k3 import build_model_config
 from torchtitan.trainer import Trainer
+
+from torchtitan_recipes.models.dist_moe import require_dist_moe
+from torchtitan_recipes.tests.models.kimi_k3 import (
+    _dist_muon_optimizer,
+    kimi_k3_debugmodel,
+)
 
 
 _KIMI_K3_MANIFOLD_HF_ASSETS_PATH = (
@@ -261,13 +259,6 @@ def kimi_k3_debugmodel_dist_moe_bf16_recompute_varlen_pp2_fsdp2_ep2() -> (
     num_dp_shards = 2
     num_pp_microbatches = 64
     config = kimi_k3_debugmodel(seq_len=seq_len)
-    model = build_model_config(
-        "debugmodel",
-        attn_backend="varlen",
-        seq_len=seq_len,
-    )
-    config = replace(config, model=model)
-    _set_debug_expert_topology(config, num_experts=28, top_k=16)
     parallelism = replace(
         config.parallelism,
         data_parallel_replicate_degree=1,
@@ -280,6 +271,14 @@ def kimi_k3_debugmodel_dist_moe_bf16_recompute_varlen_pp2_fsdp2_ep2() -> (
         num_pp_microbatches=num_pp_microbatches,
         fsdp_reshard_after_forward="always",
     )
+    model = build_model_config(
+        "debugmodel",
+        attn_backend="varlen",
+        seq_len=seq_len,
+        parallelism=parallelism,
+    )
+    config.model = model
+    _set_debug_expert_topology(config, num_experts=28, top_k=16)
     optimizer = _dist_muon_optimizer(
         model,
         muon_lr=8e-4,
@@ -302,9 +301,9 @@ def kimi_k3_debugmodel_dist_moe_bf16_recompute_varlen_pp2_fsdp2_ep2() -> (
         optim=replace(config.optim, optimizer=optimizer),
         parallelism=parallelism,
         training=training,
-        activation_checkpoint=RegionAC.Config(save_regions=[]),
+        activation_remat=ActivationRematConfig(save_regions=[]),
         checkpointer=None,
-        dist_moe=_full_recompute_runtime_config(),
+        dist_moe_runtime=_full_recompute_runtime_config(),
     )
     config = _use_phased_round_robin_routing(config)
     config = _use_transient_dist_muon_buffers(config)
@@ -321,10 +320,26 @@ def _kimi_k3_full_bf16_pretrain_dist_moe_pp8_fsdp64_ep64_gb200_512(
     num_dp_shards = 64
     num_pp_microbatches = 64
     config = kimi_k3_debugmodel(seq_len=seq_len)
+    parallelism = replace(
+        config.parallelism,
+        data_parallel_replicate_degree=1,
+        data_parallel_shard_degree=num_dp_shards,
+        context_parallel_degree=1,
+        tensor_parallel_degree=1,
+        expert_parallel_degree=64,
+        pipeline_parallel_degree=8,
+        pipeline_parallel_schedule="1F1B",
+        pipeline_parallel_module_fqns_per_model_part=None,
+        pipeline_parallel_layers_per_stage=None,
+        num_pp_microbatches=num_pp_microbatches,
+        pp_max_unsharded_active_stages=None,
+        fsdp_reshard_after_forward="always",
+    )
     model = build_model_config(
         "Kimi-K3",
         attn_backend="varlen",
         seq_len=seq_len,
+        parallelism=parallelism,
     )
     layer_ranges = [
         range(first_layer, min(first_layer + 12, len(model.layers)))
@@ -337,19 +352,7 @@ def _kimi_k3_full_bf16_pretrain_dist_moe_pp8_fsdp64_ep64_gb200_512(
     pipeline_parts[0][:0] = ["vision_encoder", "tok_embeddings"]
     pipeline_parts[-1].extend(["norm", "lm_head", "output_res_proj", "output_res_norm"])
     parallelism = replace(
-        config.parallelism,
-        data_parallel_replicate_degree=1,
-        data_parallel_shard_degree=num_dp_shards,
-        context_parallel_degree=1,
-        tensor_parallel_degree=1,
-        expert_parallel_degree=64,
-        pipeline_parallel_degree=8,
-        pipeline_parallel_schedule="1F1B",
-        pipeline_parallel_module_fqns_per_model_part=pipeline_parts,
-        pipeline_parallel_layers_per_stage=None,
-        num_pp_microbatches=num_pp_microbatches,
-        pp_max_unsharded_active_stages=None,
-        fsdp_reshard_after_forward="always",
+        parallelism, pipeline_parallel_module_fqns_per_model_part=pipeline_parts
     )
     optimizer = _dist_muon_optimizer(
         model,
@@ -387,9 +390,9 @@ def _kimi_k3_full_bf16_pretrain_dist_moe_pp8_fsdp64_ep64_gb200_512(
         optim=replace(config.optim, optimizer=optimizer),
         parallelism=parallelism,
         training=training,
-        # RegionAC recomputes the surrounding Kimi block but honors the
+        # ActivationRematConfig recomputes the surrounding Kimi block but honors the
         # non-recomputed Dist-MoE region, avoiding nested expert execution.
-        activation_checkpoint=RegionAC.Config(save_regions=[]),
+        activation_remat=ActivationRematConfig(save_regions=[]),
         checkpointer=None,
         comm=replace(
             config.comm,
@@ -397,7 +400,7 @@ def _kimi_k3_full_bf16_pretrain_dist_moe_pp8_fsdp64_ep64_gb200_512(
             train_timeout_seconds=10 * 60,
         ),
         profiler=replace(config.profiler, enable_profiling=False),
-        dist_moe=_full_recompute_runtime_config(),
+        dist_moe_runtime=_full_recompute_runtime_config(),
     )
     config = _use_phased_round_robin_routing(config)
     config = _use_transient_dist_muon_buffers(config)
@@ -436,12 +439,6 @@ def _kimi_k3_full_long_context_v4_dist_moe_mxfp8_gb200_256(
     # The debug flavor is only a container for shared trainer defaults; its
     # own context limit is lower than the released model's long-context workload.
     config = kimi_k3_debugmodel()
-    model = build_model_config(
-        "Kimi-K3",
-        attn_backend="varlen",
-        seq_len=seq_len,
-    )
-    model = _compile_kimi_attention_residual(model)
     parallelism = replace(
         config.parallelism,
         data_parallel_replicate_degree=1,
@@ -457,6 +454,12 @@ def _kimi_k3_full_long_context_v4_dist_moe_mxfp8_gb200_256(
         num_pp_microbatches=num_pp_microbatches,
         pp_max_unsharded_active_stages=1,
         fsdp_reshard_after_forward="always",
+    )
+    model = build_model_config(
+        "Kimi-K3",
+        attn_backend="varlen",
+        seq_len=seq_len,
+        parallelism=parallelism,
     )
     optimizer = _dist_muon_optimizer(
         model,
@@ -493,9 +496,9 @@ def _kimi_k3_full_long_context_v4_dist_moe_mxfp8_gb200_256(
     config.optim = replace(config.optim, optimizer=optimizer)
     config.parallelism = parallelism
     config.training = training
-    # RegionAC retains the Dist-MoE boundary while recomputing the rest of the
+    # ActivationRematConfig retains the Dist-MoE boundary while recomputing the rest of the
     # Kimi block, avoiding a second expert forward during backward.
-    config.activation_checkpoint = RegionAC.Config(save_regions=[])
+    config.activation_remat = ActivationRematConfig(save_regions=[])
     config.checkpointer = None
     config.comm = replace(
         config.comm,
@@ -503,7 +506,7 @@ def _kimi_k3_full_long_context_v4_dist_moe_mxfp8_gb200_256(
         train_timeout_seconds=30 * 60,
     )
     config.profiler = replace(config.profiler, enable_profiling=False)
-    config.dist_moe = _full_recompute_runtime_config()
+    config.dist_moe_runtime = _full_recompute_runtime_config()
     # Factor-one scratch requires exact aggregate balance. The phased source
     # offsets preserve that bound when CP and DP jointly form the EP64 mesh.
     config = _use_phased_round_robin_routing(config)
@@ -512,7 +515,7 @@ def _kimi_k3_full_long_context_v4_dist_moe_mxfp8_gb200_256(
         [
             ContextParallelTransform(
                 inner_attention_map={
-                    VarlenInnerAttention: UlyssesCPVarlenInnerAttention,
+                    VarlenInnerAttention: UlyssesVarlenInnerAttention,
                     InnerKDA: ContextParallelInnerKDA,
                 }
             ),

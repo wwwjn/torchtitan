@@ -25,6 +25,7 @@ from torchtitan.models.common.attn_gym import (
     ChunkKdaCudnn,
     ContextParallelRouting,
     is_missing_kernel,
+    KernelOptions,
     l2norm,
     require_attn_gym,
 )

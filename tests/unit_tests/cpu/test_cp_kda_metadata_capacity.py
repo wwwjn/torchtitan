@@ -30,7 +30,9 @@ def test_routing_preserves_global_capacity_and_active_entries(
     """Keep tensor shapes fixed without changing active routing or document cuts."""
     from torchtitan.distributed.context_parallel import get_token_fragments
 
-    module = importlib.import_module(ContextParallelInnerKDA.__module__)
+    module = importlib.import_module(
+        "torchtitan.models.common.attention.cp_linear_attention"
+    )
     group = SimpleNamespace(size=lambda: 2)
     monkeypatch.setattr(module, "spmd_mesh_group", lambda axis: group)
     monkeypatch.setattr(module.dist, "get_rank", lambda group: cp_rank)

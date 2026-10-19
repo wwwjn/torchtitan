@@ -976,7 +976,7 @@ def test_initialize_optim_seeds_cuda_graph_stream_allocator() -> None:
         "torchtitan.training_engine.cuda_graphs_supported",
         return_value=True,
     ), patch(
-        "torchtitan.training_engine.run_eager_on_cuda_graph_stream",
+        "torchtitan.training_engine._run_eager_on_cuda_graph_stream",
         side_effect=run_on_graph_stream,
     ), patch(
         "torchtitan.training_engine.utils.device_module.synchronize",

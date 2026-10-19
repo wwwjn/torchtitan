@@ -23,8 +23,10 @@ from torchtitan.experiments.dist_moe_kimi_k3.activation_retention import (
     retain_kda,
     retain_last_kda,
 )
-from torchtitan.models.common.linear import Linear
 from torchtitan.models.base.module import Module, ModuleDict
+from torchtitan.models.common.attention.kda import KDA
+from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.moe import MoE
 
 from torchtitan_recipes.tests.models.kimi_k3 import kimi_k3_debugmodel
 
@@ -111,7 +113,9 @@ def test_global_recompute_overrides_block_retention() -> None:
     assert [block.inner_forwards for block in model.layers.values()] == [2, 2, 2]
 
 
-@pytest.mark.parametrize("policy", [FullActivationRematConfig, DefaultActivationRematConfig])
+@pytest.mark.parametrize(
+    "policy", [FullActivationRematConfig, DefaultActivationRematConfig]
+)
 def test_fixed_checkpoint_presets_reject_block_overrides(policy) -> None:
     """Fixed Full and default remat presets cannot silently acquire custom saves."""
     with pytest.raises(ValueError, match="ActivationRematConfig"):
@@ -133,7 +137,7 @@ def test_last_kda_retention_does_not_change_workload() -> None:
     kda_ids = [
         layer_id
         for layer_id, layer in enumerate(config.model.layers)
-        if layer.delta_attention is not None
+        if isinstance(layer.attention, KDA.Config)
     ]
     assert actual.model is config.model
     assert actual.parallelism is config.parallelism
@@ -144,35 +148,34 @@ def test_last_kda_retention_does_not_change_workload() -> None:
     assert actual.activation_remat.recompute_regions == ["*routed_experts*"]
     assert actual.activation_remat.block_save_regions == {
         "layers.0": ["feed_forward.w2.*"],
-        f"layers.{kda_ids[-1]}": ["delta_attention.inner_attention"],
+        f"layers.{kda_ids[-1]}": ["attention.inner_attention"],
     }
     assert config.activation_remat.block_save_regions == {
         "layers.0": ["feed_forward.w2.*"]
     }
 
 
-def test_checkpoint_and_shared_overlap_overrides_compose() -> None:
-    """Independent AC/model overrides claim different nodes and preserve data."""
+def test_retention_and_shared_overlap_override_compose() -> None:
+    """Recipe-time remat retention composes with a shared-expert model override."""
     config = kimi_k3_debugmodel(seq_len=256)
-    config.activation_remat = FullActivationRematConfig()
+    config.activation_remat = retain_kda(
+        FullActivationRematConfig(), block_fqns=["layers.31"]
+    )
     overrides = OverrideConfig(
         imports=[
-            (
-                "torchtitan.experiments.dist_moe_kimi_k3.activation_retention.retain_kda",
-                {"block_fqns": ["layers.31"]},
-            ),
             "torchtitan_recipes.overrides.shared_expert_overlap.shared_expert_overlap",
         ]
     )
     apply_overrides(overrides, config)
     assert type(config.activation_remat) is ActivationRematConfig
     assert config.activation_remat.block_save_regions == {
-        "layers.31": ["delta_attention.inner_attention"]
+        "layers.31": ["attention.inner_attention"]
     }
     assert all(
         layer.feed_forward.overlap_shared_experts
         for layer in config.model.layers
-        if layer.feed_forward is not None and layer.feed_forward.shared_experts is not None
+        if isinstance(layer.feed_forward, MoE.Config)
+        and layer.feed_forward.shared_experts is not None
     )
 
 
