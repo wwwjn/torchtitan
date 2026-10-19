@@ -104,6 +104,11 @@ class RoutedExperts(Module):
         del buffer_device
         self.token_dispatcher.init_buffer()
 
+    def count_tokens(self, routing_map_TE: torch.Tensor) -> torch.Tensor:
+        """Tokens routed to each expert, ``(E,)``, for ``forward`` to dispatch with."""
+        # The fused inference router returns tokens per expert directly.
+        return routing_map_TE if routing_map_TE.dim() == 1 else routing_map_TE.sum(dim=0)
+
     def forward(
         self,
         x_TD: torch.Tensor,
@@ -874,10 +879,7 @@ class MoE(FeedForward):
             aux_loss_denominator=aux_loss_denominator,
             **router_kwargs,
         )
-        # The fused inference router returns tokens per expert directly.
-        num_local_tokens_per_expert_E = (
-            routing_map_TE if routing_map_TE.dim() == 1 else routing_map_TE.sum(dim=0)
-        )
+        num_local_tokens_per_expert_E = self.routed_experts.count_tokens(routing_map_TE)
 
         out_TD = self.routed_experts(
             routed_x_TD,
