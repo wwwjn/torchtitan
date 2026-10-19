@@ -260,7 +260,7 @@ class AllGatherKVSlidingWindowFlexInnerAttention(
 class Ulysses(CPInnerAttention[_GlobalAttentionMetadataT, _GlobalAttentionMetadataT]):
     """Base for Ulysses CP attention with global attention metadata."""
 
-    all_to_all_backend: Literal["list", "single"]
+    all_to_all_backend: Literal["list", "single"] = "list"
 
     @dataclass(kw_only=True, slots=True)
     class Config(CPInnerAttention.Config):

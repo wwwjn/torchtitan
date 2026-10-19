@@ -247,8 +247,15 @@ class TestUlyssesConfigValidation(unittest.TestCase):
         layer = config.model.layers[1]
         existing = layer.attention.inner_attention
         self.assertIsInstance(existing, UlyssesFlexInnerAttention.Config)
+        target_fields = {
+            field.name for field in fields(AllGatherKVFlexInnerAttention.Config)
+        }
         layer.attention.inner_attention = AllGatherKVFlexInnerAttention.Config(
-            **{f.name: getattr(existing, f.name) for f in fields(existing)}
+            **{
+                field.name: getattr(existing, field.name)
+                for field in fields(existing)
+                if field.name in target_fields
+            }
         )
         config.__post_init__()
 

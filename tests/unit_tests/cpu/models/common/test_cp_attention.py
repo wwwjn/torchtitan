@@ -1193,6 +1193,67 @@ class TestMLAContextParallelAttention(unittest.TestCase):
         torch.testing.assert_close(args[2], expected_k_THK)
         torch.testing.assert_close(args[3], expected_v_THV)
 
+    def test_ulysses_single_exchanges_packed_inputs_and_output(self):
+        cp_mla = importlib.import_module("torchtitan.models.common.attention.cp_mla")
+        q_THK = torch.randn(8, 4, 6)
+        kv_c_normed_TL = torch.randn(8, 5)
+        kv_THP = torch.randn(8, 4, 7)
+        k_shared_TR = torch.randn(8, 2)
+        out_THV = torch.randn(8, 4, 3)
+        kernel = UlyssesMLAAttention(
+            UlyssesMLAAttention.Config(
+                **_mla_config_kwargs(), all_to_all_backend="single"
+            )
+        )
+        kernel.wkv_b = _MockProjection(kv_THP.flatten(-2))
+
+        with (
+            _in_mesh(2),
+            mock.patch.object(
+                spmd, "redistribute", side_effect=lambda x, *args, **kwargs: x
+            ) as all_gather,
+            mock.patch.object(
+                cp_mla, "_ulysses_seq_to_heads_single", side_effect=lambda x, group: x
+            ) as input_exchange,
+            mock.patch.object(
+                cp_mla, "_ulysses_heads_to_seq_single", side_effect=lambda x, group: x
+            ) as output_exchange,
+            mock.patch.object(
+                FlexInnerAttention, "forward", autospec=True, return_value=out_THV
+            ) as attention,
+        ):
+            actual = kernel(q_THK, kv_c_normed_TL, k_shared_TR, attention_metadata=None)
+
+        self.assertIs(actual, out_THV)
+        all_gather.assert_called_once()
+        self.assertIs(all_gather.call_args.args[0], k_shared_TR)
+        input_exchange.assert_called_once()
+        torch.testing.assert_close(
+            input_exchange.call_args.args[0],
+            torch.cat((q_THK, kv_THP), dim=-1),
+            rtol=0,
+            atol=0,
+        )
+        output_exchange.assert_called_once()
+        self.assertIs(output_exchange.call_args.args[0], out_THV)
+        self.assertEqual(input_exchange.call_args.args[1].size(), 2)
+        self.assertIs(
+            input_exchange.call_args.args[1], output_exchange.call_args.args[1]
+        )
+        torch.testing.assert_close(attention.call_args.args[1], q_THK, rtol=0, atol=0)
+        torch.testing.assert_close(
+            attention.call_args.args[2],
+            torch.cat(
+                (kv_THP[..., :4], k_shared_TR.unsqueeze(1).expand(-1, 4, -1)),
+                dim=-1,
+            ),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            attention.call_args.args[3], kv_THP[..., 4:], rtol=0, atol=0
+        )
+
 
 class TestUlyssesVarlen(unittest.TestCase):
     def test_is_still_a_varlen_kernel(self):

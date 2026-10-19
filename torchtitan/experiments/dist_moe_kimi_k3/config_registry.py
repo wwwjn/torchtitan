@@ -15,6 +15,12 @@ import numpy as np
 import spmd_types as spmd
 import torch
 
+from torchtitan_recipes.models.dist_moe import require_dist_moe
+from torchtitan_recipes.tests.models.kimi_k3 import (
+    _dist_muon_optimizer,
+    kimi_k3_debugmodel,
+)
+
 from torchtitan.components.data import (
     ConcatThenSplitPackingConfig,
     DatasetBuildContext,
@@ -31,21 +37,15 @@ from torchtitan.config.transform import apply_transforms, ContextParallelTransfo
 from torchtitan.config.transform.dist_moe import DistMoeTransform
 from torchtitan.distributed.activation_remat import ActivationRematConfig
 from torchtitan.distributed.spmd_types import spmd_sparse_mesh
-from torchtitan.models.common.attention import VarlenInnerAttention
-from torchtitan.models.common.attention.cp_attention import UlyssesVarlenInnerAttention
+from torchtitan.models.common.attention import MLAAttention
 from torchtitan.models.common.attention.cp_kda import ContextParallelInnerKDA
+from torchtitan.models.common.attention.cp_mla import UlyssesMLAAttention
 from torchtitan.models.common.attention.kda import InnerKDA
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.common.dist_moe.runtime import DistMoeRuntime
 from torchtitan.models.common.moe import MoE, RoundRobinTokenChoiceTopKRouter
 from torchtitan.models.kimi_k3 import build_model_config
 from torchtitan.trainer import Trainer
-
-from torchtitan_recipes.models.dist_moe import require_dist_moe
-from torchtitan_recipes.tests.models.kimi_k3 import (
-    _dist_muon_optimizer,
-    kimi_k3_debugmodel,
-)
 
 
 _KIMI_K3_MANIFOLD_HF_ASSETS_PATH = (
@@ -515,7 +515,7 @@ def _kimi_k3_full_long_context_v4_dist_moe_mxfp8_gb200_256(
         [
             ContextParallelTransform(
                 inner_attention_map={
-                    VarlenInnerAttention: UlyssesVarlenInnerAttention,
+                    MLAAttention: UlyssesMLAAttention,
                     InnerKDA: ContextParallelInnerKDA,
                 }
             ),

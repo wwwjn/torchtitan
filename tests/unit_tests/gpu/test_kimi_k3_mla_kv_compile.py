@@ -8,9 +8,11 @@ import unittest
 
 import torch
 
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.local_compile import apply_local_compile
 from torchtitan.models.common.attention.mla import materialize_mla_kv
 from torchtitan.models.kimi_k3 import build_model_config
+from torchtitan.models.kimi_k3.attention import KimiMLAAttention
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
@@ -21,9 +23,13 @@ class TestMLAKVLocalCompile(unittest.TestCase):
 
     def test_compiled_matches_eager_bitwise(self):
         torch.manual_seed(0)
-        layers = build_model_config("debugmodel", attn_backend="flex").layers
+        layers = build_model_config(
+            "debugmodel", attn_backend="flex", parallelism=ParallelismConfig()
+        ).layers
         attention_config = next(
-            layer.attention for layer in layers if layer.attention is not None
+            layer.attention
+            for layer in layers
+            if isinstance(layer.attention, KimiMLAAttention.Config)
         )
         kv_width = attention_config.qk_nope_head_dim + attention_config.v_head_dim
         q_THK = torch.empty(

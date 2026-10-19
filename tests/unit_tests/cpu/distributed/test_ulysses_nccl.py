@@ -53,6 +53,24 @@ class TestUlyssesNCCL(TestCase):
     def test_skips_non_ulysses_model(self):
         self.assertIsNone(self.configure(self.model))
 
+    def test_disables_registration_for_compact_mla(self):
+        from torchtitan.models.common.attention import MLAAttention
+        from torchtitan.models.common.attention.cp_kda import ContextParallelInnerKDA
+        from torchtitan.models.common.attention.cp_mla import UlyssesMLAAttention
+        from torchtitan.models.common.attention.kda import InnerKDA
+        from torchtitan_recipes.tests.models.kimi_k3 import kimi_k3_debugmodel
+
+        model = ContextParallelTransform(
+            inner_attention_map={
+                MLAAttention: UlyssesMLAAttention,
+                InnerKDA: ContextParallelInnerKDA,
+            }
+        ).transform(kimi_k3_debugmodel(seq_len=512, attn_backend="flex").model)
+        self.assertTrue(list(model.traverse(UlyssesMLAAttention.Config)))
+        self.assertEqual(self.configure(model), "0")
+        os.environ.clear()
+        self.assertIsNone(self.configure(model, version=(2, 32, 3)))
+
     @parametrize("kwargs", ({"comm_backend": "fake"}, {"device_type": "cpu"}))
     def test_skips_unsupported_runtime(self, kwargs):
         self.assertIsNone(self.configure(self.ulysses_model, **kwargs))

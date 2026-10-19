@@ -19,7 +19,12 @@ from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.distributed.spmd_types import spmd_mesh_group
 
 from .attention import FlexInnerAttention
-from .cp_attention import AllGatherKVFlex, Ulysses
+from .cp_attention import (
+    _ulysses_heads_to_seq_single,
+    _ulysses_seq_to_heads_single,
+    AllGatherKVFlex,
+    Ulysses,
+)
 from .mla import materialize_mla_kv, MLAAttention
 
 __all__ = [
@@ -81,7 +86,12 @@ class UlyssesMLAAttention(Ulysses, MLAAttention):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Ulysses.Config, MLAAttention.Config):
-        pass
+        all_to_all_backend: Literal["list", "single"] = "list"
+        """Collective used to exchange equal token and head shards."""
+
+    def __init__(self, config: Config) -> None:
+        super().__init__(config)
+        self.all_to_all_backend = config.all_to_all_backend
 
     def forward(
         self,
@@ -115,17 +125,24 @@ class UlyssesMLAAttention(Ulysses, MLAAttention):
         kv_THP = self.project_mla_kv(kv_c_normed_TL)
         remat.recompute_needs_tensor(q_THK, kv_THP)
         packed_q_kv_THF = torch.cat((q_THK, kv_THP), dim=-1)
-        packed_q_kv_THF = remat.region(
-            spmd.redistribute,
-            self.remat_region_name("cp_all_to_all_in"),
-            recompute=recompute,
-        )(
-            packed_q_kv_THF,
-            cp_group,
-            src=spmd.S(_TOKEN_DIM),
-            dst=spmd.S(_HEAD_DIM),
-            async_op=True,
-        )
+        if self.all_to_all_backend == "single":
+            packed_q_kv_THF = remat.region(
+                _ulysses_seq_to_heads_single,
+                self.remat_region_name("cp_all_to_all_in"),
+                recompute=recompute,
+            )(packed_q_kv_THF, cp_group)
+        else:
+            packed_q_kv_THF = remat.region(
+                spmd.redistribute,
+                self.remat_region_name("cp_all_to_all_in"),
+                recompute=recompute,
+            )(
+                packed_q_kv_THF,
+                cp_group,
+                src=spmd.S(_TOKEN_DIM),
+                dst=spmd.S(_HEAD_DIM),
+                async_op=True,
+            )
         q_THK, kv_THP = torch.split(
             packed_q_kv_THF,
             [q_THK.shape[-1], kv_THP.shape[-1]],
@@ -139,6 +156,12 @@ class UlyssesMLAAttention(Ulysses, MLAAttention):
             self.remat_region_name("inner_attention"),
             recompute=recompute,
         )(q_THK, k_THK, v_THV, **kwargs)
+        if self.all_to_all_backend == "single":
+            return remat.region(
+                _ulysses_heads_to_seq_single,
+                self.remat_region_name("cp_all_to_all_out"),
+                recompute=recompute,
+            )(out_THV, cp_group)
         return remat.region(
             spmd.redistribute,
             self.remat_region_name("cp_all_to_all_out"),
