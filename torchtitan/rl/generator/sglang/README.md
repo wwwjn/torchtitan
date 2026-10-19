@@ -9,6 +9,14 @@ from torchtitan.rl.generator.sglang.engine import SGLangEngine
 generator=Generator.Config(..., engine=SGLangEngine.Config(enable_cuda_graph=True))
 ```
 
+or, for an existing recipe, with the `sglang_engine` config override:
+
+```bash
+python -m torchtitan.rl.train --module torchtitan_recipes.rl.alphabet_sort \
+    --config rl_grpo_qwen3_0_6b_varlen_batch_invariant \
+    --override torchtitan_recipes.overrides.sglang_engine.sglang_engine
+```
+
 In batch-invariant mode (`DebugConfig(batch_invariant=True, deterministic=True)`), the
 SGLang engine returns the same tokens and bitwise-identical logprobs as the vLLM engine
 for the same requests, including seeded temperature sampling. It does so regardless of
@@ -57,6 +65,7 @@ The `sglang-kernel` wheel uses the stable ABI and loads with the nightly torch.
 | Model / layout | Status |
 |---|---|
 | Dense, full attention, TP=1 | Supported; bitwise parity with `VLLMEngine` |
+| Dense, full attention, TP > 1 | Supported; bitwise parity with `VLLMEngine` at the same TP degree (tested at TP=2 and TP=4) |
 
 Not supported yet: expert parallelism, generator data parallelism, linear attention
 (GDN, KDA), Dist-MoE, sequence parallelism, prefill CUDA graphs, multi-turn session KV

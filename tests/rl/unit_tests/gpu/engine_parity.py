@@ -28,7 +28,6 @@ from torchtitan.rl._env import apply_env_defaults
 apply_env_defaults()
 
 import argparse
-import dataclasses
 import importlib
 import json
 import os
@@ -45,12 +44,16 @@ from torchtitan.rl.generator.generator import Generator
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
 from torchtitan.rl.generator.types import EngineRequest, SamplingConfig
 
-RECIPES = {
-    "qwen3_0_6b": (
-        "torchtitan_recipes.rl.alphabet_sort",
-        "rl_grpo_qwen3_0_6b_varlen_batch_invariant",
+# name -> (model builder module, flavor, default HF checkpoint)
+MODELS = {
+    "qwen3_0_6b": ("torchtitan.models.qwen3", "0.6B", "./assets/hf/Qwen3-0.6B"),
+    "qwen3_30b_a3b": (
+        "torchtitan.models.qwen3",
+        "30B-A3B",
+        "./assets/hf/Qwen3-30B-A3B",
     ),
 }
+
 
 _WORDS = (
     "alpha beta gamma delta epsilon sort these names alphabetically and explain why "
@@ -122,15 +125,27 @@ def _copy_live_weights_into_prefetched(engine) -> None:
 
 
 def _build_engine(args):
-    module_name, fn_name = RECIPES[args.recipe]
-    controller_config = getattr(importlib.import_module(module_name), fn_name)()
-    gen_config: Generator.Config = controller_config.generator
-    model_config = gen_config.model
+    from torchtitan.config import DebugConfig, ParallelismConfig
+    from torchtitan_recipes.rl.model_configs import build_rl_model_configs
+
+    module_name, flavor, default_model_path = MODELS[args.model]
+    parallelism = InferenceParallelismConfig(
+        data_parallel_degree=args.dp,
+        tensor_parallel_degree=args.tp,
+        expert_parallel_degree=args.ep,
+    )
+    # The generator config of an RL recipe, sharded for this layout.
+    _, model_config = build_rl_model_configs(
+        importlib.import_module(module_name).build_model_config,
+        flavor,
+        trainer_parallelism=ParallelismConfig(),
+        generator_parallelism=parallelism,
+        seq_len=args.seq_len,
+        attn_backend="varlen",
+    )
     # Local compile regions do not support batch-invariant mode.
     model_config.local_compile_regions = []
-    debug = dataclasses.replace(
-        gen_config.debug, batch_invariant=True, deterministic=True, seed=0
-    )
+    debug = DebugConfig(batch_invariant=True, deterministic=True, seed=0)
     # What Generator.__init__ does before it builds the engine.
     set_batch_invariance(debug.batch_invariant)
     Generator._set_determinism(debug)
@@ -149,14 +164,10 @@ def _build_engine(args):
             enable_cuda_graph=args.cuda_graph,
             extra_server_args=json.loads(args.sglang_extra_server_args),
         )
-    model_path = args.model_path or os.path.abspath(controller_config.hf_assets_path)
+    model_path = args.model_path or os.path.abspath(default_model_path)
     engine = engine_config.build(
         model=model_config,
-        parallelism=InferenceParallelismConfig(
-            data_parallel_degree=args.dp,
-            tensor_parallel_degree=args.tp,
-            expert_parallel_degree=args.ep,
-        ),
+        parallelism=parallelism,
         model_path=model_path,
         max_num_seqs=args.max_num_seqs,
         model_dtype="bfloat16",
@@ -165,7 +176,7 @@ def _build_engine(args):
         checkpointer=CheckpointManager.Config(
             initial_load_in_hf=True, initial_load_path=model_path
         ),
-        dist_moe_runtime=gen_config.dist_moe_runtime,
+        dist_moe_runtime=None,
         debug=debug,
         reset_kv_cache_on_model_state_dict_load=True,
         rank=int(os.environ.get("RANK", "0")),
@@ -245,9 +256,10 @@ def main() -> None:
     parser.add_argument("--compare", nargs=2, metavar=("A", "B"))
     parser.add_argument("--engine", choices=["vllm", "sglang"])
     parser.add_argument("--out")
-    parser.add_argument("--recipe", default="qwen3_0_6b", choices=sorted(RECIPES))
+    parser.add_argument("--model", default="qwen3_0_6b", choices=sorted(MODELS))
+    parser.add_argument("--seq-len", type=int, default=2048)
     parser.add_argument(
-        "--model-path", default=None, help="HF checkpoint (default: the recipe's)"
+        "--model-path", default=None, help="HF checkpoint (default: MODELS)"
     )
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("--dp", type=int, default=1)

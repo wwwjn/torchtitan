@@ -70,6 +70,7 @@ _OWNED_SERVER_ARGS = frozenset(
         "json_model_override_args",
         "disable_cuda_graph",
         "disable_overlap_schedule",
+        "disable_custom_all_reduce",
         "random_seed",
         "enable_priority_scheduling",
         "schedule_low_priority_values_first",
@@ -246,6 +247,9 @@ class SGLangEngine(GenerationEngine):
             disable_cuda_graph=not config.enable_cuda_graph,
             # The generator steps the scheduler synchronously.
             disable_overlap_schedule=True,
+            # The TorchTitan model's collectives run on its own process groups; SGLang's
+            # custom all-reduce would only cost its startup (a kernel JIT build).
+            disable_custom_all_reduce=True,
             # Smaller priority runs first, as in the vLLM engine; EngineRequest.group_id
             # explains the order.
             enable_priority_scheduling=True,
