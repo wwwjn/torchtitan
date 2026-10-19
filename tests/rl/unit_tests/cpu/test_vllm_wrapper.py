@@ -18,7 +18,7 @@ from torchtitan.models.deepseek_v3 import build_model_config as build_deepseek_c
 from torchtitan.models.kimi_k3 import build_model_config as build_kimi_config
 from torchtitan.models.qwen3 import build_model_config as build_qwen3_config
 from torchtitan.models.qwen3_5 import build_model_config
-from torchtitan.rl.generator.vllm import model_wrapper
+from torchtitan.rl.generator import unified_model
 from torchtitan.rl.generator.vllm.attention import VLLMInnerAttention
 from torchtitan.rl.generator.vllm.model_wrapper import (
     _replace_vllm_layer_configs,
@@ -184,7 +184,7 @@ def test_load_state_dict_allocates_one_fsdp_group_at_a_time(
         wrapper = _Wrapper(model)
         max_allocated_groups = 0
 
-        restore_sharded_params = model_wrapper._restore_sharded_params
+        restore_sharded_params = unified_model.restore_sharded_params
 
         def checked_restore_sharded_params(module) -> None:
             nonlocal max_allocated_groups
@@ -196,11 +196,11 @@ def test_load_state_dict_allocates_one_fsdp_group_at_a_time(
             )
 
         monkeypatch.setattr(
-            model_wrapper, "_restore_sharded_params", checked_restore_sharded_params
+            unified_model, "restore_sharded_params", checked_restore_sharded_params
         )
         for module in model.modules():  # as after the initial load
             if isinstance(module, FSDPModule):
-                model_wrapper._unshard_and_free_sharded_params(module)
+                unified_model.unshard_and_free_sharded_params(module)
         wrapper.load_state_dict(new_state_dict)
 
         assert max_allocated_groups <= 2

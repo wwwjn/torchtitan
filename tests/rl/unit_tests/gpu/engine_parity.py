@@ -1,0 +1,277 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""Generate through a ``GenerationEngine`` and dump each request's tokens and logprobs.
+
+Each engine runs in its own torchrun launch (one process per generator rank); a
+comparison of the dumps checks that two engines running the same TorchTitan model
+produce bitwise-identical tokens and logprobs in batch-invariant mode:
+
+    torchrun --nproc_per_node=1 -m tests.rl.unit_tests.gpu.engine_parity \\
+        --engine vllm --out /tmp/vllm.json
+    torchrun --nproc_per_node=1 -m tests.rl.unit_tests.gpu.engine_parity \\
+        --engine sglang --out /tmp/sglang.json
+    python -m tests.rl.unit_tests.gpu.engine_parity --compare /tmp/vllm.json /tmp/sglang.json
+
+The requests mix greedy and seeded temperature sampling, and GRPO-style groups that
+share a prompt (prefix-cache hits). ``--admission`` changes the batches each engine
+sees, and ``--weight-update-at-step`` reloads the current weights through
+``load_prefetched_model_state_dict`` while requests are in flight; neither may change
+the outputs.
+"""
+
+from torchtitan.rl._env import apply_env_defaults
+
+apply_env_defaults()
+
+import argparse
+import dataclasses
+import importlib
+import json
+import os
+import random
+import struct
+import sys
+
+import torch
+import torch.distributed as dist
+
+from torchtitan.components.checkpointer import CheckpointManager
+from torchtitan.distributed.batch_invariant import set_batch_invariance
+from torchtitan.rl.generator.generator import Generator
+from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
+from torchtitan.rl.generator.types import EngineRequest, SamplingConfig
+
+RECIPES = {
+    "qwen3_0_6b": (
+        "torchtitan_recipes.rl.alphabet_sort",
+        "rl_grpo_qwen3_0_6b_varlen_batch_invariant",
+    ),
+}
+
+_WORDS = (
+    "alpha beta gamma delta epsilon sort these names alphabetically and explain why "
+    "the river bends near the old mill while the scientist measures entropy of a gas "
+    "in a sealed container under pressure"
+).split()
+
+
+def _build_prompts(model_path: str, num_prompts: int) -> list[list[int]]:
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    rng = random.Random(1234)
+    prompts = []
+    for i in range(num_prompts):
+        # Lengths from a few tokens to more than one 256-token KV page.
+        num_words = [8, 40, 120, 300, 16, 600, 64, 200][i % 8] + rng.randint(0, 7)
+        text = " ".join(rng.choice(_WORDS) for _ in range(num_words))
+        rendered = tokenizer.apply_chat_template(
+            [{"role": "user", "content": text}],
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        prompts.append(list(tokenizer.encode(rendered, add_special_tokens=False)))
+    return prompts
+
+
+def _build_requests(args, prompts: list[list[int]]) -> list[EngineRequest]:
+    stop_token_ids = [int(t) for t in args.stop_token_ids.split(",")]
+    requests = []
+    # Per prompt: one greedy request, then a group of seeded samples sharing the prompt.
+    for i, prompt in enumerate(prompts):
+        samples = [(0.0, None)] + [
+            (1.0, 1000 + 100 * i + j) for j in range(args.group_size)
+        ]
+        for j, (temperature, seed) in enumerate(samples):
+            request = EngineRequest(
+                request_id=f"req-{i}-{j}",
+                prompt_token_ids=prompt,
+                sampling=SamplingConfig(
+                    temperature=temperature,
+                    max_tokens=args.max_tokens,
+                    seed=seed,
+                    stop_token_ids=stop_token_ids,
+                ),
+                group_id=i,
+                routing_session_id=f"session-{i}-{j}",
+                arrival_time=float(len(requests)),
+            )
+            request.min_policy_version = 0
+            requests.append(request)
+    return requests
+
+
+@torch.no_grad()
+def _copy_live_weights_into_prefetched(engine) -> None:
+    """Fill the engine's prefetched model state dict with the weights it runs now."""
+    from torch.distributed.tensor import DTensor
+
+    # Both engines expose the TorchTitan model wrapper they run through _get_model().
+    model = engine._get_model().model
+    live = dict(model.named_parameters())
+    live.update(dict(model.named_buffers()))
+    for key, dst in engine.prefetched_model_state_dict.items():
+        src = live[key]
+        src = src.to_local() if isinstance(src, DTensor) else src
+        dst = dst.to_local() if isinstance(dst, DTensor) else dst
+        dst.copy_(src)
+
+
+def _build_engine(args):
+    module_name, fn_name = RECIPES[args.recipe]
+    controller_config = getattr(importlib.import_module(module_name), fn_name)()
+    gen_config: Generator.Config = controller_config.generator
+    model_config = gen_config.model
+    # Local compile regions do not support batch-invariant mode.
+    model_config.local_compile_regions = []
+    debug = dataclasses.replace(
+        gen_config.debug, batch_invariant=True, deterministic=True, seed=0
+    )
+    # What Generator.__init__ does before it builds the engine.
+    set_batch_invariance(debug.batch_invariant)
+    Generator._set_determinism(debug)
+
+    if args.engine == "vllm":
+        from torchtitan.rl.generator.vllm.config import VLLMCudaGraphConfig
+        from torchtitan.rl.generator.vllm.engine import VLLMEngine
+
+        engine_config = VLLMEngine.Config(
+            cuda_graph=VLLMCudaGraphConfig(mode="FULL" if args.cuda_graph else "NONE")
+        )
+    else:
+        from torchtitan.rl.generator.sglang.engine import SGLangEngine
+
+        engine_config = SGLangEngine.Config(
+            enable_cuda_graph=args.cuda_graph,
+            extra_server_args=json.loads(args.sglang_extra_server_args),
+        )
+    model_path = args.model_path or os.path.abspath(controller_config.hf_assets_path)
+    engine = engine_config.build(
+        model=model_config,
+        parallelism=InferenceParallelismConfig(
+            data_parallel_degree=args.dp,
+            tensor_parallel_degree=args.tp,
+            expert_parallel_degree=args.ep,
+        ),
+        model_path=model_path,
+        max_num_seqs=args.max_num_seqs,
+        model_dtype="bfloat16",
+        gpu_memory_limit=args.gpu_memory_limit,
+        max_num_batched_tokens=args.max_num_batched_tokens,
+        checkpointer=CheckpointManager.Config(
+            initial_load_in_hf=True, initial_load_path=model_path
+        ),
+        dist_moe_runtime=gen_config.dist_moe_runtime,
+        debug=debug,
+        reset_kv_cache_on_model_state_dict_load=True,
+        rank=int(os.environ.get("RANK", "0")),
+        generator_name="engine_parity",
+        output_dir="/tmp/engine_parity",
+    )
+    return engine, model_path
+
+
+def generate(args) -> None:
+    engine, model_path = _build_engine(args)
+    requests = _build_requests(args, _build_prompts(model_path, args.num_prompts))
+    results: dict[str, dict] = {}
+    num_steps = 0
+
+    def step() -> None:
+        nonlocal num_steps
+        if num_steps == args.weight_update_at_step:
+            _copy_live_weights_into_prefetched(engine)
+            engine.load_prefetched_model_state_dict()
+        for finished in engine.step():
+            results[finished.request_id] = {
+                "token_ids": finished.token_ids,
+                "token_logprobs": finished.token_logprobs,
+                "finish_reason": finished.finish_reason,
+            }
+        num_steps += 1
+
+    if args.admission == "all":
+        assert not engine.add_requests(requests)
+        while engine.has_unfinished_requests():
+            step()
+    elif args.admission == "sequential":
+        for request in requests:
+            assert not engine.add_requests([request])
+            while engine.has_unfinished_requests():
+                step()
+    else:  # staggered: admit one request per step
+        pending = list(requests)
+        while pending or engine.has_unfinished_requests():
+            if pending:
+                assert not engine.add_requests([pending.pop(0)])
+            if engine.has_unfinished_requests():
+                step()
+
+    if int(os.environ.get("RANK", "0")) == 0:
+        with open(args.out, "w") as f:
+            json.dump({"engine": args.engine, "results": results}, f)
+    engine.shutdown()
+    if dist.is_initialized():
+        dist.barrier()
+
+
+def _bits(x: float) -> int:
+    return struct.unpack("<Q", struct.pack("<d", x))[0]
+
+
+def compare(path_a: str, path_b: str) -> list[str]:
+    """Return the ids of requests whose tokens or logprobs differ bitwise."""
+    with open(path_a) as f:
+        results_a = json.load(f)["results"]
+    with open(path_b) as f:
+        results_b = json.load(f)["results"]
+    assert results_a.keys() == results_b.keys(), (sorted(results_a), sorted(results_b))
+    mismatches = []
+    for request_id, a in results_a.items():
+        b = results_b[request_id]
+        if a["token_ids"] != b["token_ids"] or [
+            _bits(x) for x in a["token_logprobs"]
+        ] != [_bits(x) for x in b["token_logprobs"]]:
+            mismatches.append(request_id)
+    return mismatches
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--compare", nargs=2, metavar=("A", "B"))
+    parser.add_argument("--engine", choices=["vllm", "sglang"])
+    parser.add_argument("--out")
+    parser.add_argument("--recipe", default="qwen3_0_6b", choices=sorted(RECIPES))
+    parser.add_argument(
+        "--model-path", default=None, help="HF checkpoint (default: the recipe's)"
+    )
+    parser.add_argument("--tp", type=int, default=1)
+    parser.add_argument("--dp", type=int, default=1)
+    parser.add_argument("--ep", type=int, default=1)
+    parser.add_argument("--num-prompts", type=int, default=8)
+    parser.add_argument("--group-size", type=int, default=3)
+    parser.add_argument("--max-tokens", type=int, default=160)
+    parser.add_argument("--max-num-seqs", type=int, default=32)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=None)
+    parser.add_argument("--gpu-memory-limit", type=float, default=0.6)
+    parser.add_argument("--stop-token-ids", default="151645,13")
+    parser.add_argument(
+        "--admission", choices=["all", "sequential", "staggered"], default="all"
+    )
+    parser.add_argument("--weight-update-at-step", type=int, default=-1)
+    parser.add_argument("--cuda-graph", action="store_true")
+    parser.add_argument("--sglang-extra-server-args", default="{}")
+    args = parser.parse_args()
+    if args.compare:
+        mismatches = compare(*args.compare)
+        print(f"{len(mismatches)} mismatching requests: {sorted(mismatches)}")
+        sys.exit(1 if mismatches else 0)
+    generate(args)
+
+
+if __name__ == "__main__":
+    main()

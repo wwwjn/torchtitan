@@ -38,6 +38,7 @@ from torchtitan.models.base.sharding import ShardingConfig
 from torchtitan.models.common.attention import InnerAttention
 from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan.observability.logging import warn_once
+from torchtitan.rl.generator.unified_model import get_attention_dimensions  # noqa: F401
 from torchtitan.tools.utils import get_cuda_flash_attention_impl
 
 logger = logging.getLogger(__name__)
@@ -455,19 +456,3 @@ class VLLMInnerAttention(InnerAttention):
         num_tokens = q_THK.shape[0]
         out_TD = out_TD.narrow(0, 0, num_tokens)
         return out_TD.view(num_tokens, -1, self.value_head_dim)
-
-
-def get_attention_dimensions(
-    attention_config, model_dim: int
-) -> tuple[int, int, int, int]:
-    """Return query heads, KV heads, Q/K head dim, and value head dim."""
-    num_heads = attention_config.n_heads
-    num_kv_heads = getattr(attention_config, "n_kv_heads", None) or num_heads
-    if hasattr(attention_config, "qk_nope_head_dim"):
-        head_dim = attention_config.qk_nope_head_dim + attention_config.qk_rope_head_dim
-        value_head_dim = attention_config.v_head_dim
-    else:
-        head_dim = getattr(attention_config, "head_dim", None)
-        head_dim = head_dim if head_dim is not None else model_dim // num_heads
-        value_head_dim = head_dim
-    return num_heads, num_kv_heads, head_dim, value_head_dim
