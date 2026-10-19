@@ -70,6 +70,66 @@ def _sum_dim_batch_invariant(
     return result.to(output_dtype)
 
 
+def _grouped_mm_batch_invariant(
+    input: torch.Tensor,
+    mat2: torch.Tensor,
+    offs: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Implement ``_grouped_mm`` as one batch-invariant ``mm`` per group.
+
+    Shape legend: R = rows, E = groups, I = input features, O = output features.
+
+    Supports the two layouts MoE uses, with ``offs`` the exclusive cumulative row
+    end of each group:
+    - ``[R, I] x [E, I, O] -> [R, O]``: each group's rows times its weight (forward
+      and input gradient);
+    - ``[I, R] x [R, O] -> [E, I, O]``: each group's columns times its rows
+      (weight gradient).
+
+    The group bounds are read on the host, so a call synchronizes with the device
+    and cannot be captured in a CUDA graph.
+    """
+    if offs is None or bias is not None:
+        raise NotImplementedError(
+            "batch-invariant _grouped_mm supports offs without bias only"
+        )
+    output_dtype = out_dtype or input.dtype
+    group_ends = offs.tolist()
+    group_starts = [0] + group_ends[:-1]
+    if input.ndim == 2 and mat2.ndim == 3:
+        input_RI, weight_EIO = input, mat2
+        output_RO = torch.zeros(
+            input_RI.shape[0],
+            weight_EIO.shape[-1],
+            dtype=output_dtype,
+            device=input.device,
+        )
+        for group, (start, end) in enumerate(zip(group_starts, group_ends)):
+            if end > start:
+                output_RO[start:end] = torch.mm(input_RI[start:end], weight_EIO[group])
+        return output_RO
+    if input.ndim == 2 and mat2.ndim == 2:
+        input_IR, input_RO = input, mat2
+        output_EIO = torch.zeros(
+            len(group_ends),
+            input_IR.shape[0],
+            input_RO.shape[-1],
+            dtype=output_dtype,
+            device=input.device,
+        )
+        for group, (start, end) in enumerate(zip(group_starts, group_ends)):
+            if end > start:
+                output_EIO[group] = torch.mm(
+                    input_IR[:, start:end], input_RO[start:end]
+                )
+        return output_EIO
+    raise NotImplementedError(
+        f"batch-invariant _grouped_mm does not support {input.ndim}D x {mat2.ndim}D"
+    )
+
+
 def set_batch_invariance(enable: bool) -> None:
     """Enable batch-invariant mode for reproducible RL training.
 
@@ -114,6 +174,16 @@ def set_batch_invariance(enable: bool) -> None:
         dispatch_key,
         allow_override=True,
     )
+    # Below SM90, a row's _grouped_mm (MoE expert GEMM) result depends on the
+    # sizes of the groups in the call, i.e. on how many tokens the batch routes
+    # to each expert. Compose it from the fixed-schedule mm instead.
+    if accelerator.type == "cuda" and torch.cuda.get_device_capability() < (9, 0):
+        _batch_invariant_extra_lib.impl(
+            "aten::_grouped_mm",
+            _grouped_mm_batch_invariant,
+            dispatch_key,
+            allow_override=True,
+        )
 
     # Make the TP all-reduce, the only reducing collective in a batch-invariant
     # forward, sum each element in the same cross-rank order for any message

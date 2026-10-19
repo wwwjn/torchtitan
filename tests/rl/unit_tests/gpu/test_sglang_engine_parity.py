@@ -32,7 +32,13 @@ _MODEL_PATH = os.environ.get(
 )
 
 
-def _run(tmp_dir: str, name: str, nproc: int, args: list[str]) -> str:
+def _run(
+    tmp_dir: str,
+    name: str,
+    nproc: int,
+    args: list[str],
+    model_path: str = _MODEL_PATH,
+) -> str:
     out = os.path.join(tmp_dir, f"{name}.json")
     subprocess.run(
         [
@@ -44,7 +50,7 @@ def _run(tmp_dir: str, name: str, nproc: int, args: list[str]) -> str:
             "-m",
             "tests.rl.unit_tests.gpu.engine_parity",
             "--model-path",
-            _MODEL_PATH,
+            model_path,
             "--out",
             out,
             *args,
@@ -113,5 +119,63 @@ def test_sglang_matches_vllm(tmp_dir, name, tp, sglang_args):
         f"sglang_{name}",
         tp,
         ["--engine", "sglang", "--tp", str(tp), *sglang_args],
+    )
+    assert compare(reference, sglang) == []
+
+
+@functools.cache
+def _debug_moe_reference(tmp_dir: str, model_path: str) -> str:
+    return _run(
+        tmp_dir,
+        "vllm_moe",
+        1,
+        ["--engine", "vllm", *_MOE_ARGS],
+        model_path=model_path,
+    )
+
+
+_MOE_ARGS = ["--model", "qwen3_moe_debug", "--stop-token-ids", "7"]
+
+
+@pytest.fixture(scope="module")
+def debug_moe_path(tmp_dir) -> str:
+    from tests.rl.unit_tests.gpu.engine_parity import save_debug_moe_checkpoint
+
+    path = os.path.join(tmp_dir, "qwen3_moe_debug")
+    save_debug_moe_checkpoint(path)
+    return path
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    "name, sglang_args",
+    [
+        ("eager", []),
+        (
+            "staggered_chunked",
+            ["--admission", "staggered", "--max-num-batched-tokens", "512"],
+        ),
+        (
+            "reload_kv_pressure",
+            [
+                "--weight-update-at-step",
+                "20",
+                "--sglang-extra-server-args",
+                '{"max_total_tokens": 4096}',
+            ],
+        ),
+    ],
+)
+def test_sglang_matches_vllm_moe(tmp_dir, debug_moe_path, name, sglang_args):
+    """A random-weight Qwen3 MoE (no expert parallelism)."""
+    from tests.rl.unit_tests.gpu.engine_parity import compare
+
+    reference = _debug_moe_reference(tmp_dir, debug_moe_path)
+    sglang = _run(
+        tmp_dir,
+        f"sglang_moe_{name}",
+        1,
+        ["--engine", "sglang", *_MOE_ARGS, *sglang_args],
+        model_path=debug_moe_path,
     )
     assert compare(reference, sglang) == []

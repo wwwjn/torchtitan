@@ -201,6 +201,16 @@ class SGLangEngine(GenerationEngine):
             attention.inner_attention, VarlenInnerAttention.Config
         ):
             raise ValueError("SGLangEngine requires varlen attention in the model")
+        if (
+            config.enable_cuda_graph
+            and model.first_moe is not None
+            and not has_cuda_capability(9, 0)
+        ):
+            raise ValueError(
+                "enable_cuda_graph requires SM90+ for MoE models: below SM90, the "
+                "expert GEMM (torch._grouped_mm) reads group sizes on the host, "
+                "which a CUDA graph cannot capture"
+            )
         overlapping = sorted(config.extra_server_args.keys() & _OWNED_SERVER_ARGS)
         if overlapping:
             raise ValueError(
