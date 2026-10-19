@@ -143,9 +143,12 @@ def register_hybrid_config() -> None:
             backend_class_name=(
                 "torchtitan.rl.generator.sglang.gdn.TorchTitanGDNAttnBackend"
             ),
-            # The radix cache would need the backend to checkpoint recurrent
-            # states at prefix boundaries; the engine disables it for these models.
-            uses_mamba_radix_cache=False,
+            # Marks the model as keeping recurrent state, so SGLang's tree cache
+            # owns the mamba slots and frees them when requests finish or are
+            # retracted. Prefix reuse stays off: it would need the backend to
+            # checkpoint recurrent states at prefix boundaries, so the engine
+            # disables the radix cache for these models.
+            uses_mamba_radix_cache=True,
             support_mamba_cache=False,
         )
     )

@@ -249,6 +249,20 @@ def _qwen3_5_reference(tmp_dir: str, tp: int) -> str:
                 "20",
             ],
         ),
+        # Fewer state slots than requests: finished and retracted requests must
+        # return their slots.
+        (
+            "slot_reuse_kv_pressure_reload",
+            1,
+            [
+                "--max-num-seqs",
+                "8",
+                "--weight-update-at-step",
+                "20",
+                "--sglang-extra-server-args",
+                '{"max_total_tokens": 4096}',
+            ],
+        ),
         (
             "mixed_chunks",
             1,
