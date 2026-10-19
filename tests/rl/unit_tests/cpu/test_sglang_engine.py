@@ -16,14 +16,14 @@ from torchtitan.models.common.attention import LinearAttention
 from torchtitan.models.qwen3 import build_model_config as build_qwen3_config
 from torchtitan.models.qwen3_5 import build_model_config as build_qwen3_5_config
 from torchtitan.rl.generator.sglang.registry import (
-    model_config_to_sglang_overrides,
+    model_config_to_sglang_hf_config,
     SGLANG_MODEL_NAME,
 )
 
 
-def test_overrides_come_from_model_config():
+def test_hf_config_comes_from_model_config():
     config = build_qwen3_config("0.6B", seq_len=1024, parallelism=ParallelismConfig())
-    overrides = model_config_to_sglang_overrides(config)
+    overrides = model_config_to_sglang_hf_config(config)
     attention = config.first_full_attention
     assert overrides["architectures"] == [SGLANG_MODEL_NAME]
     assert overrides["num_hidden_layers"] == len(config.layers)
@@ -168,3 +168,31 @@ def test_sampler_partial_prefill_row_draws_no_noise():
         torch.zeros(1, dtype=torch.int64),
     )
     assert "r0" not in sampler._generators
+
+
+def test_sampler_samples_padding_rows_greedily():
+    """Rows after the step's requests (data-parallel attention padding) take argmax."""
+    sampler = _sampler()
+    req = SimpleNamespace(
+        rid="r0",
+        sampling_params=SimpleNamespace(sampling_seed=3),
+        inflight_middle_chunks=0,
+    )
+    sampling_info = SimpleNamespace(
+        top_ks=torch.tensor([1 << 30]),
+        temperatures=torch.tensor([[1.0]]),
+        is_all_greedy=False,
+        has_custom_logit_processor=False,
+    )
+    logits = torch.randn(3, 50)
+    sampler.set_batch_reqs([req])
+    token_ids = sampler(
+        SimpleNamespace(next_token_logits=logits.clone()),
+        sampling_info,
+        False,
+        [0],
+        [None],
+        torch.zeros(3, dtype=torch.int64),
+    )
+    assert token_ids.shape == (3,)
+    assert torch.equal(token_ids[1:], logits[1:].argmax(dim=-1))

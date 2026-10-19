@@ -124,14 +124,20 @@ def test_sglang_matches_vllm(tmp_dir, name, tp, sglang_args):
 
 
 @functools.cache
-def _debug_moe_reference(tmp_dir: str, model_path: str) -> str:
+def _debug_moe_reference(tmp_dir: str, model_path: str, layout: tuple[int, ...]) -> str:
+    dp, tp, ep = layout
     return _run(
         tmp_dir,
-        "vllm_moe",
-        1,
-        ["--engine", "vllm", *_MOE_ARGS],
+        f"vllm_moe_dp{dp}_tp{tp}_ep{ep}",
+        dp * tp,
+        ["--engine", "vllm", *_MOE_ARGS, *_layout_args(layout)],
         model_path=model_path,
     )
+
+
+def _layout_args(layout: tuple[int, ...]) -> list[str]:
+    dp, tp, ep = layout
+    return ["--dp", str(dp), "--tp", str(tp), "--ep", str(ep)]
 
 
 _MOE_ARGS = ["--model", "qwen3_moe_debug", "--stop-token-ids", "7"]
@@ -146,17 +152,18 @@ def debug_moe_path(tmp_dir) -> str:
     return path
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
-    "name, sglang_args",
+    "name, layout, sglang_args",
     [
-        ("eager", []),
+        ("eager", (1, 1, 1), []),
         (
             "staggered_chunked",
+            (1, 1, 1),
             ["--admission", "staggered", "--max-num-batched-tokens", "512"],
         ),
         (
             "reload_kv_pressure",
+            (1, 1, 1),
             [
                 "--weight-update-at-step",
                 "20",
@@ -164,18 +171,39 @@ def debug_moe_path(tmp_dir) -> str:
                 '{"max_total_tokens": 4096}',
             ],
         ),
+        # Expert parallelism over TP: tokens are padded to a TP multiple.
+        ("tp2_ep2", (1, 2, 2), []),
+        # Generator DP supplies EP ranks: SGLang's data-parallel attention.
+        ("dp2_tp1_ep2", (2, 1, 2), []),
+        # DP rank 1 runs empty idle steps through the MoE layers.
+        ("dp2_tp1_ep2_imbalanced", (2, 1, 2), ["--dp-imbalanced"]),
+        (
+            "dp2_tp2_ep4_staggered_chunked_reload",
+            (2, 2, 4),
+            [
+                "--admission",
+                "staggered",
+                "--max-num-batched-tokens",
+                "512",
+                "--weight-update-at-step",
+                "30",
+            ],
+        ),
     ],
 )
-def test_sglang_matches_vllm_moe(tmp_dir, debug_moe_path, name, sglang_args):
-    """A random-weight Qwen3 MoE (no expert parallelism)."""
+def test_sglang_matches_vllm_moe(tmp_dir, debug_moe_path, name, layout, sglang_args):
+    """A random-weight Qwen3 MoE across DP x TP = EP layouts."""
     from tests.rl.unit_tests.gpu.engine_parity import compare
 
-    reference = _debug_moe_reference(tmp_dir, debug_moe_path)
+    dp, tp, _ = layout
+    if torch.cuda.device_count() < dp * tp:
+        pytest.skip(f"needs {dp * tp} GPUs")
+    reference = _debug_moe_reference(tmp_dir, debug_moe_path, layout)
     sglang = _run(
         tmp_dir,
         f"sglang_moe_{name}",
-        1,
-        ["--engine", "sglang", *_MOE_ARGS, *sglang_args],
+        dp * tp,
+        ["--engine", "sglang", *_MOE_ARGS, *_layout_args(layout), *sglang_args],
         model_path=debug_moe_path,
     )
     assert compare(reference, sglang) == []
