@@ -37,6 +37,7 @@ from torchtitan.distributed.parallelism_context import ParallelismContext
 from torchtitan.distributed.spmd_types import current_spmd_mesh
 from torchtitan.models.base.module import Module
 from torchtitan.models.common.attention import Attention, LinearAttention
+from torchtitan.models.common.attention.gdn import GDN
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
 from torchtitan.rl.generator.sglang.attention import SGLangInnerAttention
@@ -55,12 +56,36 @@ def _replace_sglang_layer_configs(model_config: Decoder.Config) -> Decoder.Confi
     new_layers = []
     for layer_idx, layer_cfg in enumerate(model_config.layers):
         attention_cfg = getattr(layer_cfg, "attention", None)
-        if isinstance(attention_cfg, LinearAttention.Config):
+        if isinstance(attention_cfg, GDN.Config):
+            from torchtitan.rl.generator.sglang.gdn import SGLangInnerGDN
+
+            layer_cfg = dataclasses.replace(
+                layer_cfg,
+                attention=dataclasses.replace(
+                    attention_cfg,
+                    inner_attention=SGLangInnerGDN.Config(
+                        layer_idx=layer_idx,
+                        num_k_heads=(
+                            attention_cfg.in_proj_q.out_features
+                            // attention_cfg.key_head_dim
+                        ),
+                        num_v_heads=(
+                            attention_cfg.in_proj_v.out_features
+                            // attention_cfg.value_head_dim
+                        ),
+                        head_k_dim=attention_cfg.key_head_dim,
+                        head_v_dim=attention_cfg.value_head_dim,
+                        conv_kernel_size=attention_cfg.conv_kernel_size,
+                        sharding_config=attention_cfg.inner_attention.sharding_config,
+                    ),
+                ),
+            )
+        elif isinstance(attention_cfg, LinearAttention.Config):
             raise NotImplementedError(
                 f"Layer {layer_idx} uses {type(attention_cfg).__qualname__}; the SGLang "
-                "engine does not support linear attention yet."
+                "engine supports GDN linear attention only."
             )
-        if isinstance(attention_cfg, Attention.Config):
+        elif isinstance(attention_cfg, Attention.Config):
             (
                 num_heads,
                 num_kv_heads,

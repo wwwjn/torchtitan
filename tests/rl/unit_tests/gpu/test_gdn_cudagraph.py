@@ -23,6 +23,7 @@ from torchtitan.distributed.batch_invariant import (
     set_batch_invariance,
 )
 from torchtitan.models.qwen3_5 import build_model_config
+from torchtitan.rl.generator import paged_gdn
 from torchtitan.rl.generator.vllm import gdn, registry
 from torchtitan.rl.generator.vllm.batch_invariance import (
     force_logprobs_fn_for_batch_invariance,
@@ -152,7 +153,9 @@ def test_gdn_full_runner_matches_eager(tmp_path: Path, batch_invariant: bool) ->
     "batch_invariant", [False, True], ids=["regular", "batch-invariant"]
 )
 def test_single_token_reused_state_capture(monkeypatch, batch_invariant: bool) -> None:
-    monkeypatch.setattr(gdn, "is_in_batch_invariant_mode", lambda: batch_invariant)
+    monkeypatch.setattr(
+        paged_gdn, "is_in_batch_invariant_mode", lambda: batch_invariant
+    )
     torch.manual_seed(42)
     device = torch.device("cuda")
     # Qwen3.5-0.8B's local TP=1 shapes, with padding between physical slots.
@@ -180,7 +183,6 @@ def test_single_token_reused_state_capture(monkeypatch, batch_invariant: bool) -
     layer.prefix = "gdn"
     layer.local_num_k_heads = layer.local_num_v_heads = 16
     layer.head_k_dim = layer.head_v_dim = 128
-    layer.local_key_dim = 2048
     pools = [
         torch.randn(6, torch.Size(shape).numel() + 128, device=device, dtype=dtype)
         for shape, dtype in zip(shapes, (torch.bfloat16, torch.float32))
@@ -246,7 +248,9 @@ def test_single_token_reused_state_capture(monkeypatch, batch_invariant: bool) -
                     "recurrent_gdn_decode",
                     "recurrent_gdn",
                 ):
-                    unmasked.setattr(gdn, name, without_mask(getattr(gdn, name)))
+                    unmasked.setattr(
+                        paged_gdn, name, without_mask(getattr(paged_gdn, name))
+                    )
                 forward()
             expected = output.clone()
             layer.kv_cache = cache_views(pools)
@@ -283,7 +287,7 @@ def run_engine(mode: str, output: Path, batch_invariant: bool) -> None:
     torch.manual_seed(42)
     recurrent_calls = []
     kernel_name = "recurrent_gdn" if batch_invariant else "paged_chunk_gdn"
-    original_recurrent = getattr(gdn, kernel_name)
+    original_recurrent = getattr(paged_gdn, kernel_name)
 
     def recurrent(*args, **kwargs):
         metadata = next(
@@ -296,7 +300,7 @@ def run_engine(mode: str, output: Path, batch_invariant: bool) -> None:
         )
         return original_recurrent(*args, **kwargs)
 
-    setattr(gdn, kernel_name, recurrent)
+    setattr(paged_gdn, kernel_name, recurrent)
     model = os.environ[MODEL_ENV]
     model_config = build_model_config(
         "0.8B", seq_len=256, attn_backend="varlen", parallelism=ParallelismConfig()

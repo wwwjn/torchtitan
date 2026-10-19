@@ -13,6 +13,8 @@ KV memory pressure (SGLang retracts requests) and a weight reload mid-generation
 
 Requires SGLang, two or more GPUs, and the Qwen3-0.6B HF checkpoint
 (``ENGINE_PARITY_MODEL_PATH``, default: the recipe's ``./assets/hf/Qwen3-0.6B``).
+The GDN cases also need the Qwen3.5-0.8B checkpoint (``ENGINE_PARITY_QWEN3_5_PATH``,
+default: ``./assets/hf/Qwen3.5-0.8B``).
 """
 
 import functools
@@ -205,5 +207,83 @@ def test_sglang_matches_vllm_moe(tmp_dir, debug_moe_path, name, layout, sglang_a
         dp * tp,
         ["--engine", "sglang", *_MOE_ARGS, *_layout_args(layout), *sglang_args],
         model_path=debug_moe_path,
+    )
+    assert compare(reference, sglang) == []
+
+
+_QWEN3_5_PATH = os.environ.get(
+    "ENGINE_PARITY_QWEN3_5_PATH", os.path.abspath("./assets/hf/Qwen3.5-0.8B")
+)
+_QWEN3_5_ARGS = ["--model", "qwen3_5_0_8b", "--stop-token-ids", "248046,13"]
+
+
+@functools.cache
+def _qwen3_5_reference(tmp_dir: str, tp: int) -> str:
+    return _run(
+        tmp_dir,
+        f"vllm_qwen3_5_tp{tp}",
+        tp,
+        ["--engine", "vllm", *_QWEN3_5_ARGS, "--tp", str(tp)],
+        model_path=_QWEN3_5_PATH,
+    )
+
+
+@pytest.mark.skipif(
+    not os.path.isdir(_QWEN3_5_PATH) or torch.cuda.device_count() < 2,
+    reason="needs the Qwen3.5-0.8B checkpoint and 2 GPUs",
+)
+@pytest.mark.parametrize(
+    "name, tp, sglang_args",
+    [
+        ("eager", 1, []),
+        (
+            "cuda_graph_staggered_chunked_reload",
+            1,
+            [
+                "--cuda-graph",
+                "--admission",
+                "staggered",
+                "--max-num-batched-tokens",
+                "512",
+                "--weight-update-at-step",
+                "20",
+            ],
+        ),
+        (
+            "mixed_chunks",
+            1,
+            [
+                "--admission",
+                "staggered",
+                "--max-num-batched-tokens",
+                "512",
+                "--sglang-extra-server-args",
+                '{"enable_mixed_chunk": true}',
+            ],
+        ),
+        (
+            "tp2_cuda_graph_staggered_chunked",
+            2,
+            [
+                "--cuda-graph",
+                "--admission",
+                "staggered",
+                "--max-num-batched-tokens",
+                "512",
+            ],
+        ),
+    ],
+)
+def test_sglang_matches_vllm_gdn(tmp_dir, name, tp, sglang_args):
+    """Qwen3.5: GDN linear attention with a full-attention layer every fourth layer."""
+    from tests.rl.unit_tests.gpu.engine_parity import compare
+
+    reference = _qwen3_5_reference(tmp_dir, tp)
+    sglang = _run(
+        tmp_dir,
+        f"sglang_qwen3_5_{name}",
+        tp,
+        ["--engine", "sglang", *_QWEN3_5_ARGS, "--tp", str(tp), *sglang_args],
+        model_path=_QWEN3_5_PATH,
     )
     assert compare(reference, sglang) == []

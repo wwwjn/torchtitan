@@ -231,6 +231,7 @@ class SGLangEngine(GenerationEngine):
         self._rank = rank
 
         from torchtitan.rl.generator.sglang.registry import (
+            is_hybrid_linear_attention,
             model_config_to_sglang_hf_config,
             register_to_sglang,
         )
@@ -285,6 +286,12 @@ class SGLangEngine(GenerationEngine):
         if debug.seed is not None:
             server_args_kwargs["random_seed"] = debug.seed
         server_args_kwargs.update(config.extra_server_args)
+        if is_hybrid_linear_attention(model):
+            # Reusing a cached prefix of a GDN model would need its recurrent state
+            # at the prefix boundary, which the GDN backend does not checkpoint.
+            if not server_args_kwargs.get("disable_radix_cache", True):
+                raise ValueError("GDN models require disable_radix_cache=True")
+            server_args_kwargs["disable_radix_cache"] = True
         self._scheduler = self._build_scheduler(server_args_kwargs, rank=rank)
         self._install_hooks()
 

@@ -52,6 +52,8 @@ MODELS = {
         "30B-A3B",
         "./assets/hf/Qwen3-30B-A3B",
     ),
+    # Hybrid: GDN linear attention with a full-attention layer every fourth layer.
+    "qwen3_5_0_8b": ("torchtitan.models.qwen3_5", "0.8B", "./assets/hf/Qwen3.5-0.8B"),
     # Random weights saved in HF format; no tokenizer, so prompts are synthetic.
     "qwen3_moe_debug": (
         "torchtitan.models.qwen3",
@@ -233,7 +235,8 @@ def _build_engine(args):
         from torchtitan.rl.generator.vllm.engine import VLLMEngine
 
         engine_config = VLLMEngine.Config(
-            cuda_graph=VLLMCudaGraphConfig(mode="FULL" if args.cuda_graph else "NONE")
+            cuda_graph=VLLMCudaGraphConfig(mode="FULL" if args.cuda_graph else "NONE"),
+            extra_engine_args=json.loads(args.vllm_extra_engine_args),
         )
     else:
         from torchtitan.rl.generator.sglang.engine import SGLangEngine
@@ -389,6 +392,7 @@ def main() -> None:
     parser.add_argument("--weight-update-at-step", type=int, default=-1)
     parser.add_argument("--cuda-graph", action="store_true")
     parser.add_argument("--sglang-extra-server-args", default="{}")
+    parser.add_argument("--vllm-extra-engine-args", default="{}")
     args = parser.parse_args()
     if args.save_debug_moe_checkpoint:
         save_debug_moe_checkpoint(args.save_debug_moe_checkpoint)
