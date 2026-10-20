@@ -301,7 +301,8 @@ class Controller(Configurable):
         num_prefill_generators: int = 0
         """Of the ``num_generators`` generators, how many only prefill: each computes a prompt's
         KV and hands it to one of the rest, which only decode. 0: every generator does both.
-        Needs NIXL, e.g. ``pip install nixl[cu13]``.
+        Needs the KV connector set by ``generator.engine.kv_connector``: NIXL (default, e.g.
+        ``pip install nixl[cu13]``) or Mooncake.
 
             num_generators=4, num_prefill_generators=1  ->  1 prefill + 3 decode generators
         """

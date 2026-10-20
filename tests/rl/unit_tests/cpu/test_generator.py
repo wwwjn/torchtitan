@@ -153,6 +153,8 @@ def _vllm_engine(*, reset_kv_cache_on_model_state_dict_load=False, model=None):
     engine._get_model = lambda: model
     engine._session_kv_holder = None
     engine._prefill_decode_role = None
+    engine._mooncake_handle = None
+    engine._transfer_ids = {}
     return engine
 
 
@@ -362,6 +364,90 @@ def test_decode_generator_passes_the_prefill_handle_to_vllm():
     )
     assert params.max_tokens == 64
     assert params.extra_args == {"kv_transfer_params": handle}
+
+
+def test_prefill_generator_ignores_stop_tokens_so_it_stops_at_its_length_cap():
+    # A sampled stop token would end the request before its length cap, and the connectors
+    # then free the prompt's KV instead of keeping it for the decode generator.
+    params = _build_sampling_params(
+        SamplingConfig(max_tokens=64, stop_token_ids=[2]),
+        prefill_decode_role="prefill",
+    )
+    assert params.max_tokens == 1
+    assert not params.stop_token_ids
+
+
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+def test_mooncake_kv_transfer_config(monkeypatch, role):
+    monkeypatch.delenv("VLLM_MOONCAKE_BOOTSTRAP_PORT", raising=False)
+    engine_kwargs = {}
+    handle = add_kv_transfer_config(
+        engine_kwargs,
+        role,
+        connector="MooncakeConnector",
+        extra_config={"mooncake_protocol": "tcp"},
+        engine_id="prefill_generator_0-ab12",
+    )
+    kv_transfer_config = engine_kwargs["kv_transfer_config"]
+    assert kv_transfer_config.kv_connector == "MooncakeConnector"
+    assert kv_transfer_config.engine_id == "prefill_generator_0-ab12"
+    assert kv_transfer_config.kv_connector_extra_config == {"mooncake_protocol": "tcp"}
+    if role == "decode":
+        assert handle is None
+        return
+    # A prefill engine serves its own bootstrap port; decode requests find it there.
+    port = os.environ["VLLM_MOONCAKE_BOOTSTRAP_PORT"]
+    assert handle["do_remote_prefill"] is True
+    assert handle["remote_engine_id"] == "prefill_generator_0-ab12"
+    # vLLM appends "/query" to it, so it must be a full URL.
+    assert handle["remote_bootstrap_addr"].startswith("http://")
+    assert handle["remote_bootstrap_addr"].endswith(f":{port}")
+
+
+def test_mooncake_needs_an_engine_id():
+    with pytest.raises(ValueError, match="engine_id"):
+        add_kv_transfer_config({}, "prefill", connector="MooncakeConnector")
+
+
+def test_mooncake_has_no_kv_transfer_listener_to_watch():
+    config = VLLMEngine.Config(kv_connector="MooncakeConnector")
+    assert config.kv_transfer_listener_thread_name is None
+
+
+def test_mooncake_prefill_engine_gives_each_request_its_transfer_id():
+    engine = _vllm_engine()
+    engine._prefill_decode_role = "prefill"
+    engine._mooncake_handle = {
+        "do_remote_prefill": True,
+        "remote_engine_id": "e0",
+        "remote_bootstrap_addr": "http://10.0.0.1:9000",
+    }
+    engine.add_requests(
+        [
+            _engine_request("r0", min_policy_version=6),
+            _engine_request("r1", min_policy_version=6),
+        ]
+    )
+    llm_engine = cast(_FakeLLMEngine, engine._engine)
+    sent = [
+        kwargs["params"].extra_args["kv_transfer_params"]
+        for _, kwargs in llm_engine.add_requests
+    ]
+    assert [params["do_remote_decode"] for params in sent] == [True, True]
+    assert sent[0]["transfer_id"] != sent[1]["transfer_id"]
+
+    # Each finished prefill request carries the decode hop's full handle.
+    engine._engine.step = lambda: [
+        _request_output(request_id="r1"),
+        _request_output(request_id="r0"),
+    ]
+    finished = {request.request_id: request for request in engine.step()}
+    for request_id, params in zip(["r0", "r1"], sent):
+        assert finished[request_id].kv_transfer_params == {
+            **engine._mooncake_handle,
+            "transfer_id": params["transfer_id"],
+        }
+    assert engine._transfer_ids == {}
 
 
 def test_build_sampling_params_matches_contract():
