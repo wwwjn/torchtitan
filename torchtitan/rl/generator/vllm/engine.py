@@ -8,8 +8,10 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -19,7 +21,7 @@ from vllm.config import AttentionConfig, KVTransferConfig
 from vllm.exceptions import VLLMClientError
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind
-from vllm.utils.network_utils import get_ip, get_open_port
+from vllm.utils.network_utils import get_ip, get_open_port, make_zmq_path
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from torchtitan.components.checkpointer import CheckpointManager
@@ -88,17 +90,62 @@ def add_extra_vllm_engine_args(
     engine_kwargs.update(extra_engine_args)
 
 
+KVConnectorName = Literal["NixlConnector", "MooncakeConnector"]
+
+
 def add_kv_transfer_config(
-    engine_kwargs: dict[str, Any], prefill_decode_role: Literal["prefill", "decode"]
-) -> None:
-    """Add vLLM's NIXL connector to ``engine_kwargs`` in place: a prefill generator produces KV,
-    a decode generator consumes it. Peers reach this engine's KV listener at this host and port."""
-    os.environ["VLLM_NIXL_SIDE_CHANNEL_HOST"] = get_ip()
-    os.environ["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(get_open_port())
+    engine_kwargs: dict[str, Any],
+    prefill_decode_role: Literal["prefill", "decode"],
+    *,
+    connector: KVConnectorName = "NixlConnector",
+    extra_config: dict[str, Any] | None = None,
+    engine_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Add vLLM's KV connector to ``engine_kwargs`` in place: a prefill generator produces KV,
+    a decode generator consumes it.
+
+    NIXL: peers reach this engine's KV listener at this host and port; the prefill request's
+    output carries the handle a decode generator needs.
+
+    Mooncake: a prefill engine serves a bootstrap address where decode workers find its
+    workers, and its outputs carry no handle. Returns the handle fields for a prefill engine
+    (``remote_engine_id``, ``remote_bootstrap_addr``); each request adds its ``transfer_id``.
+    Returns None otherwise.
+    """
+    kv_role = "kv_producer" if prefill_decode_role == "prefill" else "kv_consumer"
+    extra = dict(extra_config or {})
+    if connector == "NixlConnector":
+        os.environ["VLLM_NIXL_SIDE_CHANNEL_HOST"] = get_ip()
+        os.environ["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(get_open_port())
+        engine_kwargs["kv_transfer_config"] = KVTransferConfig(
+            kv_connector="NixlConnector",
+            kv_role=kv_role,
+            kv_connector_extra_config=extra,
+        )
+        return None
+    if connector != "MooncakeConnector":
+        raise ValueError(f"unsupported KV connector {connector!r}")
+    if engine_id is None:
+        raise ValueError("MooncakeConnector needs an engine_id")
+    handle = None
+    if prefill_decode_role == "prefill":
+        # Several prefill generators can share a host, so each binds its own port.
+        # TODO: with TP > 1 every rank of the engine must agree on this port and engine_id.
+        bootstrap_port = get_open_port()
+        os.environ["VLLM_MOONCAKE_BOOTSTRAP_PORT"] = str(bootstrap_port)
+        handle = {
+            "do_remote_prefill": True,
+            "remote_engine_id": engine_id,
+            # vLLM queries ``remote_bootstrap_addr + "/query"``, so this is a full URL.
+            "remote_bootstrap_addr": make_zmq_path("http", get_ip(), bootstrap_port),
+        }
     engine_kwargs["kv_transfer_config"] = KVTransferConfig(
-        kv_connector="NixlConnector",
-        kv_role="kv_producer" if prefill_decode_role == "prefill" else "kv_consumer",
+        kv_connector="MooncakeConnector",
+        kv_role=kv_role,
+        engine_id=engine_id,
+        kv_connector_extra_config=extra,
     )
+    return handle
 
 
 class VLLMEngine(GenerationEngine):
@@ -127,11 +174,23 @@ class VLLMEngine(GenerationEngine):
         """Keep each multi-turn session's cached prefix on GPU between its turns (see
         `VLLMSessionKVHolder`). None: off."""
 
+        kv_connector: KVConnectorName = "NixlConnector"
+        """vLLM KV connector that moves a prompt's KV from a prefill generator to a decode
+        generator. Used only with prefill/decode disaggregation (``num_prefill_generators``).
+        ``"MooncakeConnector"`` needs Mooncake's transfer engine
+        (``mooncake-transfer-engine``)."""
+
+        kv_connector_extra_config: dict[str, Any] = field(default_factory=dict)
+        """Passed to vLLM as ``kv_connector_extra_config``, e.g. for Mooncake
+        ``{"mooncake_protocol": "rdma", "device_name": "mlx5_0,mlx5_1"}``."""
+
         @property
         def kv_transfer_listener_thread_name(self) -> str | None:
             # vLLM's NIXL connector binds its listener in this thread, and engine init waits for
-            # it with no timeout.
-            return "nixl_handshake_listener"
+            # it with no timeout. Mooncake's engine init does not wait on a listener.
+            if self.kv_connector == "NixlConnector":
+                return "nixl_handshake_listener"
+            return None
 
     def __init__(
         self,
@@ -172,6 +231,11 @@ class VLLMEngine(GenerationEngine):
             reset_kv_cache_on_model_state_dict_load
         )
         self._prefill_decode_role = prefill_decode_role
+        # Mooncake only: this prefill engine's handle fields, and each in-flight prefill
+        # request's transfer id (set at submit, attached to the output at finish).
+        self._mooncake_handle: dict[str, Any] | None = None
+        self._transfer_ids: dict[str, str] = {}
+        self._kv_engine_id = f"{generator_name}-{uuid.uuid4().hex[:8]}"
         self._setup(
             model,
             parallelism=parallelism,
@@ -340,7 +404,13 @@ class VLLMEngine(GenerationEngine):
         if seed is not None:
             engine_kwargs["seed"] = seed
         if self._prefill_decode_role is not None:
-            add_kv_transfer_config(engine_kwargs, self._prefill_decode_role)
+            self._mooncake_handle = add_kv_transfer_config(
+                engine_kwargs,
+                self._prefill_decode_role,
+                connector=self.config.kv_connector,
+                extra_config=self.config.kv_connector_extra_config,
+                engine_id=self._kv_engine_id,
+            )
         add_extra_vllm_engine_args(engine_kwargs, self.config.extra_engine_args)
         return EngineArgs(**engine_kwargs)
 
@@ -408,6 +478,14 @@ class VLLMEngine(GenerationEngine):
                 # prompts); the high-level entry stays resilient to vLLM internals vs
                 # vllm.inputs.tokens_input.
                 [engine_input] = self._engine.renderer.render_cmpl([prompt])
+                kv_transfer_params = request.kv_transfer_params
+                transfer_id = None
+                if self._prefill_decode_role == "prefill":
+                    kv_transfer_params = {"do_remote_decode": True}
+                    if self._mooncake_handle is not None:
+                        # Mooncake pairs the two hops by this id.
+                        transfer_id = uuid.uuid4().hex
+                        kv_transfer_params["transfer_id"] = transfer_id
                 # vLLM appends a random suffix to the id; the scheduler knows only that one.
                 internal_request_id = self._engine.add_request(
                     request_id=request.request_id,
@@ -415,11 +493,13 @@ class VLLMEngine(GenerationEngine):
                     params=_build_sampling_params(
                         request.sampling,
                         prefill_decode_role=self._prefill_decode_role,
-                        kv_transfer_params=request.kv_transfer_params,
+                        kv_transfer_params=kv_transfer_params,
                     ),
                     arrival_time=request.arrival_time,
                     priority=max(request.group_id, -1),
                 )
+                if transfer_id is not None:
+                    self._transfer_ids[request.request_id] = transfer_id
                 if self._session_kv_holder is not None:
                     self._session_kv_holder.track(
                         internal_request_id,
@@ -440,7 +520,25 @@ class VLLMEngine(GenerationEngine):
             request_outputs = self._engine.step()
         if self._session_kv_holder is not None:
             self._session_kv_holder.after_step()
-        return [_finished_request(request_output) for request_output in request_outputs]
+        finished = [
+            _finished_request(request_output) for request_output in request_outputs
+        ]
+        if self._mooncake_handle is not None:
+            # Mooncake's prefill outputs carry no handle: build it from this engine's address
+            # and the request's transfer id.
+            finished = [
+                dataclasses.replace(
+                    request,
+                    kv_transfer_params={
+                        **self._mooncake_handle,
+                        "transfer_id": self._transfer_ids.pop(request.request_id),
+                    },
+                )
+                if request.request_id in self._transfer_ids
+                else request
+                for request in finished
+            ]
+        return finished
 
     def holds_kv_for_transfer(self) -> bool:
         """Prefill engines only: whether finished requests still hold KV for a decode engine.
@@ -515,10 +613,16 @@ def _build_sampling_params(
     (which include EOS) are the only stops.
     """
     max_tokens, extra_args = sampling.max_tokens, None
+    stop_token_ids = sampling.stop_token_ids
     if prefill_decode_role == "prefill":
         # Only the prompt's KV is kept; the decode generator samples every output token.
         max_tokens = 1
-        extra_args = {"kv_transfer_params": {"do_remote_decode": True}}
+        # The connectors keep a prefill request's KV for the decode generator only when the
+        # request stops at its length cap, so a sampled stop token must not end it first.
+        stop_token_ids = None
+        extra_args = {
+            "kv_transfer_params": kv_transfer_params or {"do_remote_decode": True}
+        }
     elif kv_transfer_params is not None:
         extra_args = {"kv_transfer_params": kv_transfer_params}
     return SamplingParams(
@@ -526,7 +630,7 @@ def _build_sampling_params(
         top_p=sampling.top_p,
         max_tokens=max_tokens,
         n=1,  # always expects a single sample per request. Caller can call N times.
-        stop_token_ids=sampling.stop_token_ids,
+        stop_token_ids=stop_token_ids,
         # Drops the generation config's eos ids, which vLLM merges into
         # stop_token_ids even with skip_tokenizer_init.
         ignore_eos=True,
