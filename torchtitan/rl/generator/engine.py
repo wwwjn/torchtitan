@@ -48,11 +48,18 @@ class GenerationEngine(Configurable, abc.ABC):
         rank: Global rank of this process.
         generator_name: Name of the generator, for engine metrics.
         output_dir: Output directory, for engine metrics.
+        prefill_decode_role: With prefill/decode disaggregation, ``"prefill"`` engines only
+            compute each prompt's KV and hand it to a ``"decode"`` engine, which generates.
+            None: the engine does both.
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
-        pass
+        @property
+        def kv_transfer_listener_thread_name(self) -> str | None:
+            """Name of the thread in which a prefill/decode engine's KV transfer listener binds
+            its port, if the engine build waits on it; the generator raises if it dies."""
+            return None
 
     @property
     @abc.abstractmethod
@@ -94,6 +101,12 @@ class GenerationEngine(Configurable, abc.ABC):
     def holds_session_kv(self) -> bool:
         """Whether the engine holds multi-turn sessions' KV between turns, so callers must
         release sessions and groups when their rollouts end."""
+        return False
+
+    def holds_kv_for_transfer(self) -> bool:
+        """Prefill engines only: whether finished requests still hold KV a decode engine has not
+        pulled yet. The engine loop keeps stepping while they do, since the engine frees that KV
+        in a step."""
         return False
 
     def release_sessions(self, session_ids: list[str], group_ids: list[int]) -> None:

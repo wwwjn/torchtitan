@@ -6,6 +6,7 @@
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -433,6 +434,33 @@ def test_spawn_proc_mesh_gives_roles_sharing_a_host_mesh_disjoint_gpus(
     assert mesh_b.visible_devices == ["0", "1", "2", "3"]
 
 
+def test_spawn_proc_mesh_lets_generators_see_each_other(
+    bootstrap_cmd_returns_env, monkeypatch
+):
+    """Generators list each other's GPUs after their own; the trainer's stay hidden."""
+    mesh = _FakeHostMesh()
+    with pytest.raises(ValueError, match="needs host_meshes=None"):
+        provisioning.spawn_proc_mesh(
+            trainer_world_size=1,
+            per_generator_world_size=1,
+            host_meshes=provisioning.HostMeshes(
+                trainer=mesh, generators=[mesh, mesh], gpus_per_node=4
+            ),
+            num_generators=2,
+            generators_see_each_other=True,
+        )
+
+    single_host = _FakeHostMesh()
+    monkeypatch.setattr(provisioning, "this_host", lambda: single_host)
+    provisioning.spawn_proc_mesh(
+        trainer_world_size=1,
+        per_generator_world_size=1,
+        num_generators=3,
+        generators_see_each_other=True,
+    )
+    assert single_host.visible_devices == ["0", "1,2,3", "2,1,3", "3,1,2"]
+
+
 @pytest.mark.parametrize(
     "num_hosts, layout, match",
     [
@@ -506,6 +534,85 @@ def test_monarch_actor_system_provisions_every_role_before_spawning(monkeypatch)
         "torch elastic trainer_mesh",
         "torch elastic generator_mesh_0",
         "torch elastic generator_mesh_1",
+    ]
+
+
+@pytest.mark.parametrize("num_prefill_generators", [0, 1])
+def test_monarch_actor_system_provisions_prefill_generators_on_one_node(
+    monkeypatch, num_prefill_generators
+):
+    """With prefill generators, generators see each other's GPUs and run without
+    expandable segments; multi-host provisioning is rejected."""
+    calls = []
+
+    def spawn_proc_mesh(trainer_world_size, per_generator_world_size, **kwargs):
+        calls.append(kwargs)
+        return "trainer_mesh", ["generator_mesh_0", "generator_mesh_1"]
+
+    monkeypatch.setattr(monarch_system, "spawn_proc_mesh", spawn_proc_mesh)
+    monkeypatch.setattr(monarch_system, "spawn_cpu_procs", lambda num_procs: "cpu")
+    monkeypatch.setattr(monarch_system, "setup_torch_elastic_env", AsyncMock())
+    provision_kwargs = dict(
+        trainer_parallelism=ParallelismConfig(),
+        generator_parallelism=InferenceParallelismConfig(),
+        num_generators=2,
+        num_prefill_generators=num_prefill_generators,
+    )
+
+    asyncio.run(MonarchActorSystem.Config().build().provision(**provision_kwargs))
+
+    (kwargs,) = calls
+    assert kwargs["generators_see_each_other"] is bool(num_prefill_generators)
+    generator_env = kwargs["generator_env"] or {}
+    assert (
+        generator_env.get("PYTORCH_CUDA_ALLOC_CONF") == "expandable_segments:False"
+    ) is bool(num_prefill_generators)
+    if num_prefill_generators:
+        multi_host = MonarchActorSystem.Config().build(host_meshes="host_meshes")
+        with pytest.raises(ValueError, match="single-node mode"):
+            asyncio.run(multi_host.provision(**provision_kwargs))
+
+
+class _SpawnRecordingMesh:
+    """Records each actor spawned on it and returns the actor's name as its handle."""
+
+    def __init__(self):
+        self.spawned = []
+
+    def spawn(self, name, actor_class, *args, **kwargs):
+        self.spawned.append((name, kwargs))
+        return SimpleNamespace(
+            name=name,
+            flatten=lambda dim: SimpleNamespace(slice=lambda rank: name),
+        )
+
+
+def test_monarch_actor_system_spawns_prefill_then_decode_generators():
+    """The first generators prefill, the rest decode, and the router gets both pools."""
+    actor_system = MonarchActorSystem(MonarchActorSystem.Config())
+    actor_system._router_mesh = _SpawnRecordingMesh()
+    actor_system._generator_meshes = [_SpawnRecordingMesh() for _ in range(3)]
+    actor_system._num_prefill_generators = 1
+
+    asyncio.run(
+        actor_system.spawn_generator_router(
+            InterGeneratorRouter.Config(), generator_config=None, max_num_seqs=4
+        )
+    )
+
+    generators = [mesh.spawned[0] for mesh in actor_system._generator_meshes]
+    assert [(name, kwargs["prefill_decode_role"]) for name, kwargs in generators] == [
+        ("prefill_generator_0", "prefill"),
+        ("decode_generator_1", "decode"),
+        ("decode_generator_2", "decode"),
+    ]
+    ((_, router_kwargs),) = actor_system._router_mesh.spawned
+    assert [g.rank0 for g in router_kwargs["prefill_generators"]] == [
+        "prefill_generator_0"
+    ]
+    assert [g.rank0 for g in router_kwargs["generators"]] == [
+        "decode_generator_1",
+        "decode_generator_2",
     ]
 
 

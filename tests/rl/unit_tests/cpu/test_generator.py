@@ -17,6 +17,7 @@ The uneven-decode integration test requires four GPUs and a torchrun launcher.
 import asyncio
 import concurrent.futures
 import gc
+import inspect
 import math
 import os
 import shutil
@@ -53,6 +54,7 @@ from torchtitan.rl.generator.vllm.engine import (
     _extract_request_metrics_inputs,
     _finished_request,
     add_extra_vllm_engine_args,
+    add_kv_transfer_config,
     VLLMEngine,
 )
 from torchtitan.rl.generator.vllm.registry import register_to_vllm
@@ -117,11 +119,17 @@ def _sample(*, token_ids=(10, 11), finish_reason="stop"):
 
 
 def _request_output(
-    *, request_id="r0", outputs=None, num_generation_tokens=4, num_preemptions=0
+    *,
+    request_id="r0",
+    outputs=None,
+    num_generation_tokens=4,
+    num_preemptions=0,
+    kv_transfer_params=None,
 ):
     return SimpleNamespace(
         request_id=request_id,
         num_cached_tokens=0,
+        kv_transfer_params=kv_transfer_params,
         metrics=SimpleNamespace(
             first_token_latency=0.012,
             queued_ts=1.0,
@@ -144,6 +152,7 @@ def _vllm_engine(*, reset_kv_cache_on_model_state_dict_load=False, model=None):
     )
     engine._get_model = lambda: model
     engine._session_kv_holder = None
+    engine._prefill_decode_role = None
     return engine
 
 
@@ -292,6 +301,67 @@ def test_process_finished_requests_releases_dp_router_load():
 
 
 # --- SamplingParams contract (must match the batched path exactly) ---
+
+
+def test_prefill_completion_carries_the_kv_handle():
+    async def main():
+        dispatcher = _dispatcher()
+        reply = concurrent.futures.Future()
+        reply.set_running_or_notify_cancel()
+        generation = OutstandingGeneration(reply=reply, metrics_prefix="generator")
+        generation.min_policy_version = 7
+        dispatcher._rank0_outstanding_generations = {"r0": generation}
+        handle = {"do_remote_prefill": True, "remote_block_ids": [[3, 4]]}
+        dispatcher.process_finished_requests(
+            [_finished_request(_request_output(kv_transfer_params=handle))],
+            policy_version=7,
+        )
+        completion = await asyncio.wrap_future(reply)
+        assert completion.kv_transfer_params == handle
+
+    asyncio.run(main())
+
+
+def test_prefill_generator_samples_one_token_and_keeps_the_kv():
+    params = _build_sampling_params(
+        SamplingConfig(max_tokens=64), prefill_decode_role="prefill"
+    )
+    assert params.max_tokens == 1
+    assert params.extra_args == {"kv_transfer_params": {"do_remote_decode": True}}
+
+
+@pytest.mark.parametrize(
+    "role, kv_role", [("prefill", "kv_producer"), ("decode", "kv_consumer")]
+)
+def test_kv_transfer_config_sets_the_role_and_listener_address(
+    monkeypatch, role, kv_role
+):
+    monkeypatch.delenv("VLLM_NIXL_SIDE_CHANNEL_HOST", raising=False)
+    monkeypatch.delenv("VLLM_NIXL_SIDE_CHANNEL_PORT", raising=False)
+    engine_kwargs = {}
+    add_kv_transfer_config(engine_kwargs, role)
+    assert engine_kwargs["kv_transfer_config"].kv_role == kv_role
+    assert os.environ["VLLM_NIXL_SIDE_CHANNEL_HOST"]
+    assert int(os.environ["VLLM_NIXL_SIDE_CHANNEL_PORT"]) > 0
+
+
+def test_kv_transfer_listener_thread_name_matches_vllm():
+    """The generator watches vLLM's KV transfer listener thread by name during the engine build."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_scheduler
+
+    name = VLLMEngine.Config().kv_transfer_listener_thread_name
+    assert f'name="{name}"' in inspect.getsource(base_scheduler)
+
+
+def test_decode_generator_passes_the_prefill_handle_to_vllm():
+    handle = {"do_remote_prefill": True, "remote_block_ids": [[3, 4]]}
+    params = _build_sampling_params(
+        SamplingConfig(max_tokens=64),
+        prefill_decode_role="decode",
+        kv_transfer_params=handle,
+    )
+    assert params.max_tokens == 64
+    assert params.extra_args == {"kv_transfer_params": handle}
 
 
 def test_build_sampling_params_matches_contract():
@@ -619,10 +689,18 @@ def test_batch_invariant_requires_kv_cache_reset():
         )
 
 
-def test_session_kv_holder_rejects_kv_cache_reset_on_model_state_dict_load(tmp_path):
-    with pytest.raises(
-        ValueError, match="needs reset_kv_cache_on_model_state_dict_load=False"
-    ):
+@pytest.mark.parametrize(
+    "reset_kv_cache, prefill_decode_role, match",
+    [
+        (True, None, "needs reset_kv_cache_on_model_state_dict_load=False"),
+        (False, "prefill", "need session_kv_holder=None"),
+    ],
+    ids=["kv-reset", "prefill-decode"],
+)
+def test_session_kv_holder_rejects_kv_reset_and_prefill_decode(
+    tmp_path, reset_kv_cache, prefill_decode_role, match
+):
+    with pytest.raises(ValueError, match=match):
         VLLMEngine.Config(session_kv_holder=VLLMSessionKVHolder.Config()).build(
             model=_MODEL_CONFIG,
             parallelism=_PARALLELISM,
@@ -634,10 +712,11 @@ def test_session_kv_holder_rejects_kv_cache_reset_on_model_state_dict_load(tmp_p
             checkpointer=None,
             dist_moe_runtime=None,
             debug=DebugConfig(),
-            reset_kv_cache_on_model_state_dict_load=True,
+            reset_kv_cache_on_model_state_dict_load=reset_kv_cache,
             rank=0,
             generator_name="generator",
             output_dir=str(tmp_path),
+            prefill_decode_role=prefill_decode_role,
         )
 
 

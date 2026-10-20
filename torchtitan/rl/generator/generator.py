@@ -13,7 +13,7 @@ import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
@@ -193,6 +193,7 @@ class Generator(Configurable):
         rank: int | None = None,
         generator_name: str = "generator",
         open_result_channel: Callable[[], tuple[Any, Any]] | None = None,
+        prefill_decode_role: Literal["prefill", "decode"] | None = None,
     ):
         init_logger()
         # TODO: Quiet torchstore's per-op transport-resolve INFO spam (very noisy in CI).
@@ -220,6 +221,15 @@ class Generator(Configurable):
         with sl.log_trace_span("engine_init"):
             # The engine is built and used only on the engine loop thread (see `EngineLoop`).
             self._engine_loop_thread = EngineLoopThread(name="engine-loop")
+            # With prefill/decode disaggregation, "prefill" generators only compute each prompt's
+            # KV and hand it to a "decode" generator, which generates. None: this generator does
+            # both. The engine build waits on its KV transfer listener with no timeout, so a
+            # listener that fails to bind raises here instead of hanging.
+            watch_thread_name = (
+                config.engine.kv_transfer_listener_thread_name
+                if prefill_decode_role is not None
+                else None
+            )
             engine: GenerationEngine = self._engine_loop_thread.call(
                 lambda: config.engine.build(
                     model=config.model,
@@ -238,7 +248,9 @@ class Generator(Configurable):
                     rank=self._rank,
                     generator_name=generator_name,
                     output_dir=output_dir,
-                )
+                    prefill_decode_role=prefill_decode_role,
+                ),
+                watch_thread_name=watch_thread_name,
             )
             # The prefetch buffers below and each prefetch's TorchStore read pin memory through
             # the CUDA runtime, on the calling thread's device. Both run on this thread, which
@@ -347,6 +359,8 @@ class Generator(Configurable):
         routing_session_id: str,
         sampling_config: SamplingConfig | None = None,
         metrics_prefix: str = "generator",
+        kv_transfer_params: dict[str, Any] | None = None,
+        prefill_min_policy_version: int | None = None,
     ) -> Completion:
         """Generates one completion for one prompt.
 
@@ -370,6 +384,10 @@ class Generator(Configurable):
             metrics_prefix: Namespace prepended to every metric key on the returned
                 `Completion` (default ``"generator"``). Callers that need to keep streams
                 separate, e.g. ``"validation/generator"``, can override it.
+            kv_transfer_params: Decode generators only: where the prompt's KV lives, from
+                the prefill generator's `Completion.kv_transfer_params`.
+            prefill_min_policy_version: Decode generators only: the oldest policy version the
+                prefill generator's KV can come from.
 
         Example:
 
@@ -394,6 +412,8 @@ class Generator(Configurable):
                 group_id=group_id,
                 routing_session_id=routing_session_id,
                 arrival_time=time.time(),
+                kv_transfer_params=kv_transfer_params,
+                prefill_min_policy_version=prefill_min_policy_version,
             ),
             metrics_prefix=metrics_prefix,
         )

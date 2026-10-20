@@ -298,6 +298,14 @@ class Controller(Configurable):
         ``num_generators * generator_world_size``.
         """
 
+        num_prefill_generators: int = 0
+        """Of the ``num_generators`` generators, how many only prefill: each computes a prompt's
+        KV and hands it to one of the rest, which only decode. 0: every generator does both.
+        Needs NIXL, e.g. ``pip install nixl[cu13]``.
+
+            num_generators=4, num_prefill_generators=1  ->  1 prefill + 3 decode generators
+        """
+
         generator_router: InterGeneratorRouter.Config = field(
             default_factory=InterGeneratorRouter.Config
         )
@@ -347,6 +355,35 @@ class Controller(Configurable):
                 raise ValueError(
                     f"num_generators must be at least 1, got {self.num_generators}"
                 )
+            if not 0 <= self.num_prefill_generators < self.num_generators:
+                raise ValueError(
+                    "num_prefill_generators must be in [0, num_generators), got "
+                    f"{self.num_prefill_generators} with num_generators={self.num_generators}"
+                )
+            if self.num_prefill_generators:
+                parallelism = self.generator.parallelism
+                # TODO: TP > 1 needs a side-channel port and transfer params per rank; DP/EP
+                # needs the allocator change measured with expert-parallel buffers.
+                if (
+                    parallelism.tensor_parallel_degree,
+                    parallelism.data_parallel_degree,
+                    parallelism.expert_parallel_degree,
+                ) != (1, 1, 1):
+                    raise ValueError(
+                        "num_prefill_generators needs generator TP, DP and EP degrees of 1"
+                    )
+                # TODO: test resets with pulled KV.
+                if self.generator.reset_kv_cache_on_model_state_dict_load:
+                    raise ValueError(
+                        "num_prefill_generators needs "
+                        "reset_kv_cache_on_model_state_dict_load=False (batch_invariant "
+                        "requires True, so it cannot be used with prefill generators)"
+                    )
+                # TODO: drain both pools; needs `_serving` per pool in the router.
+                if not self.generator_router.hot_swap:
+                    raise ValueError(
+                        "num_prefill_generators needs generator_router.hot_swap=True"
+                    )
             if self.generator.checkpointer is not None:
                 raise ValueError(
                     "Generator checkpoint must be disabled in the RL loop "
@@ -593,7 +630,11 @@ class Controller(Configurable):
         )
 
         generator_dp_degree = max(config.generator.parallelism.data_parallel_degree, 1)
-        num_generator_dp_shards = config.num_generators * generator_dp_degree
+        # Prefill generators hold a request only until its first token.
+        num_prefill = config.num_prefill_generators
+        num_generator_dp_shards = (
+            config.num_generators - num_prefill
+        ) * generator_dp_degree
 
         # Ceiling (not target) for the generator's max_num_seqs: the per-generator
         # upper bound on concurrently scheduled sequences. vLLM may admit fewer if KV
@@ -617,6 +658,7 @@ class Controller(Configurable):
                 trainer_parallelism=config.trainer.parallelism,
                 generator_parallelism=config.generator.parallelism,
                 num_generators=config.num_generators,
+                num_prefill_generators=num_prefill,
             )
             self.trainer = await actor_system.spawn_trainer(
                 config.trainer,

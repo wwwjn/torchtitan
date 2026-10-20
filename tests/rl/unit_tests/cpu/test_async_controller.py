@@ -8,8 +8,12 @@
 the consume-time staleness invariant, the metrics timer drain, and RolloutTurnID."""
 
 import asyncio
+import functools
 import json
 import logging
+import math
+from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -26,6 +30,7 @@ from torchtitan.rl.controller.work_buffer import (
     RolloutGroupWork,
     RolloutGroupWorkBuffer,
 )
+from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout import RolloutGroup
 from torchtitan.rl.rollout.types import RolloutTurnID
@@ -53,6 +58,85 @@ def test_controller_config_maybe_log(tmp_path, caplog) -> None:
     with open(tmp_path / "config.json") as file:
         saved_config = json.load(file)
     assert saved_config["trainer"]["training"]["max_context_length"] == 128
+
+
+@pytest.mark.parametrize(
+    "num_prefill_generators, overrides, match",
+    [
+        (1, {}, None),
+        (2, {}, r"must be in \[0, num_generators\)"),
+        (
+            1,
+            {
+                "generator.parallelism": InferenceParallelismConfig(
+                    tensor_parallel_degree=2
+                )
+            },
+            "TP, DP and EP degrees of 1",
+        ),
+        (
+            1,
+            {"generator.reset_kv_cache_on_model_state_dict_load": True},
+            "reset_kv_cache_on_model_state_dict_load=False",
+        ),
+        (1, {"generator_router.hot_swap": False}, "hot_swap=True"),
+    ],
+    ids=["supported", "no-decode-generator", "tp2", "kv-reset", "drain"],
+)
+def test_prefill_generators_reject_untested_configs(
+    num_prefill_generators, overrides, match
+) -> None:
+    from torchtitan_recipes.tests.rl.alphabet_sort import rl_grpo_qwen3_5_debug_varlen
+
+    config = rl_grpo_qwen3_5_debug_varlen(seq_len=128)
+    config.generator.parallelism = InferenceParallelismConfig(tensor_parallel_degree=1)
+    for path, value in overrides.items():
+        *parents, name = path.split(".")
+        setattr(functools.reduce(getattr, parents, config), name, value)
+
+    with pytest.raises(ValueError, match=match) if match else nullcontext():
+        replace(config, num_generators=2, num_prefill_generators=num_prefill_generators)
+
+
+def test_setup_async_provisions_prefill_generators_and_sizes_decode_ones() -> None:
+    """The actor system gets the prefill count; max_num_seqs counts decode generators only."""
+    from torchtitan_recipes.tests.rl.alphabet_sort import rl_grpo_qwen3_5_debug_varlen
+
+    config = rl_grpo_qwen3_5_debug_varlen(seq_len=128)
+    config.generator.parallelism = InferenceParallelismConfig(tensor_parallel_degree=1)
+    config = replace(config, num_generators=3, num_prefill_generators=1)
+
+    class RouterSpawnedError(Exception):
+        pass
+
+    class FakeActorSystem:
+        async def provision(self, **kwargs):
+            self.provision_kwargs = kwargs
+
+        async def spawn_trainer(self, *args, **kwargs):
+            return None
+
+        async def spawn_generator_router(self, config, **kwargs):
+            self.router_kwargs = kwargs
+            raise RouterSpawnedError
+
+    controller = Controller.__new__(Controller)
+    controller.config = config
+    controller._rollouter = SimpleNamespace(get_validation_samples=lambda steps: [])
+    actor_system = FakeActorSystem()
+
+    with pytest.raises(RouterSpawnedError):
+        asyncio.run(controller.setup_async(actor_system=actor_system))
+
+    assert actor_system.provision_kwargs["num_generators"] == 3
+    assert actor_system.provision_kwargs["num_prefill_generators"] == 1
+    async_loop = config.async_loop
+    rollout_concurrency = (
+        async_loop.max_active_rollout_groups * async_loop.num_samples_per_prompt
+    )
+    assert actor_system.router_kwargs["max_num_seqs"] == min(
+        math.ceil(rollout_concurrency / 2), 512
+    )
 
 
 def _training_sample(*, group_id: int, rollout_id: int) -> TrainingSample:

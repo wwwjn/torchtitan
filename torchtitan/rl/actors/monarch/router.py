@@ -24,12 +24,15 @@ class _InterGeneratorRouterActorEndpoints:
         config: InterGeneratorRouter.Config,
         *,
         generators: Sequence[ServiceHandle],
+        prefill_generators: Sequence[ServiceHandle] = (),
     ) -> None:
         num_actors = math.prod(current_size().values())
         assert (
             num_actors == 1
         ), f"InterGeneratorRouter must be a singleton, but its mesh holds {num_actors} actors"
-        super().__init__(config, generators=generators)
+        super().__init__(
+            config, generators=generators, prefill_generators=prefill_generators
+        )
 
     @concurrent_endpoint
     async def generate(

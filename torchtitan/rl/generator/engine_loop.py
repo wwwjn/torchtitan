@@ -49,10 +49,27 @@ class EngineLoopThread:
         )
         self.thread.start()
 
-    def call(self, fn: Callable[[], _T]) -> _T:
+    def call(self, fn: Callable[[], _T], *, watch_thread_name: str | None = None) -> _T:
         """Call `fn` on the engine loop thread, in the caller's contextvars, and block until it returns.
-        For setup, before the engine loop starts."""
+        For setup, before the engine loop starts. With `watch_thread_name`, raises RuntimeError if a
+        thread of that name dies with an exception meanwhile, e.g. a KV transfer listener the engine
+        build waits on with no timeout."""
         result: concurrent.futures.Future[_T] = concurrent.futures.Future()
+        thread_died: concurrent.futures.Future[None] = concurrent.futures.Future()
+        previous_excepthook = threading.excepthook
+        if watch_thread_name is not None:
+
+            def watching_excepthook(args: threading.ExceptHookArgs) -> None:
+                previous_excepthook(args)
+                if args.thread is not None and args.thread.name == watch_thread_name:
+                    # A bind error names the address, e.g. "Address already in use (addr=...)".
+                    thread_died.set_exception(
+                        RuntimeError(
+                            f"thread {watch_thread_name!r} died: {args.exc_value!r}"
+                        )
+                    )
+
+            threading.excepthook = watching_excepthook
 
         def call() -> None:
             # A plain callback rather than a task, which would re-raise a `SystemExit` out of
@@ -64,7 +81,16 @@ class EngineLoopThread:
 
         # `call_soon_threadsafe` runs `call` in a copy of the caller's contextvars.
         self.event_loop.call_soon_threadsafe(call)
-        return result.result()
+        try:
+            concurrent.futures.wait(
+                [result, thread_died],
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            if not result.done():
+                thread_died.result()
+            return result.result()
+        finally:
+            threading.excepthook = previous_excepthook
 
 
 class EngineLoop:
@@ -365,13 +391,18 @@ class EngineLoop:
                 # new requests and avoid a prefill in between every engine decode step, which is inefficient.
                 with sl.log_trace_span("vllm_engine_step_burst"):
                     for _ in range(self._max_engine_steps_between_decisions):
-                        if not self._engine.has_unfinished_requests():
+                        if not (
+                            self._engine.has_unfinished_requests()
+                            or self._engine.holds_kv_for_transfer()
+                        ):
                             break
                         finished_requests = self._engine.step()
                         self._request_dispatcher.process_finished_requests(
                             finished_requests, self.policy_version
                         )
                         await asyncio.sleep(0)  # let pending generate() calls enqueue
+                        if not self._engine.has_unfinished_requests():
+                            break  # only held KV is left: one step per decision
 
         except Exception as exc:
             logger.exception("engine loop crashed; failing all outstanding replies")
@@ -414,6 +445,10 @@ class EngineLoop:
         # * If there are none, there is nothing to step, so we wait on the queue for the next decision.
         messages: list[EngineLoopMessage]
         if self._request_dispatcher.rank0_has_outstanding_generations():
+            messages = []
+        elif self._engine.holds_kv_for_transfer():
+            # Only KV a decode generator has yet to pull is left: poll for it, don't spin.
+            await asyncio.sleep(0.005)
             messages = []
         else:
             if pending_engine_requests:
@@ -471,6 +506,11 @@ class EngineLoop:
                         self._group_min_policy_versions.setdefault(
                             request.group_id, self.policy_version
                         )
+                    )
+                if request.prefill_min_policy_version is not None:
+                    # KV pulled from a prefill generator can be as old as its minimum version.
+                    request.min_policy_version = min(
+                        request.min_policy_version, request.prefill_min_policy_version
                     )
             requests_per_dp_rank = self._request_dispatcher.rank0_route(
                 pending_engine_requests

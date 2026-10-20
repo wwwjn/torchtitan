@@ -86,9 +86,12 @@ class ActorSystem(Configurable, abc.ABC):
         trainer_parallelism: ParallelismConfig,
         generator_parallelism: InferenceParallelismConfig,
         num_generators: int,
+        num_prefill_generators: int = 0,
     ) -> None:
         """Reserve the processes for the trainer, ``num_generators`` generators, the
-        generator router and the batcher, before any of them is spawned."""
+        generator router and the batcher, before any of them is spawned. The first
+        ``num_prefill_generators`` generators only prefill and hand each prompt's KV to one
+        of the rest, so the generators must be able to reach each other."""
 
     @abc.abstractmethod
     async def spawn_trainer(
@@ -107,7 +110,8 @@ class ActorSystem(Configurable, abc.ABC):
     ) -> Any:
         """Spawn the provisioned generators and the singleton router over them;
         returns the router's single-actor handle, the only way to reach the
-        generators. ``generator_kwargs`` go to ``Generator``'s constructor."""
+        generators. ``generator_kwargs`` go to ``Generator``'s constructor. With
+        prefill generators, each generator also gets its ``prefill_decode_role``."""
 
     @abc.abstractmethod
     async def spawn_batcher(self, config: Batcher.Config, **kwargs: Any) -> Any:
