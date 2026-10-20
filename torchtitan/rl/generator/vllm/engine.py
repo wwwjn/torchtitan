@@ -11,14 +11,15 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from vllm import EngineArgs, LLMEngine, SamplingParams
-from vllm.config import AttentionConfig
+from vllm.config import AttentionConfig, KVTransferConfig
 from vllm.exceptions import VLLMClientError
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind
+from vllm.utils.network_utils import get_ip, get_open_port
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from torchtitan.components.checkpointer import CheckpointManager
@@ -87,6 +88,19 @@ def add_extra_vllm_engine_args(
     engine_kwargs.update(extra_engine_args)
 
 
+def add_kv_transfer_config(
+    engine_kwargs: dict[str, Any], prefill_decode_role: Literal["prefill", "decode"]
+) -> None:
+    """Add vLLM's NIXL connector to ``engine_kwargs`` in place: a prefill generator produces KV,
+    a decode generator consumes it. Peers reach this engine's KV listener at this host and port."""
+    os.environ["VLLM_NIXL_SIDE_CHANNEL_HOST"] = get_ip()
+    os.environ["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(get_open_port())
+    engine_kwargs["kv_transfer_config"] = KVTransferConfig(
+        kv_connector="NixlConnector",
+        kv_role="kv_producer" if prefill_decode_role == "prefill" else "kv_consumer",
+    )
+
+
 class VLLMEngine(GenerationEngine):
     """The generator's vLLM ``LLMEngine``, behind the calls the engine loop makes.
 
@@ -113,6 +127,12 @@ class VLLMEngine(GenerationEngine):
         """Keep each multi-turn session's cached prefix on GPU between its turns (see
         `VLLMSessionKVHolder`). None: off."""
 
+        @property
+        def kv_transfer_listener_thread_name(self) -> str | None:
+            # vLLM's NIXL connector binds its listener in this thread, and engine init waits for
+            # it with no timeout.
+            return "nixl_handshake_listener"
+
     def __init__(
         self,
         config: Config,
@@ -131,6 +151,7 @@ class VLLMEngine(GenerationEngine):
         rank: int,
         generator_name: str,
         output_dir: str,
+        prefill_decode_role: Literal["prefill", "decode"] | None = None,
     ):
         if (
             config.session_kv_holder is not None
@@ -140,16 +161,25 @@ class VLLMEngine(GenerationEngine):
                 "session_kv_holder needs reset_kv_cache_on_model_state_dict_load=False: vLLM "
                 "cannot reset the prefix cache while blocks are held"
             )
+        # TODO: on a prefill generator the holder would take a second reference on blocks
+        # vLLM delay-frees for the transfer; untested.
+        if config.session_kv_holder is not None and prefill_decode_role is not None:
+            raise ValueError(
+                "prefill and decode generators need session_kv_holder=None"
+            )
         self.config = config
         self._reset_kv_cache_on_model_state_dict_load = (
             reset_kv_cache_on_model_state_dict_load
         )
+        self._prefill_decode_role = prefill_decode_role
         self._setup(
             model,
             parallelism=parallelism,
             checkpointer=checkpointer,
             dist_moe_runtime=dist_moe_runtime,
             batch_invariant=debug.batch_invariant,
+            # Transferring a hybrid model's KV needs the GDN conv state stored dim-first.
+            conv_state_dim_first=prefill_decode_role is not None,
         )
         engine_args = self._build_engine_args(
             model,
@@ -193,6 +223,7 @@ class VLLMEngine(GenerationEngine):
         checkpointer: CheckpointManager.Config | None,
         dist_moe_runtime: DistMoeRuntime.Config | None,
         batch_invariant: bool,
+        conv_state_dim_first: bool = False,
     ) -> None:
         """Process-wide vLLM setup before the engine build: register the TorchTitan model
         and config parser with vLLM, and select vLLM's model runner."""
@@ -201,6 +232,7 @@ class VLLMEngine(GenerationEngine):
             parallelism=parallelism,
             checkpointer_config=checkpointer,
             dist_moe_runtime=dist_moe_runtime,
+            conv_state_dim_first=conv_state_dim_first,
         )
         os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
         if batch_invariant:
@@ -307,6 +339,8 @@ class VLLMEngine(GenerationEngine):
             engine_kwargs["compilation_config"] = vllm_compilation_config
         if seed is not None:
             engine_kwargs["seed"] = seed
+        if self._prefill_decode_role is not None:
+            add_kv_transfer_config(engine_kwargs, self._prefill_decode_role)
         add_extra_vllm_engine_args(engine_kwargs, self.config.extra_engine_args)
         return EngineArgs(**engine_kwargs)
 
@@ -378,7 +412,11 @@ class VLLMEngine(GenerationEngine):
                 internal_request_id = self._engine.add_request(
                     request_id=request.request_id,
                     prompt=engine_input,
-                    params=_build_sampling_params(request.sampling),
+                    params=_build_sampling_params(
+                        request.sampling,
+                        prefill_decode_role=self._prefill_decode_role,
+                        kv_transfer_params=request.kv_transfer_params,
+                    ),
                     arrival_time=request.arrival_time,
                     priority=max(request.group_id, -1),
                 )
@@ -403,6 +441,14 @@ class VLLMEngine(GenerationEngine):
         if self._session_kv_holder is not None:
             self._session_kv_holder.after_step()
         return [_finished_request(request_output) for request_output in request_outputs]
+
+    def holds_kv_for_transfer(self) -> bool:
+        """Prefill engines only: whether finished requests still hold KV for a decode engine.
+        vLLM frees it in an engine step once the pull is done, so the loop keeps stepping."""
+        return (
+            self._prefill_decode_role == "prefill"
+            and self._engine.engine_core.engine_core.scheduler.has_finished_requests()
+        )
 
     def release_sessions(self, session_ids: list[str], group_ids: list[int]) -> None:
         if self._session_kv_holder is not None:
@@ -449,7 +495,12 @@ class VLLMEngine(GenerationEngine):
         return self._engine.model_executor.driver_worker.get_model()
 
 
-def _build_sampling_params(sampling: SamplingConfig) -> SamplingParams:
+def _build_sampling_params(
+    sampling: SamplingConfig,
+    *,
+    prefill_decode_role: Literal["prefill", "decode"] | None = None,
+    kv_transfer_params: dict[str, Any] | None = None,
+) -> SamplingParams:
     """Translate a `SamplingConfig` into vLLM `SamplingParams` (n=1).
 
     ``seed`` and ``stop_token_ids`` are carried on the ``SamplingConfig``
@@ -463,10 +514,17 @@ def _build_sampling_params(sampling: SamplingConfig) -> SamplingParams:
     ``ignore_eos`` turns that off, so the renderer's ``stop_token_ids``
     (which include EOS) are the only stops.
     """
+    max_tokens, extra_args = sampling.max_tokens, None
+    if prefill_decode_role == "prefill":
+        # Only the prompt's KV is kept; the decode generator samples every output token.
+        max_tokens = 1
+        extra_args = {"kv_transfer_params": {"do_remote_decode": True}}
+    elif kv_transfer_params is not None:
+        extra_args = {"kv_transfer_params": kv_transfer_params}
     return SamplingParams(
         temperature=sampling.temperature,
         top_p=sampling.top_p,
-        max_tokens=sampling.max_tokens,
+        max_tokens=max_tokens,
         n=1,  # always expects a single sample per request. Caller can call N times.
         stop_token_ids=sampling.stop_token_ids,
         # Drops the generation config's eos ids, which vLLM merges into
@@ -483,6 +541,7 @@ def _build_sampling_params(sampling: SamplingConfig) -> SamplingParams:
         # TODO(async-rl): use RequestOutputKind.CUMULATIVE for exact per-token
         #   (start_token, version) boundaries; today we keep only the per-turn min/max.
         output_kind=RequestOutputKind.FINAL_ONLY,
+        extra_args=extra_args,
     )
 
 
@@ -505,6 +564,7 @@ def _finished_request(request_output: RequestOutput) -> FinishedRequest:
         token_logprobs=list(completion_output.logprobs.logprobs),
         finish_reason=completion_output.finish_reason,
         metrics_inputs=_extract_request_metrics_inputs(request_output),
+        kv_transfer_params=request_output.kv_transfer_params,
     )
 
 

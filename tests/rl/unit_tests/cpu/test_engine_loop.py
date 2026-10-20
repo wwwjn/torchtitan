@@ -516,6 +516,21 @@ def test_step_with_kv_reset_uses_current_version_without_pins(runner) -> None:
     assert engine_loop._group_min_policy_versions == {}
 
 
+def test_step_takes_the_older_of_pin_and_prefill_min_policy_version(runner) -> None:
+    """A decode generator's request is as old as the KV it pulled: the min of its group's pin
+    and the version the prefill generator computed the KV under."""
+    engine_loop = _bare_loop(event_loop=runner.get_loop())
+    engine_loop.policy_version = 5
+    # The prefill generator is a version behind this one.
+    request = _request("t0", group_id=1)
+    request.prefill_min_policy_version = 4
+    assert _admit(runner, engine_loop, request) == 4
+    # This generator lags the prefill generator: its own pin (5) is older than 6.
+    request = _request("t1", group_id=1)
+    request.prefill_min_policy_version = 6
+    assert _admit(runner, engine_loop, request) == 5
+
+
 def test_release_groups_drops_pins(runner) -> None:
     engine_loop = _bare_loop(event_loop=runner.get_loop())
     engine_loop.policy_version = 3
@@ -591,6 +606,9 @@ class _FakeEngine:
     def has_unfinished_requests(self) -> bool:
         return bool(self.running)
 
+    def holds_kv_for_transfer(self) -> bool:
+        return False
+
     def step(self) -> list[FinishedRequest]:
         self.threads.add(threading.current_thread())
         self.step_hook()
@@ -635,6 +653,25 @@ class _HeldEngine(_FakeEngine):
             return super().step()
         self.step_hook()
         return []
+
+
+class _TransferHoldingEngine(_FakeEngine):
+    """A prefill engine that holds each finished request's KV for `hold_steps` more steps, as
+    vLLM does until the decode generator's pull is done."""
+
+    def __init__(self, hold_steps: int):
+        super().__init__()
+        self.hold_steps, self.held_steps_left = hold_steps, 0
+
+    def holds_kv_for_transfer(self) -> bool:
+        return self.held_steps_left > 0
+
+    def step(self) -> list[FinishedRequest]:
+        if self.running:
+            self.held_steps_left = self.hold_steps
+        elif self.held_steps_left:
+            self.held_steps_left -= 1
+        return super().step()
 
 
 class _StepGate:
@@ -723,6 +760,46 @@ def test_call_on_engine_thread_runs_on_it_in_the_callers_context() -> None:
         assert engine_thread.thread is not threading.current_thread()
         assert result == (engine_thread.thread, "caller")
     finally:
+        _stop_engine_thread(engine_thread)
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_call_on_engine_thread_raises_when_the_watched_thread_dies() -> None:
+    """A KV transfer listener failing to bind (port taken) raises instead of hanging the engine
+    build. Another thread dying doesn't, and the excepthook is restored afterwards."""
+    excepthook = threading.excepthook
+    release_build = threading.Event()
+
+    def build_engine(dying_thread_name: str) -> str:
+        def die():
+            raise OSError("Address already in use")
+
+        thread = threading.Thread(target=die, name=dying_thread_name)
+        thread.start()
+        thread.join()
+        # vLLM's init waits forever on a dead listener; give another thread's death the same
+        # window to (wrongly) fail the call.
+        listener = dying_thread_name == "nixl_handshake_listener"
+        release_build.wait(timeout=_TIMEOUT_S if listener else 0.2)
+        return "engine"
+
+    engine_thread = EngineLoopThread(name="engine-loop")
+    try:
+        assert (
+            engine_thread.call(
+                lambda: build_engine("other"),
+                watch_thread_name="nixl_handshake_listener",
+            )
+            == "engine"
+        )
+        with pytest.raises(RuntimeError, match="nixl_handshake_listener"):
+            engine_thread.call(
+                lambda: build_engine("nixl_handshake_listener"),
+                watch_thread_name="nixl_handshake_listener",
+            )
+        assert threading.excepthook is excepthook
+    finally:
+        release_build.set()
         _stop_engine_thread(engine_thread)
 
 
@@ -1050,6 +1127,24 @@ def test_generate_cancelled_after_admission_leaves_the_loop_running(
         completion = await asyncio.wait_for(_generate(engine_loop, "r1"), _TIMEOUT_S)
         assert completion.request_id == "r1"
         assert engine_loop._request_dispatcher._rank0_outstanding_generations == {}
+
+        await asyncio.wait_for(engine_loop.close(), _TIMEOUT_S)
+
+    asyncio.run(run())
+
+
+def test_prefill_generator_steps_until_its_held_kv_is_freed(engine_thread) -> None:
+    """vLLM frees a pulled request's KV in an engine step, so an idle prefill generator keeps
+    stepping until nothing is held."""
+    engine = _TransferHoldingEngine(hold_steps=20)
+
+    async def run() -> None:
+        engine_loop = engine_thread(engine)
+        engine_loop.start()
+        await asyncio.wait_for(_generate(engine_loop, "r0"), _TIMEOUT_S)
+        async with asyncio.timeout(_TIMEOUT_S):
+            while engine.held_steps_left:
+                await asyncio.sleep(0.01)
 
         await asyncio.wait_for(engine_loop.close(), _TIMEOUT_S)
 

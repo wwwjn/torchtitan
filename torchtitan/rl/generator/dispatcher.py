@@ -286,6 +286,7 @@ class RequestDispatcher:
                     token_logprobs=finished.token_logprobs,
                     finish_reason=finished.finish_reason,
                     metrics=metrics,
+                    kv_transfer_params=finished.kv_transfer_params,
                 )
             )
             # Free the request's reserved load on its DP rank so load-aware

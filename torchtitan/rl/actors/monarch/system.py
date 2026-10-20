@@ -78,6 +78,7 @@ class MonarchActorSystem(ActorSystem):
         self._rollout_worker_mesh: ProcMesh | None = None
         self._trainer: Any | None = None
         self._generators: list[ServiceHandle] = []
+        self._num_prefill_generators = 0
 
     async def provision(
         self,
@@ -85,13 +86,30 @@ class MonarchActorSystem(ActorSystem):
         trainer_parallelism: ParallelismConfig,
         generator_parallelism: InferenceParallelismConfig,
         num_generators: int,
+        num_prefill_generators: int = 0,
     ) -> None:
+        self._num_prefill_generators = num_prefill_generators
+        generator_env = self._generator_env
+        if num_prefill_generators:
+            # TODO: rewrite GPU visibility per host mesh for multi-host prefill/decode.
+            if self._host_meshes is not None:
+                raise ValueError(
+                    "prefill generators need single-node mode (host_meshes=None)"
+                )
+            # vLLM rejects KV transfer with expandable segments: they can remap the KV cache
+            # pages the transport registered. The trainer keeps them.
+            generator_env = {
+                **(generator_env or {}),
+                "PYTORCH_ALLOC_CONF": "expandable_segments:False",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
+            }
         self._trainer_mesh, self._generator_meshes = spawn_proc_mesh(
             compute_trainer_world_size(trainer_parallelism),
             compute_generator_world_size(generator_parallelism),
             host_meshes=self._host_meshes,
             num_generators=num_generators,
-            generator_env=self._generator_env,
+            generator_env=generator_env,
+            generators_see_each_other=num_prefill_generators > 0,
         )
         # One process, so the router is a singleton and every caller reaches
         # it with `call_one`. It gets its own mesh rather than sharing the
@@ -148,12 +166,21 @@ class MonarchActorSystem(ActorSystem):
         **generator_kwargs: Any,
     ) -> Any:
         assert self._router_mesh is not None, "provision before spawning"
+        num_prefill = self._num_prefill_generators
         for idx, generator_mesh in enumerate(self._generator_meshes):
             actor_name = (
                 "generator" if len(self._generator_meshes) == 1 else f"generator_{idx}"
             )
+            prefill_decode_role = None
+            if num_prefill:
+                prefill_decode_role = "prefill" if idx < num_prefill else "decode"
+                actor_name = f"{prefill_decode_role}_{actor_name}"
             generator = generator_mesh.spawn(
-                actor_name, GeneratorActor, generator_config, **generator_kwargs
+                actor_name,
+                GeneratorActor,
+                generator_config,
+                prefill_decode_role=prefill_decode_role,
+                **generator_kwargs,
             )
             self._generators.append(
                 ServiceHandle(
@@ -165,7 +192,8 @@ class MonarchActorSystem(ActorSystem):
             "generator_router",
             InterGeneratorRouterActor,
             config,
-            generators=self._generators,
+            generators=self._generators[num_prefill:],
+            prefill_generators=self._generators[:num_prefill],
         )
 
     async def spawn_batcher(self, config: Batcher.Config, **kwargs: Any) -> Any:

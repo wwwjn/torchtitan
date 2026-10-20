@@ -10,6 +10,7 @@ loop, request dispatcher and inference engine."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass(kw_only=True, slots=True)
@@ -67,10 +68,14 @@ class EngineRequest:
     arrival_time: float
     """Rank 0's `time.time()` in `generate`; vLLM breaks priority ties by it and measures TTFT from it.
     All TP ranks pass this one value, so they order ties the same way even if their clocks differ."""
+    kv_transfer_params: dict[str, Any] | None = None
+    """Decode generators only: where the prompt's KV lives, from the prefill generator."""
+    prefill_min_policy_version: int | None = None
+    """Decode generators only: the oldest policy version the prefill generator's KV can come from."""
     min_policy_version: int = field(init=False)
     """Oldest policy version this request's KV can come from; rank 0 sets it at admission.
-    Without a KV reset on model state dict load it is the group's pinned version and salts the
-    prefix cache."""
+    Without a KV reset on model state dict load it is the group's pinned version (or the prefill
+    generator's, if older) and salts the prefix cache."""
 
 
 @dataclass(kw_only=True, slots=True)
@@ -99,3 +104,5 @@ class FinishedRequest:
     token_logprobs: list[float]  # [generated_tokens], of each sampled token
     finish_reason: str | None
     metrics_inputs: RequestMetricsInputs
+    kv_transfer_params: dict[str, Any] | None = None
+    """Prefill generators only: the handle to the prompt's KV, for a decode generator."""
