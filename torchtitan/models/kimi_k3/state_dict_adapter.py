@@ -12,12 +12,19 @@ import re
 from typing import Any, TYPE_CHECKING
 
 import torch
+from torch.distributed.checkpoint import HuggingFaceStorageReader
 from torch.distributed.tensor import DTensor
 
+from torchtitan.components.checkpointer.hf_storage import (
+    HuggingFaceStorageReaderWithViews,
+    LogicalPrefixSpec,
+    PackedPairSpec,
+)
 from torchtitan.models.common.attention.kda import KDA
 from torchtitan.models.common.moe.state_dict_adapter import MoEStateDictAdapter
 
 from .moe import KimiLatentMoE
+from .mxfp4 import decode_mxfp4, packed_mxfp4_weights
 
 if TYPE_CHECKING:
     from .model import KimiK3Model
@@ -148,12 +155,11 @@ class KimiK3StateDictAdapter(MoEStateDictAdapter):
     def to_hf(
         self, state_dict: dict[str, Any], *, to_quantized_layout: bool = False
     ) -> dict[str, Any]:
-        """Convert a TorchTitan state dict to unquantized HuggingFace format."""
-        if to_quantized_layout:
-            raise ValueError(
-                f"{type(self).__name__} does not support loading quantized "
-                "HF checkpoints."
-            )
+        """Convert a TorchTitan state dict to unquantized HuggingFace format.
+
+        A quantized load uses the same layout: ``get_hf_storage_reader`` decodes
+        the packed MXFP4 pairs into the unquantized ``.weight`` tensors.
+        """
         state_dict = self._native_fused_linears_to_hf(
             state_dict,
             split_routed_experts=True,
@@ -287,15 +293,60 @@ class KimiK3StateDictAdapter(MoEStateDictAdapter):
             )
         return hf_state_dict
 
+    def get_hf_storage_reader(
+        self,
+        path: str,
+        from_quantized: bool = False,
+        *,
+        thread_count: int | None = None,
+    ) -> HuggingFaceStorageReader:
+        """Read the released checkpoint into the model's bf16 tensors and shapes.
+
+        With ``from_quantized``, each MXFP4 pair (``X.weight_packed`` and
+        ``X.weight_scale``: the routed experts) is decoded to a bf16 ``X.weight``.
+        The release also stores each 96-head KDA ``A_log`` as a zero-padded
+        128-entry vector; it is read as its first ``n_heads`` entries.
+        """
+        if thread_count is None:
+            thread_count = 2
+        prefixes = {
+            f"language_model.model.layers.{index}.self_attn.A_log": LogicalPrefixSpec(
+                logical_length=layer.attention.n_heads, padded_length=128
+            )
+            for index, layer in enumerate(self.kimi_config.layers)
+            if isinstance(layer.attention, KDA.Config)
+            and layer.attention.n_heads == 96
+            and layer.attention.head_dim == 128
+        }
+        spec = None
+        if from_quantized:
+            packed_weights, block_size = packed_mxfp4_weights(path)
+            spec = PackedPairSpec(
+                packed_suffix=".weight_packed",
+                scale_suffix=".weight_scale",
+                virtual_suffix=".weight",
+                block_size=block_size,
+                packed_values_per_byte=2,
+                target_dtype=torch.bfloat16,
+                target_fqns=packed_weights,
+                decode=decode_mxfp4,
+            )
+        if spec is None and not prefixes:
+            return super().get_hf_storage_reader(path, thread_count=thread_count)
+        return HuggingFaceStorageReaderWithViews(
+            path=path,
+            spec=spec,
+            thread_count=thread_count,
+            logical_prefixes=prefixes,
+        )
+
     def from_hf(
         self, hf_state_dict: dict[str, Any], *, is_quantized_layout: bool = False
     ) -> dict[str, Any]:
-        """Convert an unquantized HuggingFace state dict to TorchTitan."""
-        if is_quantized_layout:
-            raise ValueError(
-                f"{type(self).__name__} does not support loading quantized "
-                "HF checkpoints."
-            )
+        """Convert an unquantized HuggingFace state dict to TorchTitan.
+
+        A quantized load arrives in the same layout (see ``to_hf``).
+        """
         state_dict: dict[str, Any] = {}
         expert_weights_by_layer: dict[str, dict[str, dict[int, torch.Tensor]]] = {}
         unmapped: list[str] = []
