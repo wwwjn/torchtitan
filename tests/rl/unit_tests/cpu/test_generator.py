@@ -67,6 +67,10 @@ from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.routing.intra_generator import IntraGeneratorRouter
 from torchtitan.rl.routing.strategies import LeastLoadedRoutingStrategy
 from vllm import SamplingParams
+from vllm.config import KVTransferConfig
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
+    MooncakeKVConnectorStats,
+)
 from vllm.exceptions import VLLMValidationError
 from vllm.logprobs import FlatLogprobs, Logprob
 from vllm.sampling_params import RequestOutputKind
@@ -155,6 +159,7 @@ def _vllm_engine(*, reset_kv_cache_on_model_state_dict_load=False, model=None):
     engine._prefill_decode_role = None
     engine._mooncake_handle = None
     engine._transfer_ids = {}
+    engine._kv_transfer_stat_logger = None
     return engine
 
 
@@ -448,6 +453,36 @@ def test_mooncake_prefill_engine_gives_each_request_its_transfer_id():
             "transfer_id": params["transfer_id"],
         }
     assert engine._transfer_ids == {}
+
+
+def test_kv_transfer_stats_are_logged_once_per_step(monkeypatch):
+    # The connector's per-transfer stats from engine steps come out of log_stats as
+    # kv_transfer/* scalars; the next step starts from none.
+    engine = _vllm_engine()
+    kv_transfer_config = KVTransferConfig(
+        kv_connector="MooncakeConnector", kv_role="kv_producer", engine_id="e0"
+    )
+    stat_logger = vllm_engine_module._KVTransferStatLogger(
+        SimpleNamespace(kv_transfer_config=kv_transfer_config)
+    )
+    engine._kv_transfer_stat_logger = stat_logger
+    for duration_s in (0.01, 0.03):
+        stats = MooncakeKVConnectorStats()
+        stats.record_transfer(duration_s=duration_s, total_bytes=2**20, num_descs=4)
+        stat_logger.record(SimpleNamespace(kv_connector_stats=stats.to_dict()), None)
+    logged = []
+    monkeypatch.setattr(vllm_engine_module.sl, "log_trace_scalar", logged.append)
+
+    engine.log_stats(3)
+    engine.log_stats(4)
+
+    assert len(logged) == 1
+    metrics = logged[0]
+    assert metrics["kv_transfer/num_successful_transfers"] == 2
+    assert metrics["kv_transfer/avg_xfer_time_ms"] == pytest.approx(20.0)
+    assert metrics["kv_transfer/max_xfer_time_ms"] == pytest.approx(30.0)
+    assert metrics["kv_transfer/avg_mb_per_transfer"] == pytest.approx(1.0)
+    assert metrics["kv_transfer/num_failed_transfers"] == 0
 
 
 def test_build_sampling_params_matches_contract():
