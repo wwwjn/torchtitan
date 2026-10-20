@@ -16,12 +16,14 @@ The uneven-decode integration test requires four GPUs and a torchrun launcher.
 
 import asyncio
 import concurrent.futures
+import dataclasses
 import gc
 import inspect
 import math
 import os
 import shutil
 import tempfile
+import threading
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import cast
@@ -33,6 +35,8 @@ import torch.distributed as dist
 
 import torchtitan.rl.generator.generator as generator_module
 import torchtitan.rl.generator.vllm.engine as vllm_engine_module
+import torchtitan.rl.generator.vllm.worker as vllm_worker_module
+from torch.distributed import TCPStore
 from torchstore import RankRole
 from torchtitan.components.optim import AdamW
 from torchtitan.config import CommConfig, DebugConfig
@@ -66,7 +70,7 @@ from torchtitan.rl.generator.vllm.worker import (
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.routing.intra_generator import IntraGeneratorRouter
 from torchtitan.rl.routing.strategies import LeastLoadedRoutingStrategy
-from vllm import SamplingParams
+from vllm import EngineArgs, SamplingParams
 from vllm.config import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
     MooncakeKVConnectorStats,
@@ -160,6 +164,7 @@ def _vllm_engine(*, reset_kv_cache_on_model_state_dict_load=False, model=None):
     engine._mooncake_handle = None
     engine._transfer_ids = {}
     engine._kv_transfer_stat_logger = None
+    engine._rank = 0
     return engine
 
 
@@ -386,73 +391,201 @@ def test_prefill_generator_ignores_stop_tokens_so_it_stops_at_its_length_cap():
 def test_mooncake_kv_transfer_config(monkeypatch, role):
     monkeypatch.delenv("VLLM_MOONCAKE_BOOTSTRAP_PORT", raising=False)
     engine_kwargs = {}
-    handle = add_kv_transfer_config(
+    add_kv_transfer_config(
         engine_kwargs,
         role,
         connector="MooncakeConnector",
         extra_config={"mooncake_protocol": "tcp"},
         engine_id="prefill_generator_0-ab12",
+        bootstrap_address=("host0", 9000) if role == "prefill" else None,
     )
+    # Every key goes to vLLM's EngineArgs.
+    assert set(engine_kwargs) <= {
+        field.name for field in dataclasses.fields(EngineArgs)
+    }
     kv_transfer_config = engine_kwargs["kv_transfer_config"]
     assert kv_transfer_config.kv_connector == "MooncakeConnector"
     assert kv_transfer_config.engine_id == "prefill_generator_0-ab12"
     assert kv_transfer_config.kv_connector_extra_config == {"mooncake_protocol": "tcp"}
     if role == "decode":
-        assert handle is None
+        assert "VLLM_MOONCAKE_BOOTSTRAP_PORT" not in os.environ
         return
-    # A prefill engine serves its own bootstrap port; decode requests find it there.
-    port = os.environ["VLLM_MOONCAKE_BOOTSTRAP_PORT"]
-    assert handle["do_remote_prefill"] is True
-    assert handle["remote_engine_id"] == "prefill_generator_0-ab12"
-    # vLLM appends "/query" to it, so it must be a full URL.
-    assert handle["remote_bootstrap_addr"].startswith("http://")
-    assert handle["remote_bootstrap_addr"].endswith(f":{port}")
+    # Every rank of a prefill generator registers with the bootstrap server at this address.
+    assert os.environ["VLLM_MOONCAKE_BOOTSTRAP_PORT"] == "9000"
+    assert engine_kwargs["data_parallel_address"] == "host0"
 
 
-def test_mooncake_needs_an_engine_id():
+@pytest.mark.parametrize("tensor_parallel_size", [1, 2])
+def test_tp_ranks_of_a_kv_transfer_engine_keep_the_request_ids(
+    monkeypatch, tensor_parallel_size
+):
+    # TP ranks agree on finished transfers by request id, so they must not each append
+    # vLLM's random suffix.
+    monkeypatch.delenv("VLLM_DISABLE_REQUEST_ID_RANDOMIZATION", raising=False)
+    add_kv_transfer_config(
+        {"tensor_parallel_size": tensor_parallel_size},
+        "decode",
+        connector="MooncakeConnector",
+        engine_id="decode_generator_1-ab12",
+    )
+    assert (os.environ.get("VLLM_DISABLE_REQUEST_ID_RANDOMIZATION") == "1") is (
+        tensor_parallel_size > 1
+    )
+
+
+def test_mooncake_needs_an_engine_id_and_a_prefill_bootstrap_address():
     with pytest.raises(ValueError, match="engine_id"):
         add_kv_transfer_config({}, "prefill", connector="MooncakeConnector")
+    with pytest.raises(ValueError, match="bootstrap_address"):
+        add_kv_transfer_config(
+            {}, "prefill", connector="MooncakeConnector", engine_id="e0"
+        )
+
+
+def test_prefill_generator_ranks_agree_on_the_mooncake_bootstrap_port(monkeypatch):
+    # Rank 0 picks the port; the others read it from the generator's rendezvous store.
+    store = TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False)
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", str(store.port))
+    port = vllm_engine_module._agree_on_mooncake_bootstrap_port(rank=0)
+    assert vllm_engine_module._agree_on_mooncake_bootstrap_port(rank=1) == port
 
 
 def test_mooncake_has_no_kv_transfer_listener_to_watch():
     config = VLLMEngine.Config(kv_connector="MooncakeConnector")
     assert config.kv_transfer_listener_thread_name is None
+    assert not config.prefill_decode_single_node
 
 
 def test_mooncake_prefill_engine_gives_each_request_its_transfer_id():
-    engine = _vllm_engine()
-    engine._prefill_decode_role = "prefill"
-    engine._mooncake_handle = {
+    handle = {
         "do_remote_prefill": True,
         "remote_engine_id": "e0",
         "remote_bootstrap_addr": "http://10.0.0.1:9000",
     }
-    engine.add_requests(
-        [
-            _engine_request("r0", min_policy_version=6),
-            _engine_request("r1", min_policy_version=6),
-        ]
-    )
-    llm_engine = cast(_FakeLLMEngine, engine._engine)
-    sent = [
-        kwargs["params"].extra_args["kv_transfer_params"]
-        for _, kwargs in llm_engine.add_requests
-    ]
-    assert [params["do_remote_decode"] for params in sent] == [True, True]
-    assert sent[0]["transfer_id"] != sent[1]["transfer_id"]
+    # Two TP ranks of one prefill engine get the same requests from rank 0.
+    engines = [_vllm_engine(), _vllm_engine()]
+    sent = []
+    for engine in engines:
+        engine._prefill_decode_role = "prefill"
+        engine._mooncake_handle = handle
+        engine.add_requests(
+            [
+                _engine_request("r0", min_policy_version=6),
+                _engine_request("r1", min_policy_version=6),
+            ]
+        )
+        llm_engine = cast(_FakeLLMEngine, engine._engine)
+        sent.append(
+            [
+                kwargs["params"].extra_args["kv_transfer_params"]
+                for _, kwargs in llm_engine.add_requests
+            ]
+        )
+    # Mooncake pairs each prefill TP rank with its decode TP rank by this id.
+    assert sent[0] == sent[1]
+    assert [params["do_remote_decode"] for params in sent[0]] == [True, True]
+    assert sent[0][0]["transfer_id"] != sent[0][1]["transfer_id"]
 
-    # Each finished prefill request carries the decode hop's full handle.
+    # A request that stopped at its length cap carries the decode hop's full handle; vLLM
+    # freed the KV of any other.
+    engine = engines[0]
     engine._engine.step = lambda: [
-        _request_output(request_id="r1"),
-        _request_output(request_id="r0"),
+        _request_output(request_id="r1", outputs=[_sample(finish_reason="abort")]),
+        _request_output(request_id="r0", outputs=[_sample(finish_reason="length")]),
     ]
     finished = {request.request_id: request for request in engine.step()}
-    for request_id, params in zip(["r0", "r1"], sent):
-        assert finished[request_id].kv_transfer_params == {
-            **engine._mooncake_handle,
-            "transfer_id": params["transfer_id"],
-        }
+    assert finished["r0"].kv_transfer_params == {
+        **handle,
+        "transfer_id": sent[0][0]["transfer_id"],
+    }
+    assert finished["r1"].kv_transfer_params is None
     assert engine._transfer_ids == {}
+
+
+def test_tp_ranks_report_a_kv_transfer_once_every_rank_finished_it():
+    # Each TP rank runs its own scheduler under external_launcher; a request must become
+    # schedulable on every rank in the same step, once its KV arrived on all of them.
+    results = vllm_worker_module.KVConnectorTransferResults
+    merged_by_rank = {
+        rank: vllm_worker_module._TPAgreedTransferResults(
+            lambda finished_req_ids: results(), group=None, rank=rank, world_size=2
+        )
+        for rank in (0, 1)
+    }
+    steps = [
+        # rank 0 received r0 and sent s0; rank 1 has neither yet
+        [results(finished_recving={"r0"}, finished_sending={"s0"}), results()],
+        # rank 1 catches up; r1's receive failed on rank 1 and finished on rank 0
+        [
+            results(finished_recving={"r1"}),
+            results(
+                finished_recving={"r0", "r1"},
+                finished_sending={"s0"},
+                failed_recving={"r1"},
+            ),
+        ],
+    ]
+    for rank, merger in merged_by_rank.items():
+        first, second = (merger.merge(gathered) for gathered in steps)
+        assert first == results(), rank
+        assert second == results(
+            finished_recving={"r0", "r1"},
+            finished_sending={"s0"},
+            failed_recving={"r1"},
+        ), rank
+
+
+def test_dp_replicas_step_together_while_one_holds_kv_for_transfer(monkeypatch):
+    # Under external_launcher every DP replica's step is a DP collective, so a prefill replica
+    # holding KV for a decode pull must not step alone: the replicas agree to step, and the
+    # one with nothing to do runs vLLM's dummy batch.
+    state = {"holds_kv": [True, False], "flags": [None, None]}
+    barrier = threading.Barrier(2)
+
+    def has_unfinished_dp(dp_group, has_unfinished):  # all-reduce MAX over the replicas
+        state["flags"][dp_group] = has_unfinished
+        barrier.wait()
+        return any(state["flags"])
+
+    monkeypatch.setattr(
+        vllm_engine_module.ParallelConfig,
+        "has_unfinished_dp",
+        staticmethod(has_unfinished_dp),
+    )
+    replicas = []
+    for dp_rank in (0, 1):
+        engine = _vllm_engine()
+        engine._prefill_decode_role = "prefill"
+        engine._engine.dp_group = dp_rank
+        engine._engine.should_execute_dummy_batch = False
+        engine._engine.output_processor = SimpleNamespace(
+            has_unfinished_requests=lambda: False
+        )
+        scheduler = SimpleNamespace(
+            has_finished_requests=lambda dp_rank=dp_rank: state["holds_kv"][dp_rank]
+        )
+        engine._engine.engine_core = SimpleNamespace(
+            engine_core=SimpleNamespace(scheduler=scheduler)
+        )
+        replicas.append(engine)
+
+    def has_work_to_step_on_every_replica():
+        with concurrent.futures.ThreadPoolExecutor(2) as pool:
+            return list(pool.map(lambda engine: engine.has_work_to_step(), replicas))
+
+    assert has_work_to_step_on_every_replica() == [True, True]
+    assert [engine._engine.should_execute_dummy_batch for engine in replicas] == [
+        False,
+        True,
+    ]
+
+    state["holds_kv"] = [False, False]
+    assert has_work_to_step_on_every_replica() == [False, False]
+    assert [engine._engine.should_execute_dummy_batch for engine in replicas] == [
+        False,
+        False,
+    ]
 
 
 def test_kv_transfer_stats_are_logged_once_per_step(monkeypatch):

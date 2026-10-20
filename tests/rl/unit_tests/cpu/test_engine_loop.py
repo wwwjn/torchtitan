@@ -609,6 +609,9 @@ class _FakeEngine:
     def holds_kv_for_transfer(self) -> bool:
         return False
 
+    def has_work_to_step(self) -> bool:
+        return self.has_unfinished_requests() or self.holds_kv_for_transfer()
+
     def step(self) -> list[FinishedRequest]:
         self.threads.add(threading.current_thread())
         self.step_hook()

@@ -87,11 +87,13 @@ class ActorSystem(Configurable, abc.ABC):
         generator_parallelism: InferenceParallelismConfig,
         num_generators: int,
         num_prefill_generators: int = 0,
+        generators_see_each_other: bool = False,
     ) -> None:
         """Reserve the processes for the trainer, ``num_generators`` generators, the
         generator router and the batcher, before any of them is spawned. The first
         ``num_prefill_generators`` generators only prefill and hand each prompt's KV to one
-        of the rest, so the generators must be able to reach each other."""
+        of the rest, so the generators must be able to reach each other.
+        ``generators_see_each_other``: generators share one node and see each other's GPUs."""
 
     @abc.abstractmethod
     async def spawn_trainer(

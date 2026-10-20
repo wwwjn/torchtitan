@@ -6,14 +6,22 @@
 
 """TorchTitan-owned vLLM worker and model runner customizations."""
 
-from collections.abc import Set
+from collections.abc import Callable, Set
 from contextlib import nullcontext
+from types import SimpleNamespace
 
+import torch.distributed as dist
+from vllm import envs
 from vllm.config import CUDAGraphMode, get_layers_from_vllm_config
+from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorTransferResults
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import BatchDescriptor
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.utils.math_utils import round_up
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
+from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.worker import gpu_model_runner as vllm_gpu_model_runner
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.gpu_worker import Worker as GPUWorker
@@ -121,6 +129,61 @@ class TorchTitanGPUModelRunner(GPUModelRunner):
         return num_scheduled_tokens
 
 
+class _TPAgreedTransferResults:
+    """Wraps a KV connector's ``get_transfer_results`` so every TP rank reports a request's KV
+    transfer as finished in the same engine step.
+
+    With ``external_launcher`` each TP rank runs its own scheduler, which sees only its own
+    worker's transfers (vLLM's multiprocess executor instead merges all workers' into one
+    scheduler with ``KVOutputAggregator``). A request whose KV arrived on some TP ranks first
+    would be scheduled there a step earlier, and the ranks' batches, and so their TP
+    collectives, would diverge. Each step this gathers every TP rank's results and reports a
+    request once all ranks finished it, with vLLM's ``KVOutputAggregator``.
+    """
+
+    def __init__(
+        self,
+        get_transfer_results: Callable[[set[str]], KVConnectorTransferResults],
+        *,
+        group: dist.ProcessGroup,
+        rank: int,
+        world_size: int,
+    ) -> None:
+        self._get_transfer_results = get_transfer_results
+        self._group = group
+        self._rank = rank
+        self._world_size = world_size
+        self._aggregator = KVOutputAggregator(expected_finished_count=world_size)
+
+    def __call__(self, finished_req_ids: set[str]) -> KVConnectorTransferResults:
+        local = self._get_transfer_results(finished_req_ids)
+        gathered: list[KVConnectorTransferResults | None] = [None] * self._world_size
+        dist.all_gather_object(gathered, local, group=self._group)
+        return self.merge(gathered)
+
+    def merge(
+        self, gathered: list[KVConnectorTransferResults | None]
+    ) -> KVConnectorTransferResults:
+        """Merge one step's results from every TP rank (index = TP rank)."""
+        outputs = [
+            SimpleNamespace(
+                kv_connector_output=KVConnectorOutput(
+                    finished_sending=results.finished_sending or None,
+                    finished_recving=results.finished_recving or None,
+                    failed_recving=results.failed_recving,
+                )
+            )
+            for results in gathered
+        ]
+        merged = self._aggregator.aggregate(outputs, output_rank=self._rank)
+        kv_output = merged.kv_connector_output
+        return KVConnectorTransferResults(
+            finished_sending=set(kv_output.finished_sending or ()),
+            finished_recving=set(kv_output.finished_recving or ()),
+            failed_recving=set(kv_output.failed_recving),
+        )
+
+
 class TorchTitanGPUWorker(GPUWorker):
     """V1 worker that constructs :class:`TorchTitanGPUModelRunner`."""
 
@@ -148,3 +211,22 @@ class TorchTitanGPUWorker(GPUWorker):
             super().init_device()
         finally:
             vllm_gpu_model_runner.GPUModelRunner = original_runner_cls
+
+    def initialize_from_config(self, kv_cache_config) -> None:
+        super().initialize_from_config(kv_cache_config)
+        # vLLM creates the KV connector here (prefill/decode generators only).
+        tp_group = get_tp_group()
+        if has_kv_transfer_group() and tp_group.world_size > 1:
+            # Request ids must match across TP ranks for them to agree (see
+            # add_kv_transfer_config).
+            if not envs.VLLM_DISABLE_REQUEST_ID_RANDOMIZATION:
+                raise RuntimeError(
+                    "KV transfer with TP > 1 needs VLLM_DISABLE_REQUEST_ID_RANDOMIZATION=1"
+                )
+            connector = get_kv_transfer_group()
+            connector.get_transfer_results = _TPAgreedTransferResults(
+                connector.get_transfer_results,
+                group=tp_group.cpu_group,
+                rank=tp_group.rank_in_group,
+                world_size=tp_group.world_size,
+            )

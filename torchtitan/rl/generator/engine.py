@@ -61,6 +61,12 @@ class GenerationEngine(Configurable, abc.ABC):
             its port, if the engine build waits on it; the generator raises if it dies."""
             return None
 
+        @property
+        def prefill_decode_single_node(self) -> bool:
+            """Whether prefill and decode generators must share one node, see each other's
+            GPUs, and run with TP, DP and EP degrees of 1 to hand off KV."""
+            return False
+
     @property
     @abc.abstractmethod
     def data_parallel_size(self) -> int:
@@ -109,11 +115,17 @@ class GenerationEngine(Configurable, abc.ABC):
         in a step."""
         return False
 
+    def has_work_to_step(self) -> bool:
+        """Whether the engine loop should run another step: a request is running, or KV is
+        held for a decode engine. Every rank calls it at the same point of the loop, so an
+        engine whose step is a collective across replicas can answer for all of them."""
+        return self.has_unfinished_requests() or self.holds_kv_for_transfer()
+
     def release_sessions(self, session_ids: list[str], group_ids: list[int]) -> None:
         """Release the held KV of ``session_ids`` and of every session of ``group_ids``."""
 
     def log_stats(self, step: int) -> None:
-        """Log the engine's own per-step stats, if any."""
+        """Log the engine's own per-step stats, if any. Called on every rank."""
 
     @abc.abstractmethod
     def shutdown(self) -> None:
