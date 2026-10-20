@@ -11,24 +11,33 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+import re
+import threading
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import torch
 from vllm import EngineArgs, LLMEngine, SamplingParams
-from vllm.config import AttentionConfig, KVTransferConfig
+from vllm.config import AttentionConfig, KVTransferConfig, VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorLogging,
+    KVConnectorStats,
+)
 from vllm.exceptions import VLLMClientError
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.utils.network_utils import get_ip, get_open_port, make_zmq_path
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.metrics.loggers import StatLoggerBase
+from vllm.v1.metrics.stats import IterationStats, SchedulerStats
 
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.config import DebugConfig
 from torchtitan.models.common.attention import FlexInnerAttention, VarlenInnerAttention
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.dist_moe import DistMoeRuntime
+from torchtitan.observability import structured_logger as sl
 from torchtitan.rl.generator.engine import GenerationEngine
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
 from torchtitan.rl.generator.types import (
@@ -148,6 +157,55 @@ def add_kv_transfer_config(
     return handle
 
 
+class _KVTransferStatLogger(StatLoggerBase):
+    """Collects the KV connector's transfer stats from each engine step until ``drain``.
+
+    The connector records them on the engine that moves the KV: the prefill engine for
+    Mooncake (it writes into the decode engine's blocks), the decode engine for NIXL (it reads).
+    """
+
+    def __init__(self, vllm_config: VllmConfig, engine_index: int = 0) -> None:
+        self._kv_connector_logging = KVConnectorLogging(vllm_config.kv_transfer_config)
+        # `record` runs on the engine loop thread, `drain` on the generator's.
+        self._lock = threading.Lock()
+
+    def record(
+        self,
+        scheduler_stats: SchedulerStats | None,
+        iteration_stats: IterationStats | None,
+        mm_cache_stats: Any = None,
+        engine_idx: int = 0,
+    ) -> None:
+        if scheduler_stats is not None and scheduler_stats.kv_connector_stats:
+            with self._lock:
+                self._kv_connector_logging.observe(scheduler_stats.kv_connector_stats)
+
+    def log_engine_initialized(self) -> None:
+        pass
+
+    def drain(self) -> KVConnectorStats | None:
+        """The stats recorded since the last call, or None if there were none."""
+        with self._lock:
+            stats = self._kv_connector_logging.transfer_stats_accumulator
+            self._kv_connector_logging.reset()
+        return stats
+
+
+def _kv_transfer_metrics(stats: KVConnectorStats) -> dict[str, float]:
+    """The connector's reduced stats as ``kv_transfer/*`` scalars, e.g. vLLM's
+    "Avg xfer time (ms)" -> ``kv_transfer/avg_xfer_time_ms``."""
+    metrics = {
+        "kv_transfer/" + re.sub(r"[^0-9a-z]+", "_", name.lower()).strip("_"): value
+        for name, value in stats.reduce().items()
+    }
+    # Both connectors keep each transfer's duration in seconds under this key; the reduced
+    # stats stop at P90, and the slowest hand-off sets the decode generator's wait.
+    durations = stats.data.get("transfer_duration")
+    if durations:
+        metrics["kv_transfer/max_xfer_time_ms"] = max(durations) * 1000
+    return metrics
+
+
 class VLLMEngine(GenerationEngine):
     """The generator's vLLM ``LLMEngine``, behind the calls the engine loop makes.
 
@@ -236,6 +294,7 @@ class VLLMEngine(GenerationEngine):
         self._mooncake_handle: dict[str, Any] | None = None
         self._transfer_ids: dict[str, str] = {}
         self._kv_engine_id = f"{generator_name}-{uuid.uuid4().hex[:8]}"
+        self._kv_transfer_stat_logger: _KVTransferStatLogger | None = None
         self._setup(
             model,
             parallelism=parallelism,
@@ -415,7 +474,9 @@ class VLLMEngine(GenerationEngine):
         return EngineArgs(**engine_kwargs)
 
     def _build_stat_loggers(self, context: StatLoggerContext) -> list | None:
-        """Build the vLLM stat logger factories, or None without ``config.stat_logger``."""
+        """Build the vLLM stat logger factories: ``config.stat_logger``, and the KV transfer
+        stats of a prefill or decode engine. None if there are none."""
+        factories = []
         stat_logger_config = self.config.stat_logger
         if stat_logger_config is None:
             logger.info(
@@ -423,16 +484,27 @@ class VLLMEngine(GenerationEngine):
                 "metrics, set VLLMEngine.Config.stat_logger to VllmOtelStatLogger.Config() "
                 "and set OTEL_METRICS_EXPORTER=jsonl or otlp"
             )
-            return None
+        else:
 
-        def build_stat_logger(vllm_config, engine_index):
-            return stat_logger_config.build(
-                vllm_config=vllm_config,
-                engine_index=engine_index,
-                context=context,
-            )
+            def build_stat_logger(vllm_config, engine_index):
+                return stat_logger_config.build(
+                    vllm_config=vllm_config,
+                    engine_index=engine_index,
+                    context=context,
+                )
 
-        return [build_stat_logger]
+            factories.append(build_stat_logger)
+
+        if self._prefill_decode_role is not None:
+
+            def build_kv_transfer_stat_logger(vllm_config, engine_index):
+                self._kv_transfer_stat_logger = _KVTransferStatLogger(
+                    vllm_config, engine_index
+                )
+                return self._kv_transfer_stat_logger
+
+            factories.append(build_kv_transfer_stat_logger)
+        return factories or None
 
     @property
     def data_parallel_size(self) -> int:
@@ -560,6 +632,17 @@ class VLLMEngine(GenerationEngine):
                 self._session_kv_holder.num_sessions,
                 self._session_kv_holder.num_evicted,
             )
+        # TODO: with generator DP > 1 this reports only DP rank 0's transfers.
+        if self._kv_transfer_stat_logger is not None:
+            stats = self._kv_transfer_stat_logger.drain()
+            if stats is not None and not stats.is_empty():
+                metrics = _kv_transfer_metrics(stats)
+                logger.info(
+                    "KV transfer at step %d: %s",
+                    step,
+                    ", ".join(f"{name}={value:g}" for name, value in metrics.items()),
+                )
+                sl.log_trace_scalar(metrics)
 
     def load_prefetched_model_state_dict(self) -> None:
         """Copy the prefetched model state dict from pinned CPU memory into the model, and
