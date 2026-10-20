@@ -537,12 +537,15 @@ def test_monarch_actor_system_provisions_every_role_before_spawning(monkeypatch)
     ]
 
 
-@pytest.mark.parametrize("num_prefill_generators", [0, 1])
-def test_monarch_actor_system_provisions_prefill_generators_on_one_node(
-    monkeypatch, num_prefill_generators
+@pytest.mark.parametrize(
+    "num_prefill_generators, generators_see_each_other",
+    [(0, False), (1, True), (1, False)],
+)
+def test_monarch_actor_system_provisions_prefill_generators(
+    monkeypatch, num_prefill_generators, generators_see_each_other
 ):
-    """With prefill generators, generators see each other's GPUs and run without
-    expandable segments; multi-host provisioning is rejected."""
+    """Prefill and decode generators run without expandable segments. Generators that see
+    each other's GPUs need one node; otherwise (e.g. Mooncake over RDMA) they can span hosts."""
     calls = []
 
     def spawn_proc_mesh(trainer_world_size, per_generator_world_size, **kwargs):
@@ -557,20 +560,24 @@ def test_monarch_actor_system_provisions_prefill_generators_on_one_node(
         generator_parallelism=InferenceParallelismConfig(),
         num_generators=2,
         num_prefill_generators=num_prefill_generators,
+        generators_see_each_other=generators_see_each_other,
     )
 
     asyncio.run(MonarchActorSystem.Config().build().provision(**provision_kwargs))
 
     (kwargs,) = calls
-    assert kwargs["generators_see_each_other"] is bool(num_prefill_generators)
+    assert kwargs["generators_see_each_other"] is generators_see_each_other
     generator_env = kwargs["generator_env"] or {}
     assert (
         generator_env.get("PYTORCH_CUDA_ALLOC_CONF") == "expandable_segments:False"
     ) is bool(num_prefill_generators)
-    if num_prefill_generators:
-        multi_host = MonarchActorSystem.Config().build(host_meshes="host_meshes")
+    multi_host = MonarchActorSystem.Config().build(host_meshes="host_meshes")
+    if generators_see_each_other:
         with pytest.raises(ValueError, match="single-node mode"):
             asyncio.run(multi_host.provision(**provision_kwargs))
+    else:
+        asyncio.run(multi_host.provision(**provision_kwargs))
+        assert calls[-1]["host_meshes"] == "host_meshes"
 
 
 class _SpawnRecordingMesh:

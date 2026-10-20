@@ -15,11 +15,14 @@ import re
 import threading
 import uuid
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any, Literal
 
 import torch
+
+from torch.distributed import TCPStore
 from vllm import EngineArgs, LLMEngine, SamplingParams
-from vllm.config import AttentionConfig, KVTransferConfig, VllmConfig
+from vllm.config import AttentionConfig, KVTransferConfig, ParallelConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorLogging,
     KVConnectorStats,
@@ -109,20 +112,27 @@ def add_kv_transfer_config(
     connector: KVConnectorName = "NixlConnector",
     extra_config: dict[str, Any] | None = None,
     engine_id: str | None = None,
-) -> dict[str, Any] | None:
+    bootstrap_address: tuple[str, int] | None = None,
+) -> None:
     """Add vLLM's KV connector to ``engine_kwargs`` in place: a prefill generator produces KV,
     a decode generator consumes it.
 
     NIXL: peers reach this engine's KV listener at this host and port; the prefill request's
     output carries the handle a decode generator needs.
 
-    Mooncake: a prefill engine serves a bootstrap address where decode workers find its
-    workers, and its outputs carry no handle. Returns the handle fields for a prefill engine
-    (``remote_engine_id``, ``remote_bootstrap_addr``); each request adds its ``transfer_id``.
-    Returns None otherwise.
+    Mooncake: a prefill generator's ranks register their KV workers with one bootstrap server
+    at ``bootstrap_address`` (host, port), which vLLM starts on generator rank 0; decode
+    workers find them there.
     """
     kv_role = "kv_producer" if prefill_decode_role == "prefill" else "kv_consumer"
     extra = dict(extra_config or {})
+    if engine_kwargs.get("tensor_parallel_size", 1) > 1:
+        # The TP ranks agree on finished transfers by vLLM's request id (TorchTitanGPUWorker),
+        # so every rank must use the id TitanRL passes (unique per request) instead of vLLM's
+        # per-process random suffix.
+        # TODO: vLLM deprecated this switch; key the agreement by external request id before
+        # it is removed.
+        os.environ["VLLM_DISABLE_REQUEST_ID_RANDOMIZATION"] = "1"
     if connector == "NixlConnector":
         os.environ["VLLM_NIXL_SIDE_CHANNEL_HOST"] = get_ip()
         os.environ["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(get_open_port())
@@ -131,30 +141,44 @@ def add_kv_transfer_config(
             kv_role=kv_role,
             kv_connector_extra_config=extra,
         )
-        return None
+        return
     if connector != "MooncakeConnector":
         raise ValueError(f"unsupported KV connector {connector!r}")
     if engine_id is None:
         raise ValueError("MooncakeConnector needs an engine_id")
-    handle = None
     if prefill_decode_role == "prefill":
-        # Several prefill generators can share a host, so each binds its own port.
-        # TODO: with TP > 1 every rank of the engine must agree on this port and engine_id.
-        bootstrap_port = get_open_port()
-        os.environ["VLLM_MOONCAKE_BOOTSTRAP_PORT"] = str(bootstrap_port)
-        handle = {
-            "do_remote_prefill": True,
-            "remote_engine_id": engine_id,
-            # vLLM queries ``remote_bootstrap_addr + "/query"``, so this is a full URL.
-            "remote_bootstrap_addr": make_zmq_path("http", get_ip(), bootstrap_port),
-        }
+        if bootstrap_address is None:
+            raise ValueError("a Mooncake prefill engine needs a bootstrap_address")
+        host, port = bootstrap_address
+        os.environ["VLLM_MOONCAKE_BOOTSTRAP_PORT"] = str(port)
+        # With generator DP > 1, ranks of DP replicas other than rank 0's register at this
+        # host (vLLM's data_parallel_master_ip). vLLM reads VLLM_DP_MASTER_IP instead when DP
+        # is 1.
+        engine_kwargs["data_parallel_address"] = host
     engine_kwargs["kv_transfer_config"] = KVTransferConfig(
         kv_connector="MooncakeConnector",
         kv_role=kv_role,
         engine_id=engine_id,
         kv_connector_extra_config=extra,
     )
-    return handle
+
+
+def _agree_on_mooncake_bootstrap_port(rank: int) -> int:
+    """The port of a prefill generator's Mooncake bootstrap server, the same on every rank.
+
+    Rank 0 picks a free port and the other ranks read it from the generator's rendezvous store
+    (``MASTER_ADDR:MASTER_PORT``), which serves before vLLM builds its process groups.
+    """
+    store = TCPStore(
+        os.environ["MASTER_ADDR"],
+        int(os.environ["MASTER_PORT"]),
+        is_master=False,
+        timeout=timedelta(minutes=10),
+    )
+    key = "torchtitan/mooncake_bootstrap_port"
+    if rank == 0:
+        store.set(key, str(get_open_port()))
+    return int(store.get(key))
 
 
 class _KVTransferStatLogger(StatLoggerBase):
@@ -250,6 +274,13 @@ class VLLMEngine(GenerationEngine):
                 return "nixl_handshake_listener"
             return None
 
+        @property
+        def prefill_decode_single_node(self) -> bool:
+            # NIXL here: one side-channel port per process, KV over CUDA IPC between
+            # generators on one node. Mooncake: per-rank workers behind one bootstrap server,
+            # KV over RDMA.
+            return self.kv_connector == "NixlConnector"
+
     def __init__(
         self,
         config: Config,
@@ -289,11 +320,23 @@ class VLLMEngine(GenerationEngine):
             reset_kv_cache_on_model_state_dict_load
         )
         self._prefill_decode_role = prefill_decode_role
-        # Mooncake only: this prefill engine's handle fields, and each in-flight prefill
-        # request's transfer id (set at submit, attached to the output at finish).
+        self._rank = rank
+        # Mooncake prefill engines only: the handle fields of this engine's KV (set after the
+        # engine build), and each in-flight request's transfer id (attached at finish).
         self._mooncake_handle: dict[str, Any] | None = None
         self._transfer_ids: dict[str, str] = {}
+        # Unique per DP replica; vLLM gives the other TP ranks TP rank 0's.
         self._kv_engine_id = f"{generator_name}-{uuid.uuid4().hex[:8]}"
+        self._mooncake_bootstrap_address: tuple[str, int] | None = None
+        if (
+            prefill_decode_role == "prefill"
+            and config.kv_connector == "MooncakeConnector"
+        ):
+            # vLLM starts the bootstrap server on generator rank 0, at MASTER_ADDR.
+            self._mooncake_bootstrap_address = (
+                os.environ["MASTER_ADDR"],
+                _agree_on_mooncake_bootstrap_port(rank),
+            )
         self._kv_transfer_stat_logger: _KVTransferStatLogger | None = None
         self._setup(
             model,
@@ -330,6 +373,15 @@ class VLLMEngine(GenerationEngine):
         self._engine = LLMEngine.from_engine_args(
             engine_args, stat_loggers=stat_loggers
         )
+        if self._mooncake_bootstrap_address is not None:
+            host, port = self._mooncake_bootstrap_address
+            self._mooncake_handle = {
+                "do_remote_prefill": True,
+                # TP rank 0's engine id, which vLLM broadcast to this engine's TP ranks.
+                "remote_engine_id": self._engine.vllm_config.kv_transfer_config.engine_id,
+                # vLLM queries ``remote_bootstrap_addr + "/query"``, so this is a full URL.
+                "remote_bootstrap_addr": make_zmq_path("http", host, port),
+            }
         # Every rank holds the same blocks in its own scheduler; only the engine loop thread
         # touches them.
         self._session_kv_holder: VLLMSessionKVHolder | None = None
@@ -463,12 +515,13 @@ class VLLMEngine(GenerationEngine):
         if seed is not None:
             engine_kwargs["seed"] = seed
         if self._prefill_decode_role is not None:
-            self._mooncake_handle = add_kv_transfer_config(
+            add_kv_transfer_config(
                 engine_kwargs,
                 self._prefill_decode_role,
                 connector=self.config.kv_connector,
                 extra_config=self.config.kv_connector_extra_config,
                 engine_id=self._kv_engine_id,
+                bootstrap_address=self._mooncake_bootstrap_address,
             )
         add_extra_vllm_engine_args(engine_kwargs, self.config.extra_engine_args)
         return EngineArgs(**engine_kwargs)
@@ -555,8 +608,10 @@ class VLLMEngine(GenerationEngine):
                 if self._prefill_decode_role == "prefill":
                     kv_transfer_params = {"do_remote_decode": True}
                     if self._mooncake_handle is not None:
-                        # Mooncake pairs the two hops by this id.
-                        transfer_id = uuid.uuid4().hex
+                        # Mooncake pairs the two hops by this id, so every TP rank must use the
+                        # same one: both fields come from rank 0 with the request, and the
+                        # arrival time keeps a reused request id distinct.
+                        transfer_id = f"{request.request_id}@{request.arrival_time!r}"
                         kv_transfer_params["transfer_id"] = transfer_id
                 # vLLM appends a random suffix to the id; the scheduler knows only that one.
                 internal_request_id = self._engine.add_request(
@@ -597,42 +652,63 @@ class VLLMEngine(GenerationEngine):
         ]
         if self._mooncake_handle is not None:
             # Mooncake's prefill outputs carry no handle: build it from this engine's address
-            # and the request's transfer id.
+            # and the request's transfer id. vLLM keeps the KV for the decode generator only
+            # when the request stopped at its length cap, so other outputs get none.
             finished = [
                 dataclasses.replace(
                     request,
                     kv_transfer_params={
                         **self._mooncake_handle,
-                        "transfer_id": self._transfer_ids.pop(request.request_id),
+                        "transfer_id": transfer_id,
                     },
                 )
-                if request.request_id in self._transfer_ids
+                if (transfer_id := self._transfer_ids.pop(request.request_id, None))
+                and request.finish_reason == "length"
                 else request
                 for request in finished
             ]
         return finished
 
     def holds_kv_for_transfer(self) -> bool:
-        """Prefill engines only: whether finished requests still hold KV for a decode engine.
-        vLLM frees it in an engine step once the pull is done, so the loop keeps stepping."""
+        """Prefill engines only: whether this DP replica's finished requests still hold KV for a
+        decode engine. vLLM frees it in an engine step once the pull is done, so the loop keeps
+        stepping."""
         return (
             self._prefill_decode_role == "prefill"
             and self._engine.engine_core.engine_core.scheduler.has_finished_requests()
         )
+
+    def has_work_to_step(self) -> bool:
+        """With DP > 1 every replica's step is a DP collective (under external_launcher vLLM runs
+        a one-token dummy batch even when a replica has nothing scheduled), so the replicas
+        agree whether any of them has a running request or held KV; a replica with neither runs
+        vLLM's dummy batch in that step. vLLM's own `has_unfinished_requests` agrees only on
+        running requests, and a replica stepping alone for its held KV hangs."""
+        dp_group = self._engine.dp_group
+        if dp_group is None:
+            return super().has_work_to_step()
+        has_local_work = (
+            self._engine.output_processor.has_unfinished_requests()
+            or self.holds_kv_for_transfer()
+        )
+        has_work = ParallelConfig.has_unfinished_dp(dp_group, has_local_work)
+        self._engine.should_execute_dummy_batch = has_work and not has_local_work
+        return has_work
 
     def release_sessions(self, session_ids: list[str], group_ids: list[int]) -> None:
         if self._session_kv_holder is not None:
             self._session_kv_holder.release(session_ids, group_ids)
 
     def log_stats(self, step: int) -> None:
-        if self._session_kv_holder is not None:
+        """Called on every rank. Session KV is the same on every rank, so rank 0 logs it; each
+        DP replica's TP rank 0 logs its own KV transfers."""
+        if self._session_kv_holder is not None and self._rank == 0:
             logger.info(
                 "Session KV at step %d: %d sessions held, %d evicted so far",
                 step,
                 self._session_kv_holder.num_sessions,
                 self._session_kv_holder.num_evicted,
             )
-        # TODO: with generator DP > 1 this reports only DP rank 0's transfers.
         if self._kv_transfer_stat_logger is not None:
             stats = self._kv_transfer_stat_logger.drain()
             if stats is not None and not stats.is_empty():

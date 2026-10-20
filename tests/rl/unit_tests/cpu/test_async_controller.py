@@ -76,12 +76,29 @@ def test_controller_config_maybe_log(tmp_path, caplog) -> None:
         ),
         (
             1,
+            {
+                "generator.parallelism": InferenceParallelismConfig(
+                    tensor_parallel_degree=2
+                ),
+                "generator.engine.kv_connector": "MooncakeConnector",
+            },
+            None,
+        ),
+        (
+            1,
             {"generator.reset_kv_cache_on_model_state_dict_load": True},
             "reset_kv_cache_on_model_state_dict_load=False",
         ),
         (1, {"generator_router.hot_swap": False}, "hot_swap=True"),
     ],
-    ids=["supported", "no-decode-generator", "tp2", "kv-reset", "drain"],
+    ids=[
+        "supported",
+        "no-decode-generator",
+        "tp2",
+        "mooncake-tp2",
+        "kv-reset",
+        "drain",
+    ],
 )
 def test_prefill_generators_reject_untested_configs(
     num_prefill_generators, overrides, match
@@ -130,6 +147,8 @@ def test_setup_async_provisions_prefill_generators_and_sizes_decode_ones() -> No
 
     assert actor_system.provision_kwargs["num_generators"] == 3
     assert actor_system.provision_kwargs["num_prefill_generators"] == 1
+    # NIXL (the default connector) moves KV between generators on one node.
+    assert actor_system.provision_kwargs["generators_see_each_other"] is True
     async_loop = config.async_loop
     rollout_concurrency = (
         async_loop.max_active_rollout_groups * async_loop.num_samples_per_prompt

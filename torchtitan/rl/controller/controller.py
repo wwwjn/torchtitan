@@ -363,15 +363,16 @@ class Controller(Configurable):
                 )
             if self.num_prefill_generators:
                 parallelism = self.generator.parallelism
-                # TODO: TP > 1 needs a side-channel port and transfer params per rank; DP/EP
-                # needs the allocator change measured with expert-parallel buffers.
-                if (
+                # TODO (NIXL): TP > 1 needs a side-channel port and transfer params per rank;
+                # DP/EP needs the allocator change measured with expert-parallel buffers.
+                if self.generator.engine.prefill_decode_single_node and (
                     parallelism.tensor_parallel_degree,
                     parallelism.data_parallel_degree,
                     parallelism.expert_parallel_degree,
                 ) != (1, 1, 1):
                     raise ValueError(
-                        "num_prefill_generators needs generator TP, DP and EP degrees of 1"
+                        "num_prefill_generators with this KV connector needs generator TP, DP "
+                        "and EP degrees of 1"
                     )
                 # TODO: test resets with pulled KV.
                 if self.generator.reset_kv_cache_on_model_state_dict_load:
@@ -660,6 +661,10 @@ class Controller(Configurable):
                 generator_parallelism=config.generator.parallelism,
                 num_generators=config.num_generators,
                 num_prefill_generators=num_prefill,
+                generators_see_each_other=(
+                    num_prefill > 0
+                    and config.generator.engine.prefill_decode_single_node
+                ),
             )
             self.trainer = await actor_system.spawn_trainer(
                 config.trainer,

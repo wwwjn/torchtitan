@@ -87,15 +87,18 @@ class MonarchActorSystem(ActorSystem):
         generator_parallelism: InferenceParallelismConfig,
         num_generators: int,
         num_prefill_generators: int = 0,
+        generators_see_each_other: bool = False,
     ) -> None:
         self._num_prefill_generators = num_prefill_generators
         generator_env = self._generator_env
+        # TODO: rewrite GPU visibility per host mesh for multi-host generators that see each
+        # other.
+        if generators_see_each_other and self._host_meshes is not None:
+            raise ValueError(
+                "generators that see each other's GPUs need single-node mode "
+                "(host_meshes=None)"
+            )
         if num_prefill_generators:
-            # TODO: rewrite GPU visibility per host mesh for multi-host prefill/decode.
-            if self._host_meshes is not None:
-                raise ValueError(
-                    "prefill generators need single-node mode (host_meshes=None)"
-                )
             # vLLM rejects KV transfer with expandable segments: they can remap the KV cache
             # pages the transport registered. The trainer keeps them.
             generator_env = {
@@ -109,7 +112,7 @@ class MonarchActorSystem(ActorSystem):
             host_meshes=self._host_meshes,
             num_generators=num_generators,
             generator_env=generator_env,
-            generators_see_each_other=num_prefill_generators > 0,
+            generators_see_each_other=generators_see_each_other,
         )
         # One process, so the router is a singleton and every caller reaches
         # it with `call_one`. It gets its own mesh rather than sharing the

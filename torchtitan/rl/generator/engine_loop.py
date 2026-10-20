@@ -248,9 +248,10 @@ class EngineLoop:
             self._queue.put(SessionReleaseMessage(session_ids=session_ids))
 
     def log_engine_stats(self, step: int) -> None:
-        """Log the engine's per-step stats, if it has any (rank 0)."""
+        """Log the engine's per-step stats, if it has any. Every rank calls it: the engine
+        decides which ranks log what."""
         engine = self._engine
-        if engine is not None and self._rank == 0:
+        if engine is not None:
             engine.log_stats(step)
 
     async def close(self) -> None:
@@ -391,10 +392,7 @@ class EngineLoop:
                 # new requests and avoid a prefill in between every engine decode step, which is inefficient.
                 with sl.log_trace_span("vllm_engine_step_burst"):
                     for _ in range(self._max_engine_steps_between_decisions):
-                        if not (
-                            self._engine.has_unfinished_requests()
-                            or self._engine.holds_kv_for_transfer()
-                        ):
+                        if not self._engine.has_work_to_step():
                             break
                         finished_requests = self._engine.step()
                         self._request_dispatcher.process_finished_requests(
@@ -448,6 +446,8 @@ class EngineLoop:
             messages = []
         elif self._engine.holds_kv_for_transfer():
             # Only KV a decode generator has yet to pull is left: poll for it, don't spin.
+            # Rank 0 sees only its own DP replica's held KV (an agreement would be a collective
+            # on rank 0 alone); other replicas free theirs in the next step burst.
             await asyncio.sleep(0.005)
             messages = []
         else:
