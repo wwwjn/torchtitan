@@ -13,7 +13,8 @@ from typing import Any, TYPE_CHECKING
 
 import torch
 from torch.distributed.checkpoint import HuggingFaceStorageReader
-from torch.distributed.tensor import DTensor
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Placement, Replicate
 
 from torchtitan.components.checkpointer.hf_storage import (
     HuggingFaceStorageReaderWithViews,
@@ -44,6 +45,10 @@ class KimiK3StateDictAdapter(MoEStateDictAdapter):
     ):
         super().__init__(model_config, hf_assets_path)
         self.kimi_config = model_config
+        # dt_bias DTensor layouts, restored after from_hf() unflattens dt_bias.
+        self._kda_parameter_layouts: dict[
+            str, tuple[DeviceMesh, tuple[Placement, ...]]
+        ] = {}
 
         self.from_hf_map = {
             # Language model.
@@ -238,6 +243,18 @@ class KimiK3StateDictAdapter(MoEStateDictAdapter):
                     unmapped.append(key)
                     continue
                 if abstract_key == "layers.{}.attention.dt_bias":
+                    if isinstance(value, DTensor):
+                        # Flattening changes tensor coordinates, and a head-dim
+                        # shard (96 heads on 64 ranks) can be uneven: replicate
+                        # first, then restore the layout in from_hf().
+                        self._kda_parameter_layouts[key] = (
+                            value.device_mesh,
+                            value.placements,
+                        )
+                        value = value.redistribute(
+                            placements=(Replicate(),) * value.device_mesh.ndim
+                        )
+                    # HF stores dt_bias flat; Titan uses [n_heads, head_dim].
                     value = value.reshape(-1)
                 hf_state_dict[hf_abstract_key.format(layer_num)] = value
                 continue
@@ -441,6 +458,13 @@ class KimiK3StateDictAdapter(MoEStateDictAdapter):
                         delta_config.n_heads,
                         delta_config.head_dim,
                     )
+                    layout = self._kda_parameter_layouts.get(
+                        new_abstract_key.format(layer_num)
+                    )
+                    if layout is not None:
+                        value = value.redistribute(
+                            device_mesh=layout[0], placements=layout[1]
+                        )
                 state_dict[new_abstract_key.format(layer_num)] = value
                 continue
 
