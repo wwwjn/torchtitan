@@ -272,13 +272,14 @@ class KimiK3StateDictAdapter(MoEStateDictAdapter):
 
         # The released HF model contain these unused layer-0 attn res parameters.
         # TT omits them, so synthesize deterministic, placeholders to preserve strict HF state-dict loading.
-        if self.kimi_config.layers[0].attention_res_norm is None:
-            norm_template_key = (
-                "language_model.model.layers.1.self_attention_res_norm.weight"
-            )
-            proj_template_key = (
-                "language_model.model.layers.1.self_attention_res_proj.weight"
-            )
+        # Layer 0's own MLP residual parameters give the shape, dtype and sharding;
+        # under pipeline parallelism only the stage that holds layer 0 adds them.
+        norm_template_key = "language_model.model.layers.0.mlp_res_norm.weight"
+        proj_template_key = "language_model.model.layers.0.mlp_res_proj.weight"
+        if (
+            self.kimi_config.layers[0].attention_res_norm is None
+            and norm_template_key in hf_state_dict
+        ):
             hf_state_dict[
                 "language_model.model.layers.0.self_attention_res_norm.weight"
             ] = torch.ones_like(hf_state_dict[norm_template_key])
