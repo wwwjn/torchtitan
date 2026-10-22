@@ -473,6 +473,32 @@ def test_verifiers_trace_attaches_env_replies_to_the_preceding_turn() -> None:
     ]
 
 
+def _time(start: float, end: float) -> SimpleNamespace:
+    return SimpleNamespace(start=start, end=end, duration=end - start)
+
+
+def test_verifiers_rollout_logs_count_overlapping_model_calls_once() -> None:
+    """An agent's title call beside its first turn must not hide its tool time."""
+    trace = SimpleNamespace(
+        id="trace-1",
+        task=SimpleNamespace(key="task-1"),
+        stop_condition="agent_completed",
+        errors=[],
+        timing=SimpleNamespace(
+            setup=SimpleNamespace(duration=1.0),
+            agent=_time(0.0, 120.0),
+            scoring=SimpleNamespace(duration=0.0),
+        ),
+        calls=[
+            SimpleNamespace(time=_time(0.0, 100.0), error=None),
+            SimpleNamespace(time=_time(10.0, 110.0), error=None),
+        ],
+    )
+    logs = verifiers_rollout_logs(SimpleNamespace(errors=[]), trace)
+    # Summing the calls gives 200 s, more than the 120 s span, so no tool time would show.
+    assert (logs["model_sec"], logs["harness_sec"]) == (110.0, 10.0)
+
+
 def test_verifiers_rollout_logs_keep_the_failure_reason(caplog) -> None:
     from verifiers.v1.trace import Error
 
@@ -492,15 +518,14 @@ def test_verifiers_rollout_logs_keep_the_failure_reason(caplog) -> None:
         ],
         timing=SimpleNamespace(
             setup=span(5.0),
-            agent=SimpleNamespace(
-                duration=7200.0, model=span(6900.0), harness=span(300.0)
-            ),
+            agent=_time(1000.0, 8200.0),
             scoring=span(0.0),
         ),
         calls=[
-            SimpleNamespace(time=span(1801.0), error=None),
+            SimpleNamespace(time=_time(1000.0, 2801.0), error=None),
             SimpleNamespace(
-                time=span(2.0), error=Error(type="APIError", message="502")
+                time=_time(2900.0, 2902.0),
+                error=Error(type="APIError", message="502"),
             ),
         ],
     )
@@ -516,8 +541,8 @@ def test_verifiers_rollout_logs_keep_the_failure_reason(caplog) -> None:
     ]
     assert (logs["agent_sec"], logs["model_sec"], logs["harness_sec"]) == (
         7200.0,
-        6900.0,
-        300.0,
+        1803.0,
+        5397.0,
     )
     assert logs["model_calls"] == 2
     assert logs["failed_model_calls"] == 1
@@ -757,7 +782,9 @@ def test_rollout_whose_first_prompt_does_not_fit_is_flagged(caplog) -> None:
         errors=[],
         timing=SimpleNamespace(
             setup=span,
-            agent=SimpleNamespace(duration=0.0, model=span, harness=span),
+            agent=SimpleNamespace(
+                start=0.0, end=0.0, duration=0.0, model=span, harness=span
+            ),
             scoring=span,
         ),
         calls=[],
