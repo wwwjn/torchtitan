@@ -10,7 +10,8 @@ import unittest
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor import distribute_tensor, DTensor, Replicate, Shard
+from torch.distributed.tensor.placement_types import _StridedShard
 from torch.testing._internal.distributed.fake_pg import FakeStore
 from torchtitan.components.checkpointer.base import ModelWrapper
 
@@ -272,6 +273,23 @@ class StackOrViewTest(unittest.TestCase):
         torch.testing.assert_close(stacked_w13, w13, rtol=0, atol=0)
         self.assertEqual(stacked_w13.data_ptr(), w13.data_ptr())
         self.assertEqual(stacked_w13.stride(), w13.stride())
+
+    def test_dtensor_slices_keep_strided_shard_placements(self) -> None:
+        # FSDP strided over TP on the same dim, as the generator shards w13 at TP 2.
+        dist.init_process_group("fake", store=FakeStore(), rank=0, world_size=4)
+        self.addCleanup(dist.destroy_process_group)
+        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("dp", "tp"))
+        placements = (_StridedShard(1, split_factor=2), Shard(1))
+        w13 = distribute_tensor(torch.zeros(2, 16, 4), mesh, placements)
+
+        stacked = stack_or_view(list(w13.unbind(0)), dim=0)
+
+        self.assertEqual(stacked.placements, placements)
+        self.assertEqual(
+            stacked.to_local().untyped_storage().data_ptr(),
+            w13.to_local().untyped_storage().data_ptr(),
+        )
+        w13.copy_(stacked)
 
     def test_independent_tensors_are_stacked(self) -> None:
         tensors = [torch.randn(3, 5) for _ in range(4)]

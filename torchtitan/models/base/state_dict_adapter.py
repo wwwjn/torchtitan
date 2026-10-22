@@ -46,16 +46,14 @@ def stack_or_view(tensors: list[torch.Tensor], dim: int) -> torch.Tensor:
         ):
             return torch.stack(tensors, dim=dim)
         local = stack_or_view([t._local_tensor for t in tensors], dim)
-        placements = [
-            (
-                _StridedShard(p.dim + 1, split_factor=p.split_factor)
-                if isinstance(p, _StridedShard)
-                else Shard(p.dim + 1)
-            )
-            if isinstance(p, Shard) and p.dim >= dim
-            else p
-            for p in first.placements
-        ]
+        placements = []
+        for p in first.placements:
+            # _StridedShard is not a Shard subclass in every PyTorch version.
+            if isinstance(p, _StridedShard) and p.dim >= dim:
+                p = _StridedShard(p.dim + 1, split_factor=p.split_factor)
+            elif isinstance(p, Shard) and p.dim >= dim:
+                p = Shard(p.dim + 1)
+            placements.append(p)
         shape = (*first.shape[:dim], len(tensors), *first.shape[dim:])
         return DTensor.from_local(
             local,
