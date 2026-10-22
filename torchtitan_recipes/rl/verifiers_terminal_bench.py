@@ -82,7 +82,13 @@ from verifiers.v1.tasksets.harbor import HarborEnvConfig
 
 from torchtitan_recipes.rl.model_configs import build_rl_model_configs
 
-_ENV_SERVER_WORKERS = 16
+# Rollouts per env-server worker; the worker count scales with the batch. A worker
+# runs its rollouts on one asyncio loop whose default executor has 32 threads, and
+# sandbox runtimes that block a thread while a rollout waits for a sandbox (e.g. a
+# pooled provider's acquire) leave none for the setup of rollouts that already hold
+# one once a worker carries more than 32. Setup then never finishes, and a pool that
+# bounds unfinished setups stops handing out sandboxes. 8 matches prime-rl.
+_MAX_ROLLOUTS_PER_ENV_SERVER_WORKER = 8
 
 
 def _terminal_bench_rollouter_config(
@@ -97,9 +103,10 @@ def _terminal_bench_rollouter_config(
 
     ``max_context_length`` is the generator's sequence length; the generation
     server caps each rollout at it. ``max_turns`` is the agent turn limit,
-    which Verifiers enforces. ``max_concurrent_rollouts`` sizes the env server;
-    set it to the number of rollouts the controller keeps in flight, or the
-    excess queues in the env server and the generators idle.
+    which Verifiers enforces. ``max_concurrent_rollouts`` sizes the env server
+    (up to ``_MAX_ROLLOUTS_PER_ENV_SERVER_WORKER`` rollouts per worker); set it to
+    the number of rollouts the controller keeps in flight, or the excess queues in
+    the env server and the generators idle.
     """
     if train_dataset == validation_dataset:
         raise ValueError(
@@ -107,6 +114,9 @@ def _terminal_bench_rollouter_config(
         )
 
     taskset_id = register_local_taskset_alias(TerminalTasksetConfig.__module__)
+    rollouts_per_env_server_worker = min(
+        _MAX_ROLLOUTS_PER_ENV_SERVER_WORKER, max_concurrent_rollouts
+    )
     return VerifiersRollouter.Config(
         training_dataloader=IterableRLDataLoader.Config(
             dataset=VerifiersTaskDataset.Config(
@@ -140,8 +150,12 @@ def _terminal_bench_rollouter_config(
                 ),
             ),
             serve=vf.ServeConfig(
-                pool=vf.StaticPoolConfig(num_workers=_ENV_SERVER_WORKERS),
-                max_concurrent=math.ceil(max_concurrent_rollouts / _ENV_SERVER_WORKERS),
+                pool=vf.StaticPoolConfig(
+                    num_workers=math.ceil(
+                        max_concurrent_rollouts / rollouts_per_env_server_worker
+                    )
+                ),
+                max_concurrent=rollouts_per_env_server_worker,
                 address="tcp://127.0.0.1:0",
             ),
         ),
