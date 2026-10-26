@@ -8,10 +8,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+import functools
 import logging
 import os
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -19,6 +22,7 @@ import torch
 import torch.distributed as dist
 import torchstore as ts
 from torchstore import RankRole
+from torchstore.client import LocalClient
 from torchstore.state_dict_utils import _state_dict_mapping_key, _state_dict_storage_key
 
 from torchtitan.components.checkpointer import CheckpointManager
@@ -31,23 +35,13 @@ from torchtitan.observability.logging import init_logger
 from torchtitan.rl.generator.dispatcher import RequestDispatcher
 from torchtitan.rl.generator.engine import GenerationEngine
 from torchtitan.rl.generator.engine_loop import EngineLoop, EngineLoopThread
+from torchtitan.rl.generator.model_state_dict_staging import group_fqns_by_module
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
 from torchtitan.rl.generator.types import EngineRequest, SamplingConfig
 from torchtitan.rl.rollout.types import Completion
 from torchtitan.rl.routing.intra_generator import IntraGeneratorRouter
 
 logger = logging.getLogger(__name__)
-
-
-def _group_fqns_by_module(fqns: Iterable[str]) -> list[list[str]]:
-    """Group state-dict FQNs by top-level module, one group per ``layers.<i>``,
-    in first-seen order."""
-    groups: dict[str, list[str]] = {}
-    for fqn in fqns:
-        parts = fqn.split(".", 2)
-        module = ".".join(parts[:2]) if parts[0] == "layers" else parts[0]
-        groups.setdefault(module, []).append(fqn)
-    return list(groups.values())
 
 
 def _default_engine_config() -> GenerationEngine.Config:
@@ -77,7 +71,10 @@ class Generator(Configurable):
 
     `prefetch_model_state_dict` runs on the caller's event loop and writes the staging buffers the
     engine loop reads on a load: the router awaits it before `load_model_state_dict`, and the
-    controller awaits that load before the trainer's next push, so the two never overlap.
+    controller awaits that load before the trainer's next push, so the two never overlap. When
+    the engine stages in chunks, the load fetches the chunks after the first two on the same
+    event loop, each into a buffer the load has finished reading (see
+    `_before_model_state_dict_chunk`).
 
     Args:
         config: Generator-specific configuration, including its model.
@@ -159,9 +156,9 @@ class Generator(Configurable):
         fetch_weights_per_module: bool = False
         """Fetch new weights from TorchStore with one request per top-level module
         (each ``layers.<i>``, then the remaining modules) instead of one request for
-        the whole state dict. A single request makes the trainer-side storage volumes
-        serve a rank's whole shard at once; per-module requests bound that burst for
-        big models."""
+        the whole state dict (or for each chunk, when the engine stages it in chunks).
+        A single request makes the trainer-side storage volumes serve a rank's whole
+        shard at once; per-module requests bound that burst for big models."""
 
         reset_kv_cache_on_model_state_dict_load: bool = False
         """Reset cached and running-request KV after each model state dict load.
@@ -292,6 +289,12 @@ class Generator(Configurable):
             )
 
         self._prefetched_model_state_dict = engine.prefetched_model_state_dict
+        self._model_state_dict_chunks = engine.prefetched_model_state_dict_chunks
+        # Set by each chunked prefetch for the load after it, which fetches chunks 2+ (see
+        # `_before_model_state_dict_chunk`).
+        self._fetch_event_loop: asyncio.AbstractEventLoop | None = None
+        self._fetch_chunk: Callable[[int], Coroutine[Any, Any, None]] | None = None
+        self._next_chunk_fetch: concurrent.futures.Future[None] | None = None
 
         broadcast_group = dist.new_group(backend="gloo")  # for LoopDecisions
         # The engine loop owns the engine from here on and releases it on exit, so this
@@ -312,6 +315,7 @@ class Generator(Configurable):
             broadcast_group=broadcast_group,
             max_engine_steps_between_decisions=config.max_engine_steps_between_decisions,
             reset_kv_cache_on_model_state_dict_load=config.reset_kv_cache_on_model_state_dict_load,
+            before_model_state_dict_chunk=self._before_model_state_dict_chunk,
         )
 
         logger.info("Generator initialized")
@@ -460,30 +464,78 @@ class Generator(Configurable):
 
     @sl.log_trace_span("prefetch_model_state_dict")
     async def prefetch_model_state_dict(self) -> None:
-        """Fetch weights into pinned CPU memory without interrupting generation."""
+        """Fetch weights into pinned CPU memory without interrupting generation.
+
+        When the engine stages the model state dict in chunks, this fetches the first two
+        and the load fetches the rest (see `_before_model_state_dict_chunk`).
+        """
         # Async RL uses a StorageVolume snapshot so generators do not read
         # live trainer GPU tensors while optimizer steps may be mutating them.
         key = "model_state_dict"
         buffers = self._prefetched_model_state_dict
-        if not self.config.fetch_weights_per_module:
+        chunks = self._model_state_dict_chunks
+        if len(chunks) == 1 and not self.config.fetch_weights_per_module:
             await ts.get_state_dict(
                 key, user_state_dict=buffers, strict=False, direct_rdma=False
             )
             return
         # Same reads as get_state_dict, written in place into the pinned buffers,
-        # but split into one request per module. Keys this rank has no buffer for
-        # are skipped.
+        # but split into one request per chunk, or per module.
         client = await ts.client()
         await client.get_layouts(buffers, key, strict=False)
         stored_fqns = await client.get(_state_dict_mapping_key(key))
-        for module_fqns in _group_fqns_by_module(stored_fqns):
-            batch = {
-                _state_dict_storage_key(key, fqn): buffers[fqn]
-                for fqn in module_fqns
-                if fqn in buffers
-            }
-            if batch:
-                await client.get_batch(batch)
+        self._fetch_event_loop = asyncio.get_running_loop()
+        self._fetch_chunk = functools.partial(
+            self._fetch_model_state_dict_chunk, client, stored_fqns
+        )
+        self._next_chunk_fetch = None
+        for index in range(min(2, len(chunks))):
+            await self._fetch_chunk(index)
+
+    async def _fetch_model_state_dict_chunk(
+        self, client: LocalClient, stored_fqns: Mapping[str, Any], index: int
+    ) -> None:
+        """Fetch chunk ``index`` of the model state dict into its pinned buffers. Keys this
+        rank has no buffer for, or the store does not hold, are skipped."""
+        key = "model_state_dict"
+        buffers = self._prefetched_model_state_dict
+        fqns = [
+            fqn for fqn in self._model_state_dict_chunks[index] if fqn in stored_fqns
+        ]
+        requests = (
+            group_fqns_by_module(fqns)
+            if self.config.fetch_weights_per_module
+            else [fqns]
+        )
+        for request_fqns in requests:
+            if request_fqns:
+                await client.get_batch(
+                    {
+                        _state_dict_storage_key(key, fqn): buffers[fqn]
+                        for fqn in request_fqns
+                    }
+                )
+
+    def _before_model_state_dict_chunk(self, index: int) -> None:
+        """ENGINE LOOP THREAD: called by the load before it copies chunk ``index >= 1``,
+        once chunk ``index - 1`` has been copied out.
+
+        Starts fetching chunk ``index + 1`` into the buffer chunk ``index - 1`` freed, then
+        waits until chunk ``index`` is staged: the prefetch staged chunks 0 and 1, and the
+        call for chunk ``index - 1`` started chunk ``index``. The fetches run on the
+        prefetch's event loop, where its TorchStore client lives. They read the same
+        version as the prefetch: the controller pushes the next version only after this
+        load.
+        """
+        staged = self._next_chunk_fetch
+        self._next_chunk_fetch = None
+        if index + 1 < len(self._model_state_dict_chunks):
+            self._next_chunk_fetch = asyncio.run_coroutine_threadsafe(
+                self._fetch_chunk(index + 1), self._fetch_event_loop
+            )
+        if staged is not None:
+            with sl.log_trace_span("wait_model_state_dict_chunk"):
+                staged.result()
 
     async def close(self) -> None:
         """Stop the engine loop, which releases the dispatcher and the engine on exit."""

@@ -45,6 +45,7 @@ from torchtitan.rl.generator.dispatcher import (
     RequestDispatcher,
 )
 from torchtitan.rl.generator.generator import Generator
+from torchtitan.rl.generator.model_state_dict_staging import ChunkedStateDictStaging
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
 from torchtitan.rl.generator.types import EngineRequest, SamplingConfig
 from torchtitan.rl.generator.vllm.config import VLLMCudaGraphConfig
@@ -165,6 +166,7 @@ def test_prefetch_model_state_dict_updates_staging_buffers_in_place():
         generator = Generator.__new__(Generator)
         generator.config = SimpleNamespace(fetch_weights_per_module=False)
         generator._prefetched_model_state_dict = staging_state_dict
+        generator._model_state_dict_chunks = [["weight"]]
 
         def fill_state_dict(*args, **kwargs):
             assert kwargs["user_state_dict"] is staging_state_dict
@@ -182,7 +184,8 @@ def test_prefetch_model_state_dict_updates_staging_buffers_in_place():
         get_state_dict = AsyncMock(side_effect=fill_state_dict)
         with patch.object(generator_module.ts, "get_state_dict", get_state_dict):
             await generator.prefetch_model_state_dict()
-        engine.load_prefetched_model_state_dict()
+        before_chunk = Mock()
+        engine.load_prefetched_model_state_dict(before_chunk)
 
         assert generator._prefetched_model_state_dict is staging_state_dict
         get_state_dict.assert_awaited_once_with(
@@ -191,27 +194,11 @@ def test_prefetch_model_state_dict_updates_staging_buffers_in_place():
             strict=False,
             direct_rdma=False,
         )
-        load_state_dict.assert_called_once_with({"weight": "fetched"})
+        load_state_dict.assert_called_once_with(
+            {"weight": "fetched"}, before_chunk=before_chunk
+        )
 
     asyncio.run(main())
-
-
-def test_group_fqns_by_module_splits_each_layer():
-    fqns = [
-        "tok_embeddings.weight",
-        "layers.0.attention.wq.weight",
-        "layers.0.moe.experts.w1",
-        "layers.1.attention.wq.weight",
-        "norm.weight",
-        "output.weight",
-    ]
-    assert generator_module._group_fqns_by_module(fqns) == [
-        ["tok_embeddings.weight"],
-        ["layers.0.attention.wq.weight", "layers.0.moe.experts.w1"],
-        ["layers.1.attention.wq.weight"],
-        ["norm.weight"],
-        ["output.weight"],
-    ]
 
 
 def test_prefetch_model_state_dict_per_module_fetches_in_place():
@@ -224,6 +211,7 @@ def test_prefetch_model_state_dict_per_module_fetches_in_place():
         generator = Generator.__new__(Generator)
         generator.config = SimpleNamespace(fetch_weights_per_module=True)
         generator._prefetched_model_state_dict = buffers
+        generator._model_state_dict_chunks = [list(buffers)]
 
         # The store also holds a key this rank has no buffer for.
         stored = {"layers.0.w": 0, "layers.1.w": 1, "norm.weight": 2, "other.w": 3}
@@ -252,6 +240,61 @@ def test_prefetch_model_state_dict_per_module_fetches_in_place():
         targets = [next(iter(request.values())) for request in requests]
         expected = [buffers[fqn] for fqn in ["layers.0.w", "layers.1.w", "norm.weight"]]
         assert all(t is e for t, e in zip(targets, expected, strict=True))
+
+    asyncio.run(main())
+
+
+def test_chunked_load_fetches_each_chunk_after_the_chunk_sharing_its_buffer_is_copied():
+    """The prefetch stages chunks 0 and 1; the load fetches chunk i + 1 once chunk i - 1
+    is copied out, so every chunk is intact when it is copied."""
+
+    async def main():
+        # One layer per chunk: 5 chunks rotating through 2 buffers.
+        state_dict = {f"layers.{i}.weight": torch.zeros(16) for i in range(5)}
+        staging = ChunkedStateDictStaging(
+            state_dict, max_pinned_bytes=2 * 64, pin_memory=False
+        )
+        assert len(staging.chunks) == 5
+        generator = Generator.__new__(Generator)
+        generator.config = SimpleNamespace(fetch_weights_per_module=False)
+        generator._prefetched_model_state_dict = staging.state_dict
+        generator._model_state_dict_chunks = staging.chunks
+        fetched_values = {fqn: float(i + 1) for i, fqn in enumerate(state_dict)}
+        fqns_by_storage_key = {
+            generator_module._state_dict_storage_key("model_state_dict", fqn): fqn
+            for fqn in state_dict
+        }
+        fetched: list[list[str]] = []
+
+        async def get_batch(batch):
+            await asyncio.sleep(0)
+            fqns = [fqns_by_storage_key[key] for key in batch]
+            for fqn, tensor in zip(fqns, batch.values(), strict=True):
+                tensor.fill_(fetched_values[fqn])
+            fetched.append(fqns)
+
+        client = SimpleNamespace(
+            get_layouts=AsyncMock(),
+            get=AsyncMock(return_value=dict.fromkeys(state_dict)),
+            get_batch=get_batch,
+        )
+        with patch.object(
+            generator_module.ts, "client", AsyncMock(return_value=client)
+        ):
+            await generator.prefetch_model_state_dict()
+        assert fetched == staging.chunks[:2]
+
+        def load() -> list[float]:
+            # Engine loop thread: copy each chunk out, as the model's load does.
+            copied = []
+            for index, fqns in enumerate(staging.chunks):
+                if index > 0:
+                    generator._before_model_state_dict_chunk(index)
+                copied += [staging.state_dict[fqn][0].item() for fqn in fqns]
+            return copied
+
+        assert await asyncio.to_thread(load) == list(fetched_values.values())
+        assert fetched == staging.chunks
 
     asyncio.run(main())
 
@@ -575,12 +618,13 @@ def test_prefetched_model_state_dict_is_the_buffers_the_load_reads():
     loaded = []
     engine = _vllm_engine(
         model=SimpleNamespace(
-            load_state_dict=loaded.append, _prefetched_model_state_dict=buffers
+            load_state_dict=lambda state_dict, before_chunk: loaded.append(state_dict),
+            _prefetched_model_state_dict=buffers,
         )
     )
 
     assert engine.prefetched_model_state_dict is buffers
-    engine.load_prefetched_model_state_dict()
+    engine.load_prefetched_model_state_dict(Mock())
     assert loaded == [buffers]
 
 
@@ -589,13 +633,14 @@ def test_reset_kv_cache_on_model_state_dict_load_controls_cache_reset(
     reset_kv_cache: bool,
 ):
     model = SimpleNamespace(
-        load_state_dict=lambda state_dict: None, _prefetched_model_state_dict={}
+        load_state_dict=lambda state_dict, before_chunk: None,
+        _prefetched_model_state_dict={},
     )
     engine = _vllm_engine(
         reset_kv_cache_on_model_state_dict_load=reset_kv_cache, model=model
     )
 
-    engine.load_prefetched_model_state_dict()
+    engine.load_prefetched_model_state_dict(Mock())
 
     expected = [((), {"reset_running_requests": True})] if reset_kv_cache else []
     assert cast(_FakeLLMEngine, engine._engine).reset_prefix_cache_calls == expected

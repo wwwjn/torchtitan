@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -113,6 +114,28 @@ class VLLMEngine(GenerationEngine):
         """Keep each multi-turn session's cached prefix on GPU between its turns (see
         `VLLMSessionKVHolder`). None: off."""
 
+        max_model_state_dict_staging_gib: float | None = None
+        """Upper bound on the pinned CPU memory per rank, in GiB, that stages new weights
+        on their way to the GPU. None (default): no bound.
+
+        Without a bound each rank pins a copy of its whole shard, which the generator fills
+        while it keeps generating, so a load only copies it to the GPU. A bound splits the
+        shard into chunks of consecutive top-level modules (each ``layers.<i>``, ...) that
+        take turns in two buffers: the generator fetches the first two chunks while it
+        generates and the rest during the load, each fetch overlapping the copy of the
+        chunk before it. Loads then pause generation until the rest is fetched, and
+        ``InterGeneratorRouter.Config.max_concurrent_prefetches`` does not bound those
+        fetches. The CUDA host allocator rounds a pinned block up to a power of two, so a
+        buffer holds the largest power of two in half the bound, and every top-level
+        module must fit in one."""
+
+        def __post_init__(self):
+            staging_gib = self.max_model_state_dict_staging_gib
+            if staging_gib is not None and staging_gib <= 0:
+                raise ValueError(
+                    f"max_model_state_dict_staging_gib must be positive, got {staging_gib}"
+                )
+
     def __init__(
         self,
         config: Config,
@@ -150,6 +173,11 @@ class VLLMEngine(GenerationEngine):
             checkpointer=checkpointer,
             dist_moe_runtime=dist_moe_runtime,
             batch_invariant=debug.batch_invariant,
+            max_model_state_dict_staging_bytes=(
+                None
+                if config.max_model_state_dict_staging_gib is None
+                else int(config.max_model_state_dict_staging_gib * 2**30)
+            ),
         )
         engine_args = self._build_engine_args(
             model,
@@ -193,6 +221,7 @@ class VLLMEngine(GenerationEngine):
         checkpointer: CheckpointManager.Config | None,
         dist_moe_runtime: DistMoeRuntime.Config | None,
         batch_invariant: bool,
+        max_model_state_dict_staging_bytes: int | None,
     ) -> None:
         """Process-wide vLLM setup before the engine build: register the TorchTitan model
         and config parser with vLLM, and select vLLM's model runner."""
@@ -201,6 +230,7 @@ class VLLMEngine(GenerationEngine):
             parallelism=parallelism,
             checkpointer_config=checkpointer,
             dist_moe_runtime=dist_moe_runtime,
+            max_model_state_dict_staging_bytes=max_model_state_dict_staging_bytes,
         )
         os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
         if batch_invariant:
@@ -352,6 +382,13 @@ class VLLMEngine(GenerationEngine):
         ``load_prefetched_model_state_dict``. Safe to fill from any thread while no load runs."""
         return self._get_model()._prefetched_model_state_dict
 
+    @property
+    def prefetched_model_state_dict_chunks(self) -> list[list[str]]:
+        staging = self._get_model()._model_state_dict_staging
+        if staging is None:
+            return super().prefetched_model_state_dict_chunks
+        return staging.chunks
+
     def add_requests(
         self, requests: list[EngineRequest]
     ) -> list[tuple[str, Exception]]:
@@ -419,11 +456,15 @@ class VLLMEngine(GenerationEngine):
                 self._session_kv_holder.num_evicted,
             )
 
-    def load_prefetched_model_state_dict(self) -> None:
+    def load_prefetched_model_state_dict(
+        self, before_chunk: Callable[[int], None]
+    ) -> None:
         """Copy the prefetched model state dict from pinned CPU memory into the model, and
         reset the KV cache when configured."""
         model = self._get_model()
-        model.load_state_dict(model._prefetched_model_state_dict)
+        model.load_state_dict(
+            model._prefetched_model_state_dict, before_chunk=before_chunk
+        )
         if self._reset_kv_cache_on_model_state_dict_load:
             # Always reset running requests too: the only reason to reset is a strict
             # recompute under the new weights. Keeping running requests' KV while hiding

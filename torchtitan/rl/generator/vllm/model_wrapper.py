@@ -14,7 +14,7 @@ TorchTitan models for vLLM.
 import copy
 import dataclasses
 from collections import defaultdict
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from typing import Any, cast
 
 import spmd_types as spmd
@@ -47,6 +47,10 @@ from torchtitan.models.common.attention.kda import KDA
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.dist_moe import DistMoeRoutedExperts, DistMoeRuntime
 from torchtitan.quantization._fsdp_tensor import _ShardedFSDPTensor
+from torchtitan.rl.generator.model_state_dict_staging import (
+    ChunkedStateDictStaging,
+    top_level_module,
+)
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
 
 
@@ -335,6 +339,7 @@ class VLLMModelWrapper(Module):
         vllm_config: VllmConfig,
         prefix: str = "",
         dist_moe_runtime: DistMoeRuntime.Config | None = None,
+        max_model_state_dict_staging_bytes: int | None = None,
     ):
         super().__init__()
 
@@ -420,10 +425,20 @@ class VLLMModelWrapper(Module):
         # is still sharded. Bind first so first-touch places them on the
         # NUMA node local to this rank's GPU.
         maybe_apply_numa_binding(torch.cuda.current_device(), "cuda")
-        with torch.device("cpu"):
-            self._prefetched_model_state_dict = _create_cpu_state_dict(
-                self.model.state_dict(), pin_memory=True
+        self._model_state_dict_staging: ChunkedStateDictStaging | None = None
+        if max_model_state_dict_staging_bytes is not None:
+            self._model_state_dict_staging = ChunkedStateDictStaging(
+                self.model.state_dict(),
+                max_pinned_bytes=max_model_state_dict_staging_bytes,
             )
+            self._prefetched_model_state_dict = (
+                self._model_state_dict_staging.state_dict
+            )
+        else:
+            with torch.device("cpu"):
+                self._prefetched_model_state_dict = _create_cpu_state_dict(
+                    self.model.state_dict(), pin_memory=True
+                )
 
         # Unshard the model here so vLLM performs its GPU memory profiling
         # based on the model's actual representation used during forward
@@ -431,7 +446,12 @@ class VLLMModelWrapper(Module):
             if isinstance(module, FSDPModule):
                 _unshard_and_free_sharded_params(module)
 
-    def load_state_dict(self, state_dict: Mapping[str, Any]):
+    def load_state_dict(
+        self,
+        state_dict: Mapping[str, Any],
+        *,
+        before_chunk: Callable[[int], None] | None = None,
+    ):
         """Copy new weights into `self.model`, allocating about one FSDP group's sharded buffers at a time.
 
         Each group is allocated right before its first module loads and freed right after its last:
@@ -455,6 +475,9 @@ class VLLMModelWrapper(Module):
         Args:
             state_dict: Keyed like `self.model.state_dict()`, not `self.state_dict()`
                 (no `model.` prefix), e.g. the generator's pinned CPU copy.
+            before_chunk: With chunked staging, called with ``i`` right before the first
+                module of staging chunk ``i >= 1`` loads; see
+                ``GenerationEngine.load_prefetched_model_state_dict``.
         """
         # One entry per FSDP group: fully_shard([norm, lm_head]) gives both modules one
         # state, and its sharded buffers are allocated and freed together.
@@ -476,10 +499,24 @@ class VLLMModelWrapper(Module):
                     lambda module, *args: _unshard_and_free_sharded_params(module)
                 )
             )
-        incompatible_keys = self.model.load_state_dict(state_dict, strict=True)
-        for handle in handles:
-            handle.remove()
-        return incompatible_keys
+        if self._model_state_dict_staging is not None:
+            # Without it, chunks 2+ would load whatever their buffers held last.
+            assert before_chunk is not None, "chunked staging needs before_chunk"
+            chunks = self._model_state_dict_staging.chunks
+            for index in range(1, len(chunks)):
+                first_module = self.model.get_submodule(
+                    top_level_module(chunks[index][0])
+                )
+                handles.append(
+                    first_module.register_load_state_dict_pre_hook(
+                        lambda *args, index=index: before_chunk(index)
+                    )
+                )
+        try:
+            return self.model.load_state_dict(state_dict, strict=True)
+        finally:
+            for handle in handles:
+                handle.remove()
 
     def set_num_valid_tokens(self, num_valid_tokens: int) -> None:
         """Publish how many of this step's tokens are real, for the padding mask.
