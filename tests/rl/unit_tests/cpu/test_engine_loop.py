@@ -111,6 +111,7 @@ def _bare_loop(
         broadcast_group=None,
         max_engine_steps_between_decisions=16,
         reset_kv_cache_on_model_state_dict_load=reset_kv_cache_on_model_state_dict_load,
+        before_model_state_dict_chunk=lambda index: None,
     )
     # An outstanding generation models in-flight work (possibly in a peer DP rank).
     if inflight:
@@ -597,7 +598,7 @@ class _FakeEngine:
         finished, self.running = self.running, []
         return [_finished(request_id) for request_id in finished]
 
-    def load_prefetched_model_state_dict(self) -> None:
+    def load_prefetched_model_state_dict(self, before_chunk) -> None:
         pass
 
     def shutdown(self) -> None:
@@ -889,6 +890,7 @@ def test_prefetch_reads_torchstore_on_the_actor_loop_while_the_engine_steps(
         generator.config = SimpleNamespace(fetch_weights_per_module=False)
         generator._engine_loop = engine_thread(engine)
         generator._prefetched_model_state_dict = {}
+        generator._model_state_dict_chunks = [[]]
         await generator.start_engine_loop()
         first = _generate(generator._engine_loop, "r0")
         assert await asyncio.to_thread(gate.entered.wait, _TIMEOUT_S)

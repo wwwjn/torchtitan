@@ -132,6 +132,7 @@ def register_to_vllm(
     parallelism: InferenceParallelismConfig,
     checkpointer_config: CheckpointManager.Config | None,
     dist_moe_runtime: DistMoeRuntime.Config | None = None,
+    max_model_state_dict_staging_bytes: int | None = None,
 ) -> None:
     """Register the TorchTitan model class and the TorchTitan config parser with vLLM.
 
@@ -164,6 +165,8 @@ def register_to_vllm(
             weights arrive from TorchStore.
         dist_moe_runtime: ``DistMoeRuntime.Config(inference=True)`` for models
             with Dist-MoE routed experts; ``None`` otherwise.
+        max_model_state_dict_staging_bytes: ``VLLMEngine.Config``'s
+            ``max_model_state_dict_staging_gib``, in bytes.
     """
     has_gdn = any(
         isinstance(layer.attention, GDN.Config) for layer in model_config.layers
@@ -201,6 +204,7 @@ def register_to_vllm(
                 vllm_config=vllm_config,
                 prefix=prefix,
                 dist_moe_runtime=dist_moe_runtime,
+                max_model_state_dict_staging_bytes=max_model_state_dict_staging_bytes,
             )
 
     VLLMModelFromSpec.__name__ = VLLM_MODEL_NAME

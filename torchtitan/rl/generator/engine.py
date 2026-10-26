@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import abc
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -68,7 +69,16 @@ class GenerationEngine(Configurable, abc.ABC):
     @abc.abstractmethod
     def prefetched_model_state_dict(self) -> dict[str, torch.Tensor]:
         """The pinned CPU buffers a model state dict is prefetched into, and loaded from by
-        ``load_prefetched_model_state_dict``. Safe to fill from any thread while no load runs."""
+        ``load_prefetched_model_state_dict``. Safe to fill from any thread while no load runs,
+        and during a load as its ``before_chunk`` allows."""
+
+    @property
+    def prefetched_model_state_dict_chunks(self) -> list[list[str]]:
+        """Keys of ``prefetched_model_state_dict`` in the chunks
+        ``load_prefetched_model_state_dict`` copies, in order. With one chunk (the
+        default), everything is staged before the load. With more, chunk ``i`` shares
+        memory with chunks ``i - 2`` and ``i + 2``, so the load stages them as it goes."""
+        return [list(self.prefetched_model_state_dict)]
 
     @abc.abstractmethod
     def add_requests(
@@ -86,9 +96,17 @@ class GenerationEngine(Configurable, abc.ABC):
         """Run one engine step and return the requests it finished."""
 
     @abc.abstractmethod
-    def load_prefetched_model_state_dict(self) -> None:
+    def load_prefetched_model_state_dict(
+        self, before_chunk: Callable[[int], None]
+    ) -> None:
         """Load the prefetched model state dict into the model, and reset the KV cache when
-        configured."""
+        configured.
+
+        Args:
+            before_chunk: Called with ``i`` before chunk ``i >= 1`` of
+                ``prefetched_model_state_dict_chunks`` is copied, once chunk ``i - 1`` has
+                been copied out; returns once chunk ``i`` is staged.
+        """
 
     @property
     def holds_session_kv(self) -> bool:

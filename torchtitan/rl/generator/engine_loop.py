@@ -113,7 +113,9 @@ class EngineLoop:
     NOT drain in-flight requests first ("hotswap"). This behavior can be changed in the
     inter-generator router, by blocking new requests until the engine is drained. The network
     transfer into the engine's pinned CPU buffers happens before this loop action, which then
-    performs the local CPU-to-GPU copy.
+    performs the local CPU-to-GPU copy. When the engine stages the model state dict in chunks,
+    the load also fetches all chunks after the first two, through
+    `before_model_state_dict_chunk`.
 
     Args:
         engine: The inference engine, built on the engine loop thread. The loop releases it on exit.
@@ -123,6 +125,8 @@ class EngineLoop:
         broadcast_group: All-ranks gloo group that `LoopDecision`s are broadcast over.
         max_engine_steps_between_decisions: ``Generator.Config``'s field.
         reset_kv_cache_on_model_state_dict_load: ``Generator.Config``'s field.
+        before_model_state_dict_chunk: Passed to the engine's
+            ``load_prefetched_model_state_dict`` as ``before_chunk``.
     """
 
     def __init__(
@@ -135,6 +139,7 @@ class EngineLoop:
         broadcast_group: dist.ProcessGroup,
         max_engine_steps_between_decisions: int,
         reset_kv_cache_on_model_state_dict_load: bool,
+        before_model_state_dict_chunk: Callable[[int], None],
     ):
         self._engine: GenerationEngine | None = engine
         self._event_loop = event_loop
@@ -145,6 +150,7 @@ class EngineLoop:
         self._reset_kv_cache_on_model_state_dict_load = (
             reset_kv_cache_on_model_state_dict_load
         )
+        self._before_model_state_dict_chunk = before_model_state_dict_chunk
         # Read once: the engine is released on exit, and only the engine loop thread uses it.
         self._holds_session_kv = engine.holds_session_kv
 
@@ -489,10 +495,12 @@ class EngineLoop:
         """ALL RANKS: collectively load the prefetched model state dict and bump the policy
         version.
 
-        The model state dict was already fetched into the engine's pinned CPU buffers; this
-        performs the local CPU-to-GPU copy.
+        The model state dict was already fetched into the engine's pinned CPU buffers (with
+        chunked staging, its first two chunks); this performs the local CPU-to-GPU copy.
         """
-        self._engine.load_prefetched_model_state_dict()
+        self._engine.load_prefetched_model_state_dict(
+            self._before_model_state_dict_chunk
+        )
         self.policy_version = version
         gc.collect()
 

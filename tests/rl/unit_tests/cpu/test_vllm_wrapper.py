@@ -21,6 +21,7 @@ from torchtitan.models.kimi_k2_7 import build_model_config as build_kimi_k2_7_co
 from torchtitan.models.kimi_k3 import build_model_config as build_kimi_k3_config
 from torchtitan.models.qwen3 import build_model_config as build_qwen3_config
 from torchtitan.models.qwen3_5 import build_model_config
+from torchtitan.rl.generator.model_state_dict_staging import ChunkedStateDictStaging
 from torchtitan.rl.generator.vllm import model_wrapper
 from torchtitan.rl.generator.vllm.attention import VLLMInnerAttention
 from torchtitan.rl.generator.vllm.model_wrapper import (
@@ -149,8 +150,11 @@ class _Wrapper:
 
     load_state_dict = VLLMModelWrapper.load_state_dict
 
-    def __init__(self, model: nn.Module):
+    def __init__(
+        self, model: nn.Module, staging: ChunkedStateDictStaging | None = None
+    ):
         self.model = model
+        self._model_state_dict_staging = staging
 
 
 def test_load_state_dict_allocates_one_fsdp_group_at_a_time(
@@ -222,6 +226,69 @@ def test_load_state_dict_allocates_one_fsdp_group_at_a_time(
             for p in group.fsdp_params
         )
         for name, param in model.named_parameters(remove_duplicate=False):
+            assert param.equal(new_state_dict[name].to_local()), name
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    "fetch_lands_when", ["started", "awaited"], ids=["fetch-early", "fetch-late"]
+)
+def test_chunked_load_copies_each_chunk_after_it_is_staged(
+    tmp_path, fetch_lands_when
+) -> None:
+    """Each staging chunk is staged before its first module loads, and its buffer is
+    refilled only after its last module has loaded, whether a chunk's fetch lands as soon
+    as it starts or only when the load waits for it."""
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'store'}", rank=0, world_size=1
+    )
+    try:
+        model = nn.Module()
+        model.tok_embeddings = nn.Embedding(32, 16)  # 2048 bytes
+        model.layers = nn.ModuleList(nn.Linear(16, 16) for _ in range(4))  # 1088 each
+        model.norm = nn.LayerNorm(16)  # 128 bytes, in the root's FSDP group
+        mesh = init_device_mesh("cpu", (1,))
+        for module in (model.tok_embeddings, *model.layers):
+            fully_shard(module, mesh=mesh)
+        fully_shard(model, mesh=mesh)
+        model.set_keep_unsharded_storage(True)
+        # 2048-byte buffers: [tok_embeddings] [layers.0] [layers.1] [layers.2] [layers.3, norm]
+        staging = ChunkedStateDictStaging(
+            model.state_dict(), max_pinned_bytes=4096, pin_memory=False
+        )
+        assert [fqns[0].rsplit(".", 1)[0] for fqns in staging.chunks] == [
+            "tok_embeddings",
+            *(f"layers.{i}" for i in range(4)),
+        ]
+        new_state_dict = {k: v.detach() + 1.0 for k, v in model.state_dict().items()}
+
+        def stage(index: int) -> None:
+            for fqn in staging.chunks[index]:
+                staging.state_dict[fqn].to_local().copy_(new_state_dict[fqn].to_local())
+
+        staged = []
+
+        def before_chunk(index: int) -> None:
+            # Starts fetching chunk index + 1 into chunk index - 1's buffer, then waits
+            # for chunk index (fetched from index 2 on).
+            staged.append(index)
+            if fetch_lands_when == "started" and index + 1 < len(staging.chunks):
+                stage(index + 1)
+            if fetch_lands_when == "awaited" and index >= 2:
+                stage(index)
+
+        stage(0)
+        stage(1)
+        for module in model.modules():  # as after the initial load
+            if isinstance(module, FSDPModule):
+                model_wrapper._unshard_and_free_sharded_params(module)
+        _Wrapper(model, staging).load_state_dict(
+            staging.state_dict, before_chunk=before_chunk
+        )
+
+        assert staged == [1, 2, 3, 4]
+        for name, param in model.named_parameters():
             assert param.equal(new_state_dict[name].to_local()), name
     finally:
         dist.destroy_process_group()
