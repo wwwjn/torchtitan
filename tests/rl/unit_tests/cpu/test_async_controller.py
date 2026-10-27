@@ -1375,6 +1375,30 @@ def test_close_cancels_a_running_pass_before_closing_the_rollouter() -> None:
     assert pass_done_at_rollouter_close == [True]
 
 
+@pytest.mark.parametrize("temperature", [0.0, 1.0])
+def test_validation_samples_at_the_configured_temperature(temperature) -> None:
+    controller = object.__new__(Controller)
+    controller.config = SimpleNamespace(
+        async_loop=SimpleNamespace(
+            validation=ValidationConfig(steps=1, temperature=temperature)
+        )
+    )
+    controller._rollouter = SimpleNamespace(
+        get_validation_samples=lambda steps: ["prompt"]
+    )
+    controller._sampling = SamplingConfig(temperature=0.8)
+    controller.rollout_recorder = Mock()
+    seen = []
+
+    async def collect(*, samples, sampling, step, overlapped):
+        seen.append(sampling)
+        return [], []
+
+    controller._collect_validation_rollouts = collect
+    asyncio.run(controller.validate(step=0))
+    assert [(s.temperature, s.top_p) for s in seen] == [(temperature, 1.0)]
+
+
 @pytest.mark.parametrize(
     "overlapped, key",
     [

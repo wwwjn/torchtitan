@@ -154,6 +154,11 @@ class ValidationConfig:
     freq: int | None = None
     """Also validate after every `freq` train steps; None validates only before and after."""
 
+    temperature: float = 0.0
+    """Sampling temperature of each validation rollout (n=1, top_p=1); 0.0 is greedy. Greedy agent
+    rollouts can fall into repetition loops once training lowers the entropy, so a pass that
+    should track learning samples at the training temperature."""
+
     overlap_training: bool = False
     """False: training waits for each pass, so all its rollouts sample one policy.
     True: the pre-training and periodic passes run beside training on the same generators:
@@ -167,6 +172,10 @@ class ValidationConfig:
             raise ValueError("validation steps must be -1 or non-negative")
         if self.freq is not None and self.freq <= 0:
             raise ValueError(f"validation freq must be positive, got {self.freq}")
+        if self.temperature < 0:
+            raise ValueError(
+                f"validation temperature must be non-negative, got {self.temperature}"
+            )
 
 
 @dataclass(kw_only=True, slots=True)
@@ -744,7 +753,7 @@ class Controller(Configurable):
         step: int,
         overlapped: bool = False,
     ) -> tuple[list[RolloutGroup], list[m.Metric]]:
-        """Sample held-out prompts, run each greedily (n=1) concurrently, and emit validation metrics."""
+        """Sample held-out prompts, run each once (n=1) concurrently, and emit validation metrics."""
         # TODO: group_size=1 (best-of-1) only. Support best-of-N.
         generate = self._make_generate_fn(metrics_prefix="validation_generator")
         release_session_fn = self._make_release_session_fn()
@@ -814,7 +823,7 @@ class Controller(Configurable):
 
     @sl.log_trace_span("validate")
     async def validate(self, *, step: int, overlapped: bool = False) -> list[m.Metric]:
-        """Run greedy validation on held-out prompts.
+        """Run validation on held-out prompts at `ValidationConfig.temperature` (default greedy).
 
         Args:
             step: Training step this validation pass belongs to (0 for the
@@ -834,10 +843,14 @@ class Controller(Configurable):
             return []
         # In a thread: building the dataset would otherwise block the training loops.
         samples = await asyncio.to_thread(self._rollouter.get_validation_samples, steps)
-        greedy = replace(self._sampling, temperature=0.0, top_p=1.0)
+        sampling = replace(
+            self._sampling,
+            temperature=self.config.async_loop.validation.temperature,
+            top_p=1.0,
+        )
 
         rollout_groups, validation_metrics = await self._collect_validation_rollouts(
-            samples=samples, sampling=greedy, step=step, overlapped=overlapped
+            samples=samples, sampling=sampling, step=step, overlapped=overlapped
         )
 
         self.rollout_recorder.record(is_validation=True, rollout_groups=rollout_groups)
