@@ -6,6 +6,7 @@
 
 import itertools
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -18,7 +19,10 @@ from torch.nn.attention import (
 )
 from torch.nn.attention.varlen import AuxRequest
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.attention.attention import get_attention_context
+from vllm.model_executor.layers.attention.attention import (
+    get_attention_context,
+    set_default_quant_scales,
+)
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionType
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
@@ -41,6 +45,123 @@ from torchtitan.observability.logging import warn_once
 from torchtitan.tools.utils import get_cuda_flash_attention_impl
 
 logger = logging.getLogger(__name__)
+
+
+# Opt-in with TORCHTITAN_VLLM_FA2_SPLIT_MIXED=1 (with TORCHTITAN_VLLM_FA2_KERNEL=1).
+_SPLIT_MIXED_BATCHES = os.environ.get("TORCHTITAN_VLLM_FA2_SPLIT_MIXED") == "1"
+# Decode requests per single-token FA2 call: FA2 splits the KV only while
+# batch * kv_heads stays below ~0.8 * 2 * SMs.
+_DECODE_CHUNK = 64
+# KV splits for single-token (decode) FA2 calls; 0 keeps FA2's heuristic, which sizes
+# splits for two CTAs per SM (one fits at head_dim 256) and stops splitting above
+# ~0.8 * 2 * SMs rows. A100, Qwen3.5-35B-A3B TP2, 5-45K keys, 16 splits: 32 decodes
+# 685 -> 621 us per layer; 25 decodes among 256 padded rows 1942 -> 504 us.
+# Opt-in with TORCHTITAN_VLLM_FA2_DECODE_SPLITS=16.
+_DECODE_NUM_SPLITS = int(os.environ.get("TORCHTITAN_VLLM_FA2_DECODE_SPLITS", "0"))
+
+
+# Opt-in with TORCHTITAN_TRTLLM_DECODE=1 (SM100 / SM103); the decodes of mixed batches too
+# with TORCHTITAN_TRTLLM_SPLIT_MIXED=1.
+_TRTLLM_DECODE = os.environ.get("TORCHTITAN_TRTLLM_DECODE") == "1"
+_TRTLLM_SPLIT_MIXED = (
+    _TRTLLM_DECODE and os.environ.get("TORCHTITAN_TRTLLM_SPLIT_MIXED") == "1"
+)
+# FA4-only alternative to TORCHTITAN_TRTLLM_SPLIT_MIXED: the decodes of mixed batches as a
+# separate FA4 call (_forward_mixed_fa4). Opt-in with TORCHTITAN_FA4_SPLIT_MIXED=1.
+_FA4_SPLIT_MIXED = (
+    not _TRTLLM_SPLIT_MIXED and os.environ.get("TORCHTITAN_FA4_SPLIT_MIXED") == "1"
+)
+# vLLM's FlashInfer workspace size; TRT-LLM-gen keeps zero-initialized split counters in it.
+_TRTLLM_WORKSPACE_BYTES = 256 << 20
+_trtllm_workspaces: dict[torch.device, torch.Tensor] = {}
+
+
+def _trtllm_workspace(device: torch.device) -> torch.Tensor:
+    workspace = _trtllm_workspaces.get(device)
+    if workspace is None:
+        workspace = torch.zeros(
+            _TRTLLM_WORKSPACE_BYTES, dtype=torch.uint8, device=device
+        )
+        _trtllm_workspaces[device] = workspace
+    return workspace
+
+
+def _trtllm_decode(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    output: torch.Tensor,
+    block_table: torch.Tensor,
+    seqused_k: torch.Tensor,
+    max_seqlen_k: int,
+    softmax_scale: float,
+) -> None:
+    """Causal paged decode attention (one query token per request) with FlashInfer's
+    TRT-LLM-gen kernel, which native vLLM and SGLang run on Blackwell.
+
+    On GB300 with vLLM's 128-token kernel pages, FA4 decode reads the KV at 5.1-5.8 TB/s
+    and TRT-LLM-gen at 5.9-6.4 TB/s (Qwen3.5, 8-128 requests at 2-90K keys): 666 -> 561 us
+    per layer for 32 requests at 35B-A3B. It reads the block table and sequence lengths on the GPU,
+    so CUDA graphs replay it without host-side planning. ``max_seqlen_k`` is the model's
+    max length while vLLM captures, as for its own FlashInfer backend.
+    """
+    from flashinfer.decode import trtllm_batch_decode_with_kv_cache
+
+    # Padded FULL-graph batches: one query row per (possibly padded) request.
+    batch = seqused_k.shape[0]
+    trtllm_batch_decode_with_kv_cache(
+        query[:batch],
+        (key_cache, value_cache),
+        _trtllm_workspace(query.device),
+        block_table,
+        seqused_k,
+        max_seqlen_k,
+        bmm1_scale=softmax_scale,
+        out=output[:batch],
+        kv_layout="NHD",
+    )
+
+
+def _fa2_single_token(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    output: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seqused_k: torch.Tensor,
+    block_table: torch.Tensor,
+    max_seqlen_k: int,
+    softmax_scale: float,
+) -> None:
+    """Causal paged FA2 on one query token per request, ``_DECODE_NUM_SPLITS`` KV splits.
+
+    vLLM's ``flash_attn_varlen_func`` rejects ``num_splits > 1`` for FA2; its op takes it
+    on the single-token path, where the query heads of a KV head become the query rows.
+    """
+    torch.ops._vllm_fa2_C.varlen_fwd(
+        query,
+        key_cache,
+        value_cache,
+        output,
+        cu_seqlens_q,
+        torch.empty_like(cu_seqlens_q),  # unused with seqused_k
+        seqused_k,
+        None,  # leftpad_k
+        block_table,
+        None,  # alibi_slopes
+        1,  # max_seqlen_q
+        max_seqlen_k,
+        0.0,  # dropout_p
+        softmax_scale,
+        False,  # zero_tensors
+        True,  # is_causal
+        -1,  # window_size_left
+        -1,  # window_size_right
+        0.0,  # softcap
+        False,  # return_softmax
+        _DECODE_NUM_SPLITS,
+        None,  # generator
+    )
 
 
 @register_backend(AttentionBackendEnum.CUSTOM)
@@ -72,6 +193,13 @@ class TorchTitanVarlenInnerAttentionBackend(FlashAttentionBackend):
             FlashAttentionMetadataBuilder
         ):
             _cudagraph_support = AttentionCGSupport.ALWAYS
+            # Decodes first, for the mixed-batch splits (_forward_mixed_fa2,
+            # _forward_mixed_trtllm, _forward_mixed_fa4).
+            reorder_batch_threshold = (
+                1
+                if _SPLIT_MIXED_BATCHES or _TRTLLM_SPLIT_MIXED or _FA4_SPLIT_MIXED
+                else None
+            )
 
         return TorchTitanVarlenInnerAttentionMetadataBuilder
 
@@ -126,6 +254,17 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
                 logger,
                 "FA3/FA4 not available on this CUDA architecture, falling back to FA2. ",
             )
+        # Hill-climb prototype (opt-in): on FA2 GPUs, torch's paged FA2 reads decode KV at
+        # ~330-550 GB/s (num_splits=1, 1024-token pages: 3.2 ms per Qwen3.5-27B TP2 layer at
+        # 32 x 16K) while vLLM's FA2 build reads it at ~1.4 TB/s (0.73 ms). Outside
+        # batch-invariant mode, run vLLM's kernel instead.
+        self.use_vllm_fa2 = (
+            flash_attention_impl is None
+            and os.environ.get("TORCHTITAN_VLLM_FA2_KERNEL") == "1"
+        )
+        if _TRTLLM_DECODE:
+            # Before CUDA graph capture, so the workspace is not a graph-pool allocation.
+            _trtllm_workspace(torch.device("cuda", torch.cuda.current_device()))
 
     # Based on vLLM's FlashAttentionImpl.forward():
     # https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/flash_attn.py
@@ -225,6 +364,136 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
 
         assert self.alibi_slopes is None, "Alibi slopes not supported yet."
 
+        if (
+            self.use_vllm_fa2
+            and self.out_transform is None
+            and not is_in_batch_invariant_mode()
+        ):
+            if max_seqlen_k < max_seqlen_q:
+                # vLLM's CUDA graph memory profiling runs dummy batches whose keys (length
+                # 1) are shorter than their queries, e.g. 8192 tokens over 48 requests at
+                # max_num_seqs=48, where paged causal FA2 reads out of bounds. Real batches
+                # never have that shape.
+                return output[:num_actual_tokens].zero_()
+            from vllm.vllm_flash_attn import flash_attn_varlen_func
+
+            if (
+                _SPLIT_MIXED_BATCHES
+                and max_seqlen_q > 1
+                and self.sliding_window == (-1, -1)
+                and cu_seqlens_q.shape[0] - 1 <= num_actual_tokens
+            ):
+                self._forward_mixed_fa2(
+                    flash_attn_varlen_func,
+                    query[:num_actual_tokens],
+                    key_cache,
+                    value_cache,
+                    output[:num_actual_tokens],
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                )
+                return output[:num_actual_tokens]
+            if (
+                _DECODE_NUM_SPLITS
+                and max_seqlen_q == 1
+                and self.sliding_window == (-1, -1)
+            ):
+                _fa2_single_token(
+                    query[:num_actual_tokens],
+                    key_cache,
+                    value_cache,
+                    output[:num_actual_tokens],
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_k,
+                    self.scale,
+                )
+                return output[:num_actual_tokens]
+            flash_attn_varlen_func(
+                q=query[:num_actual_tokens],
+                k=key_cache,
+                v=value_cache,
+                out=output[:num_actual_tokens],
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                seqused_k=seqused_k,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=self.scale,
+                causal=True,
+                window_size=(
+                    None
+                    if self.sliding_window == (-1, -1)
+                    else list(self.sliding_window)
+                ),
+                block_table=block_table,
+                fa_version=2,
+                num_splits=attn_metadata.max_num_splits,
+            )
+            return output[:num_actual_tokens]
+
+        if (
+            _TRTLLM_DECODE
+            and self.out_transform is None
+            and self.sliding_window == (-1, -1)
+            and not is_in_batch_invariant_mode()
+        ):
+            if max_seqlen_q == 1:
+                _trtllm_decode(
+                    query,
+                    key_cache,
+                    value_cache,
+                    output,
+                    block_table,
+                    seqused_k,
+                    max_seqlen_k,
+                    self.scale,
+                )
+                return output[:num_actual_tokens]
+            if (
+                _TRTLLM_SPLIT_MIXED
+                and max_seqlen_k >= max_seqlen_q
+                and cu_seqlens_q.shape[0] - 1 <= num_actual_tokens
+            ):
+                self._forward_mixed_trtllm(
+                    query[:num_actual_tokens],
+                    key_cache,
+                    value_cache,
+                    output[:num_actual_tokens],
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                )
+                return output[:num_actual_tokens]
+
+        if (
+            _FA4_SPLIT_MIXED
+            and max_seqlen_q > 1
+            and max_seqlen_k >= max_seqlen_q
+            and self.out_transform is None
+            and self.sliding_window == (-1, -1)
+            and not is_in_batch_invariant_mode()
+            and current_flash_attention_impl() == "FA4"
+            and cu_seqlens_q.shape[0] - 1 <= num_actual_tokens
+        ):
+            self._forward_mixed_fa4(
+                query[:num_actual_tokens],
+                key_cache,
+                value_cache,
+                output[:num_actual_tokens],
+                cu_seqlens_q,
+                seqused_k,
+                block_table,
+                max_seqlen_q,
+                max_seqlen_k,
+            )
+            return output[:num_actual_tokens]
+
         # FA3 and FA4 infer key lengths from block_table + seqused_k for paged
         # KV. FA4 explicitly rejects page_table together with cu_seqlens_k.
         # FA2 requires cu_seqlens_k to be explicitly set.
@@ -277,6 +546,179 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         output[:num_actual_tokens].copy_(out)
         return output[:num_actual_tokens]
 
+    def _forward_mixed_trtllm(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        seqused_k: torch.Tensor,
+        block_table: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+    ) -> None:
+        """A batch with prefills: the decodes on TRT-LLM-gen, the prefills on FA4.
+
+        One FA4 call over a mixed batch plans for the prefill's query length: it splits no
+        decode request's KV, and at head_dim 256 with a query-head group that does not divide
+        128 (Qwen3.5-27B: 6) it also drops PackGQA and reads each decode request's KV once per
+        query head. Attention was 49 ms of an 85 ms mixed step for Qwen3.5-27B on GB300, vs
+        9 ms for SGLang. As ``_forward_mixed_fa2`` does for
+        FA2: the runner orders decodes first, so request ``i < num_decodes`` owns token
+        ``i``; TRT-LLM-gen runs rows ``[0, num_requests)`` with the prefills' key lengths
+        masked to zero, then FA4 runs the prefills with the decodes as empty queries.
+        All on-device, so FULL CUDA graphs keep one graph per token count.
+        """
+        is_decode = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]) == 1
+        # Prefill requests get no keys here; their rows are rewritten below.
+        _trtllm_decode(
+            query,
+            key_cache,
+            value_cache,
+            output,
+            block_table,
+            torch.where(is_decode, seqused_k, 0),
+            max_seqlen_k,
+            self.scale,
+        )
+        torch.nn.attention.varlen.varlen_attn_out(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            torch.maximum(cu_seqlens_q, is_decode.sum(dtype=cu_seqlens_q.dtype)),
+            None,
+            max_seqlen_q,
+            max_seqlen_k,
+            scale=self.scale,
+            window_size=(-1, 0),
+            block_table=block_table,
+            seqused_k=seqused_k,
+            enable_gqa=self.enable_gqa,
+        )
+
+    def _forward_mixed_fa4(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        seqused_k: torch.Tensor,
+        block_table: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+    ) -> None:
+        """A batch with prefills as two FA4 calls: the decodes, then the prefills.
+
+        ``_forward_mixed_trtllm`` without TRT-LLM-gen. The decode call passes
+        ``max_seqlen_q=1``, so FA4 keeps PackGQA and its split-KV heuristic for the decode
+        requests; the prefills see no queries in it, as the decodes see none in the prefill
+        call. The runner orders decodes first.
+        """
+        num_decodes = ((cu_seqlens_q[1:] - cu_seqlens_q[:-1]) == 1).sum(
+            dtype=cu_seqlens_q.dtype
+        )
+        for cu_seqlens, max_q in (
+            (torch.minimum(cu_seqlens_q, num_decodes), 1),
+            (torch.maximum(cu_seqlens_q, num_decodes), max_seqlen_q),
+        ):
+            torch.nn.attention.varlen.varlen_attn_out(
+                output,
+                query,
+                key_cache,
+                value_cache,
+                cu_seqlens,
+                None,
+                max_q,
+                max_seqlen_k,
+                scale=self.scale,
+                window_size=(-1, 0),
+                block_table=block_table,
+                seqused_k=seqused_k,
+                enable_gqa=self.enable_gqa,
+            )
+
+    def _forward_mixed_fa2(
+        self,
+        flash_attn_varlen_func,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        seqused_k: torch.Tensor,
+        block_table: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+    ) -> None:
+        """Attention for a batch that mixes decodes and prefills, as two kinds of FA2 calls.
+
+        FA2 splits the KV only on its single-token path and rejects ``num_splits > 1`` for
+        paged varlen with longer queries. One call over a mixed batch therefore reads each
+        decode request's whole KV with one CTA per head: 3.3-5.4 ms per layer for
+        Qwen3.5-35B-A3B TP2 replay steps on A100 vs 0.38 ms for a pure-decode step. The
+        runner orders decodes first (``reorder_batch_threshold = 1``), so request
+        ``i < num_decodes`` owns token ``i``. Decodes run on the single-token path, in one
+        call with ``_DECODE_NUM_SPLITS`` or else in chunks small enough for FA2's split
+        heuristic (it does not split a batch of 256 padded requests). The prefills then run
+        with the decodes as empty queries. A100, 31 decodes at 15-45K keys plus a 512-token
+        prefill: 6.5 -> 2.3 ms per layer.
+        """
+        num_reqs = cu_seqlens_q.shape[0] - 1
+        is_decode = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]) == 1
+        decode_seqused_k = torch.where(is_decode, seqused_k, 0)
+        one_token_each = torch.arange(
+            num_reqs + 1, dtype=cu_seqlens_q.dtype, device=cu_seqlens_q.device
+        )
+        # Prefill requests get no keys here; their rows are rewritten below.
+        if _DECODE_NUM_SPLITS:
+            _fa2_single_token(
+                query[:num_reqs],
+                key_cache,
+                value_cache,
+                output[:num_reqs],
+                one_token_each,
+                decode_seqused_k,
+                block_table,
+                max_seqlen_k,
+                self.scale,
+            )
+        else:
+            for start in range(0, num_reqs, _DECODE_CHUNK):
+                end = min(start + _DECODE_CHUNK, num_reqs)
+                flash_attn_varlen_func(
+                    q=query[start:end],
+                    k=key_cache,
+                    v=value_cache,
+                    out=output[start:end],
+                    cu_seqlens_q=one_token_each[: end - start + 1],
+                    max_seqlen_q=1,
+                    seqused_k=decode_seqused_k[start:end],
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    block_table=block_table[start:end],
+                    fa_version=2,
+                    num_splits=0,
+                )
+        flash_attn_varlen_func(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=output,
+            cu_seqlens_q=torch.maximum(cu_seqlens_q, is_decode.sum(dtype=torch.int32)),
+            max_seqlen_q=max_seqlen_q,
+            seqused_k=seqused_k,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=self.scale,
+            causal=True,
+            block_table=block_table,
+            fa_version=2,
+            num_splits=0,
+        )
+
 
 class TorchTitanVarlenInnerAttentionDiffKVImpl(TorchTitanVarlenInnerAttentionImpl):
     """PyTorch varlen implementation using vLLM's unequal K/V cache writer."""
@@ -296,6 +738,11 @@ class TorchTitanVarlenInnerAttentionDiffKVImpl(TorchTitanVarlenInnerAttentionImp
 
 class _VLLMAttention(Attention, Module):
     """vLLM attention that participates in the TorchTitan Module protocol."""
+
+    def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
+        # Set vLLM's 4 attention scales to their default 1.0 now: the model is built empty,
+        # and the weight-sync buffers copy these values before vLLM sets them.
+        set_default_quant_scales(self)
 
 
 class VLLMInnerAttention(InnerAttention):

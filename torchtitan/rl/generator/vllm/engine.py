@@ -53,6 +53,9 @@ from torchtitan.tools.utils import has_cuda_capability
 logger = logging.getLogger(__name__)
 
 
+_SCHEDULING_POLICY = os.environ.get("TORCHTITAN_SCHEDULING_POLICY", "priority")
+
+
 def add_extra_vllm_engine_args(
     engine_kwargs: dict[str, Any], extra_engine_args: dict[str, Any]
 ) -> None:
@@ -67,6 +70,8 @@ def add_extra_vllm_engine_args(
         "max_num_batched_tokens": "Generator.Config.max_num_batched_tokens",
         "compilation_config": "VLLMEngine.Config.cuda_graph",
         "seed": "Generator.Config.debug.seed",
+        # vLLM builds the same connector from it, without `CPUKVOffload.attach`.
+        "kv_offloading_size": "VLLMEngine.Config.session_kv_holder.cpu_kv_offload",
     }
     owned_keys = sorted(
         extra_engine_args.keys()
@@ -110,8 +115,7 @@ class VLLMEngine(GenerationEngine):
         """Optional logger instantiated on TP rank 0 to export vLLM metrics."""
 
         session_kv_holder: VLLMSessionKVHolder.Config | None = None
-        """Keep each multi-turn session's cached prefix on GPU between its turns (see
-        `VLLMSessionKVHolder`). None: off."""
+        """Keep each multi-turn session's KV between turns (see `VLLMSessionKVHolder`). None: off."""
 
     def __init__(
         self,
@@ -137,13 +141,31 @@ class VLLMEngine(GenerationEngine):
             and reset_kv_cache_on_model_state_dict_load
         ):
             raise ValueError(
-                "session_kv_holder needs reset_kv_cache_on_model_state_dict_load=False: vLLM "
-                "cannot reset the prefix cache while blocks are held"
+                "session_kv_holder needs reset_kv_cache_on_model_state_dict_load=False (so no "
+                "batch_invariant): vLLM cannot reset the prefix cache while blocks are held or "
+                "a request waits on a CPU load"
+            )
+        # Offload needs DP=1: vLLM pins a separate size_gib region per DP rank, and each rank
+        # fills only its own share, so DP=2 pins 2 x size_gib and leaves half of it unused.
+        # TODO: one vLLM engine_id per generator (e.g. f"torchtitan-{MASTER_ADDR}-{MASTER_PORT}")
+        # would let its DP ranks on one host share one region. Not done: relies on vLLM's private memory layout.
+        if (
+            config.session_kv_holder is not None
+            and config.session_kv_holder.cpu_kv_offload is not None
+            and parallelism.data_parallel_degree > 1
+        ):
+            raise ValueError(
+                "session_kv_holder.cpu_kv_offload needs parallelism.data_parallel_degree=1, got "
+                f"{parallelism.data_parallel_degree}: vLLM pins size_gib once per DP rank"
             )
         self.config = config
         self._reset_kv_cache_on_model_state_dict_load = (
             reset_kv_cache_on_model_state_dict_load
         )
+        # Each rank tracks the same sessions in its scheduler; only the engine loop thread touches them.
+        self._session_kv_holder: VLLMSessionKVHolder | None = None
+        if config.session_kv_holder is not None:
+            self._session_kv_holder = config.session_kv_holder.build()
         self._setup(
             model,
             parallelism=parallelism,
@@ -177,13 +199,8 @@ class VLLMEngine(GenerationEngine):
         self._engine = LLMEngine.from_engine_args(
             engine_args, stat_loggers=stat_loggers
         )
-        # Every rank holds the same blocks in its own scheduler; only the engine loop thread
-        # touches them.
-        self._session_kv_holder: VLLMSessionKVHolder | None = None
-        if config.session_kv_holder is not None:
-            self._session_kv_holder = config.session_kv_holder.build(
-                scheduler=self._engine.engine_core.engine_core.scheduler
-            )
+        if self._session_kv_holder is not None:
+            self._session_kv_holder.attach(self._engine)
 
     @staticmethod
     def _setup(
@@ -285,7 +302,8 @@ class VLLMEngine(GenerationEngine):
         # Smaller `priority` runs first and is preempted last; we pass `EngineRequest.group_id`
         # (-1 for all validation), so older groups have higher priority (see its docstring).
         # TODO: validation (priority -1) runs before training. Revisit once validation overlaps training.
-        engine_kwargs["scheduling_policy"] = "priority"
+        # TORCHTITAN_SCHEDULING_POLICY=fcfs (benchmark A/B): vLLM's default policy, priority 0.
+        engine_kwargs["scheduling_policy"] = _SCHEDULING_POLICY
         # Which sliding-window / Mamba (GDN) state blocks are hashed into the prefix
         # cache; full-attention groups hash every block regardless.
         # - 0 (vLLM default since v0.29): only the replay boundary (the last block
@@ -295,12 +313,17 @@ class VLLMEngine(GenerationEngine):
         #   previous completion, cannot reuse anything past the previous prompt.
         # - None: every full block boundary, as before v0.29. Blocks are still freed
         #   when the request moves past them; hashed ones stay reusable until evicted.
-        engine_kwargs["prefix_cache_retention_interval"] = None
-        # FA2 requires block_size to be a multiple of 256
-        if not has_cuda_capability(9, 0):
+        # TORCHTITAN_PREFIX_CACHE_RETENTION=<tokens> (benchmark A/B; 0 = vLLM's default).
+        retention = os.environ.get("TORCHTITAN_PREFIX_CACHE_RETENTION")
+        engine_kwargs["prefix_cache_retention_interval"] = int(retention) if retention else None
+        # torch's FA2 requires block_size to be a multiple of 256; vLLM's FA2 kernel
+        # (TORCHTITAN_VLLM_FA2_KERNEL=1) takes multiples of 16, so hybrid models get
+        # vLLM's smaller GDN-aligned pages (Qwen3.5-27B TP2: 784 vs 1024 tokens).
+        if not has_cuda_capability(9, 0) and os.environ.get("TORCHTITAN_VLLM_FA2_KERNEL") != "1":
             engine_kwargs["block_size"] = 256
         vllm_compilation_config = self.config.cuda_graph.get_vllm_compilation_config(
             max_num_seqs=max_num_seqs,
+            max_model_len=model.max_context_length,
             max_num_batched_tokens=max_num_batched_tokens,
             expert_sequence_parallel_size=parallelism.expert_sequence_parallel_size,
             enable_sequence_parallel=parallelism.enable_sequence_parallel,
@@ -309,6 +332,8 @@ class VLLMEngine(GenerationEngine):
             engine_kwargs["compilation_config"] = vllm_compilation_config
         if seed is not None:
             engine_kwargs["seed"] = seed
+        if self._session_kv_holder is not None:
+            engine_kwargs.update(self._session_kv_holder.engine_kwargs())
         add_extra_vllm_engine_args(engine_kwargs, self.config.extra_engine_args)
         return EngineArgs(**engine_kwargs)
 
@@ -376,13 +401,13 @@ class VLLMEngine(GenerationEngine):
                 # prompts); the high-level entry stays resilient to vLLM internals vs
                 # vllm.inputs.tokens_input.
                 [engine_input] = self._engine.renderer.render_cmpl([prompt])
-                # vLLM appends a random suffix to the id; the scheduler knows only that one.
+                # vLLM appends a suffix to the id; the scheduler knows only that one.
                 internal_request_id = self._engine.add_request(
                     request_id=request.request_id,
                     prompt=engine_input,
                     params=_build_sampling_params(request.sampling),
                     arrival_time=request.arrival_time,
-                    priority=max(request.group_id, -1),
+                    priority=max(request.group_id, -1) if _SCHEDULING_POLICY == "priority" else 0,
                 )
                 if self._session_kv_holder is not None:
                     self._session_kv_holder.track(
@@ -411,7 +436,10 @@ class VLLMEngine(GenerationEngine):
             self._session_kv_holder.release(session_ids, group_ids)
 
     def log_stats(self, step: int) -> None:
-        if self._session_kv_holder is not None:
+        if (
+            self._session_kv_holder is not None
+            and self.config.session_kv_holder.hold_gpu_blocks
+        ):
             logger.info(
                 "Session KV at step %d: %d sessions held, %d evicted so far",
                 step,

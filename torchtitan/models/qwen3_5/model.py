@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 from typing import Any, cast
 
 import spmd_types as spmd
@@ -94,6 +95,23 @@ class OffsetRMSNorm(Module):
         variance = input.pow(2).mean(-1, keepdim=True)
         input = input * torch.rsqrt(variance + self.eps)
         return ((1.0 + self.weight.float()) * input).to(input_dtype)
+
+
+# Inference only: fold each residual add into the OffsetRMSNorm that reads it (one kernel instead
+# of an add and a norm), as vLLM's fused add + RMSNorm does. Opt-in with
+# TORCHTITAN_FUSED_ADD_RMSNORM=1; training keeps the separate ops (remat regions, backward).
+_FUSED_ADD_RMSNORM = os.environ.get("TORCHTITAN_FUSED_ADD_RMSNORM") == "1"
+
+
+@local_compile("fused_add_offset_rmsnorm", batch_invariant=False, recompile_limit=16)
+def _add_offset_rmsnorm(
+    x: torch.Tensor, h: torch.Tensor, weight: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(x + h, OffsetRMSNorm(x + h))`` in one compiled region."""
+    summed = x + h
+    normed = summed.float()
+    normed = normed * torch.rsqrt(normed.pow(2).mean(-1, keepdim=True) + eps)
+    return summed, ((1.0 + weight.float()) * normed).to(summed.dtype)
 
 
 class Qwen35Attention(Attention):
@@ -272,6 +290,44 @@ class Qwen35TransformerBlock(TransformerBlock):
             torch.add, self.remat_region_name("ffn_residual"), recompute=False
         )(x_TD, h_TD)
 
+    def forward_fused_residual(
+        self,
+        x_TD: torch.Tensor,
+        pending_TD: torch.Tensor | None,
+        attention_metadata: AttentionMetadata | None,
+        positions: torch.Tensor | None = None,
+        *,
+        padding_mask: torch.Tensor | None = None,
+        aux_loss_denominator: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``forward`` for inference with the residual adds folded into the norms.
+
+        ``pending_TD`` is the previous block's FFN output, not yet added to ``x_TD``. Returns
+        ``(x_TD, ffn_out_TD)``: the caller adds ``ffn_out_TD`` in the next norm.
+        """
+        if pending_TD is None:
+            h_TD = self.attention_norm(x_TD)
+        else:
+            x_TD, h_TD = _add_offset_rmsnorm(
+                x_TD, pending_TD, self.attention_norm.weight, self.attention_norm.eps
+            )
+        if self.full_attn:
+            h_TD = self.attention(h_TD, attention_metadata, positions)
+        else:
+            h_TD = self.attention(h_TD, attention_metadata)
+        x_TD, h_TD = _add_offset_rmsnorm(
+            x_TD, h_TD, self.ffn_norm.weight, self.ffn_norm.eps
+        )
+        if isinstance(self.feed_forward, MoE):
+            h_TD = self.feed_forward(
+                h_TD,
+                padding_mask_T=padding_mask,
+                aux_loss_denominator=aux_loss_denominator,
+            )
+        else:
+            h_TD = self.feed_forward(h_TD)
+        return x_TD, h_TD
+
 
 class Qwen35Model(MultimodalModel):
     state_dict_adapter_cls = Qwen35StateDictAdapter
@@ -340,6 +396,7 @@ class Qwen35Model(MultimodalModel):
                 "fused_binary_activation",
                 "gated_rmsnorm",
                 "offset_rmsnorm",
+                "fused_add_offset_rmsnorm",
                 "partial_rope",
                 "shared_expert_gate",
                 "fp32_to_bf16_split",
@@ -678,6 +735,19 @@ class Qwen35Model(MultimodalModel):
 
         return inputs_embeds
 
+    def _use_fused_residual(self) -> bool:
+        """The fused residual path: opted in, inference, and OffsetRMSNorm everywhere it fuses."""
+        if not _FUSED_ADD_RMSNORM or torch.is_grad_enabled() or self.layers is None:
+            return False
+        if not isinstance(self.norm, OffsetRMSNorm):
+            return False
+        return all(
+            isinstance(layer, Qwen35TransformerBlock)
+            and isinstance(layer.attention_norm, OffsetRMSNorm)
+            and isinstance(layer.ffn_norm, OffsetRMSNorm)
+            for layer in self.layers.values()
+        )
+
     def forward(  # pyrefly: ignore [bad-override]
         self,
         tokens: torch.Tensor,
@@ -723,20 +793,37 @@ class Qwen35Model(MultimodalModel):
             aux_loss_denominator = (
                 None if aux_loss_denominators is None else aux_loss_denominators[0]
             )
-        for layer in self.layers.values():
-            x = layer(
-                x,
-                (
-                    attention_metadata.get(type(layer.attention.inner_attention))
-                    if attention_metadata is not None
-                    else None
-                ),
-                positions,
-                padding_mask=padding_mask,
-                aux_loss_denominator=aux_loss_denominator,
-            )
+        if self._use_fused_residual():
+            pending = None
+            for layer in self.layers.values():
+                x, pending = layer.forward_fused_residual(
+                    x,
+                    pending,
+                    (
+                        attention_metadata.get(type(layer.attention.inner_attention))
+                        if attention_metadata is not None
+                        else None
+                    ),
+                    positions,
+                    padding_mask=padding_mask,
+                    aux_loss_denominator=aux_loss_denominator,
+                )
+            x = _add_offset_rmsnorm(x, pending, self.norm.weight, self.norm.eps)[1]
+        else:
+            for layer in self.layers.values():
+                x = layer(
+                    x,
+                    (
+                        attention_metadata.get(type(layer.attention.inner_attention))
+                        if attention_metadata is not None
+                        else None
+                    ),
+                    positions,
+                    padding_mask=padding_mask,
+                    aux_loss_denominator=aux_loss_denominator,
+                )
 
-        x = self.norm(x) if self.norm is not None else x
+            x = self.norm(x) if self.norm is not None else x
         if self._skip_lm_head:
             return x
         return self.lm_head(x) if self.lm_head is not None else x

@@ -19,6 +19,7 @@ Batch-invariant execution has two additional requirements:
 Decode and prefill update the paged convolution and SSM state pools directly.
 """
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -55,6 +56,37 @@ from torchtitan.rl.generator.vllm.linear_attention import (
     TorchTitanLinearAttentionMetadata,
     unique_state_shape,
 )
+from torchtitan.rl.generator.vllm.sm80_gdn_delta_h import maybe_use_sm80_delta_h
+
+
+def _maybe_tune_sm80_delta_h() -> None:
+    """Launch Attention Gym's GDN state recurrence with 8 warps before Hopper.
+
+    Its fixed 4 warps spill the [K, BV] fp32 state on SM80 (no wgmma): 21.4 ms per
+    layer for one 8192-token Qwen3.5-27B TP2 prefill vs 1.5 ms with 8 warps (A100).
+    TODO: move into attn_gym's launch config; opt-in (TORCHTITAN_SM80_GDN_TUNE=1) here.
+    """
+    if os.environ.get("TORCHTITAN_SM80_GDN_TUNE") != "1":
+        return
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() >= (9, 0):
+        return
+    import attn_gym.linear.kda.fwd.triton.chunk_delta_h as delta_h
+
+    # The persistent variant (packed batches of many short sequences, and graphs captured
+    # with such a batch) spills the same way: 2.9 ms per layer in a 35B-A3B prefill.
+    for name in ("chunk_delta_h_kernel", "chunk_delta_h_persistent_kernel"):
+        kernel = getattr(delta_h, name)
+        if not isinstance(kernel, _EightWarpLauncher):
+            setattr(delta_h, name, _EightWarpLauncher(kernel))
+
+
+class _EightWarpLauncher:
+    def __init__(self, kernel):
+        self.kernel = kernel
+
+    def __getitem__(self, grid):
+        launch = self.kernel[grid]
+        return lambda *args, **kwargs: launch(*args, **(kwargs | {"num_warps": 8}))
 
 
 class VLLMInnerGDN(InnerAttention, MambaBase):
@@ -78,6 +110,8 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
 
     def __init__(self, config: Config) -> None:
         super().__init__()
+        _maybe_tune_sm80_delta_h()
+        maybe_use_sm80_delta_h()
 
         vllm_config = get_current_vllm_config()
         self.tensor_parallel_size = vllm_config.parallel_config.tensor_parallel_size
@@ -370,16 +404,26 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         key_head_dim: int,
         value_head_dim: int,
         attention_metadata: LinearAttentionMetadata | None,
+        fused_conv_weight: torch.Tensor | None = None,
+        mixed_qkv_TC: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run the flattened vLLM cache operation on rank-local tensors."""
+        """Run the flattened vLLM cache operation on rank-local tensors.
+
+        ``fused_conv_weight`` is the concatenated q / k / v conv weight and
+        ``mixed_qkv_TC`` the q / k / v columns of one fused projection, both from
+        ``fused_gdn_proj``, so neither is concatenated on every call.
+        """
         del attention_metadata
         assert key_head_dim == self.head_k_dim
         assert value_head_dim == self.head_v_dim
-        mixed_qkv_TC = torch.cat([query_TC, key_TC, value_TC], dim=-1)
-        conv_weight_CW = torch.cat(
-            [conv_q_weight_C1W, conv_k_weight_C1W, conv_v_weight_C1W],
-            dim=0,
-        ).squeeze(1)
+        if mixed_qkv_TC is None:
+            mixed_qkv_TC = torch.cat([query_TC, key_TC, value_TC], dim=-1)
+        if fused_conv_weight is None:
+            fused_conv_weight = torch.cat(
+                [conv_q_weight_C1W, conv_k_weight_C1W, conv_v_weight_C1W],
+                dim=0,
+            )
+        conv_weight_CW = fused_conv_weight.squeeze(1)
         assert conv_weight_CW.shape[-1] == self.conv_kernel_size
 
         num_tokens = mixed_qkv_TC.shape[0]

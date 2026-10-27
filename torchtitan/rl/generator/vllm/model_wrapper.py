@@ -13,6 +13,7 @@ TorchTitan models for vLLM.
 
 import copy
 import dataclasses
+import os
 from collections import defaultdict
 from collections.abc import Iterator, Mapping
 from typing import Any, cast
@@ -22,7 +23,7 @@ import spmd_types as spmd
 import torch
 import torch.distributed as dist
 from torch.distributed._composable.fsdp import FSDPModule
-from torch.distributed._state_dict_utils import _create_cpu_state_dict
+from torch.distributed._state_dict_utils import _copy_state_dict
 from torch.distributed.tensor import DTensor, Replicate
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
@@ -46,8 +47,12 @@ from torchtitan.models.common.attention.gdn import GDN
 from torchtitan.models.common.attention.kda import KDA
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.dist_moe import DistMoeRoutedExperts, DistMoeRuntime
+from torchtitan.models.common.moe.moe import MoE
+from torchtitan.models.common.moe.token_dispatcher import AllToAllTokenDispatcher
 from torchtitan.quantization._fsdp_tensor import _ShardedFSDPTensor
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
+from torchtitan.rl.generator.vllm import fused_gdn_proj, tp_experts, trtllm_moe
+from torchtitan.rl.generator.vllm.sm80_grouped_mm import maybe_use_sm80_grouped_mm
 
 
 logger = init_logger(__name__)
@@ -189,12 +194,13 @@ def _patch_vllm_all_reduce() -> None:
        wait_tensor is a no-op. Only sum reductions are routed (the custom AR is
        sum-only); others fall through to the original op. No-op at world_size 1.
 
-    2. Force the custom AR onto its registered=False path so CUDA graph capture
-       works. registered=True records graph buffers and calls cudaIpcGetMemHandle
-       on them, which fails for the expandable_segments (VMM) memory the RL stack
-       enables for Monarch RDMA. registered=False reduces via the init-time
-       buffer_ptrs (raw cudaMalloc, IPC-able), records no graph buffers, at the
-       cost of one staging copy per AR.
+    2. With expandable segments on, force the custom AR onto its registered=False
+       path so CUDA graph capture works. registered=True records graph buffers and
+       calls cudaIpcGetMemHandle on them, which fails for the expandable_segments
+       (VMM) memory the RL stack enables for Monarch RDMA. registered=False reduces
+       via the init-time buffer_ptrs (raw cudaMalloc, IPC-able), records no graph
+       buffers, at the cost of one staging copy per AR (~2 us at decode sizes on
+       A100). With them off (CPU KV offload requires that), vLLM's own path runs.
 
     3. (spmd_types) spmd.redistribute issues an in-place dist.all_reduce that the
        point-1 swap can't see, so route its Partial -> {R,I} reduce straight to
@@ -228,10 +234,13 @@ def _patch_vllm_all_reduce() -> None:
 
     c10d.all_reduce = all_reduce
 
-    # Force vLLM's TP custom AR onto its registered=False path (see point 2).
+    # Force vLLM's TP custom AR onto its registered=False path (see point 2). Without
+    # expandable segments (e.g. under CPU KV offload, which requires them off) the graph
+    # buffers are IPC-able and vLLM's registered path skips the staging copy.
     device_comm = get_tp_group().device_communicator
     ca = getattr(device_comm, "ca_comm", None) if device_comm is not None else None
-    if ca is not None and not ca.disabled:
+    registered = not _expandable_segments_enabled()
+    if ca is not None and not ca.disabled and not registered:
 
         def custom_all_reduce(input):
             # Mirrors CustomAllreduce.custom_all_reduce but always registered=False.
@@ -253,7 +262,10 @@ def _patch_vllm_all_reduce() -> None:
     _tp_all_reduce_patched = True
     logger.info(
         "vllm_allreduce: routed _c10d_functional.all_reduce (TP sum reductions) "
-        "through vLLM custom all-reduce (registered=False, CUDA-graph-safe)"
+        "through vLLM custom all-reduce (%s)",
+        "registered graph buffers"
+        if registered
+        else "registered=False, CUDA-graph-safe",
     )
 
 
@@ -339,6 +351,11 @@ class VLLMModelWrapper(Module):
         super().__init__()
 
         assert vllm_config is not None, "vllm_config is required"
+        maybe_use_sm80_grouped_mm()
+        # Before parallelize: it binds each module's forward into its SPMD wrapper.
+        fused_gdn_proj.maybe_patch_gdn_forward()
+        tp_experts.maybe_patch_grouped_linear()
+        trtllm_moe.maybe_patch_routed_experts()
 
         # Translate the inference parallelism into torchtitan's full
         # ParallelismConfig that ParallelismContext and model.parallelize consume.
@@ -377,6 +394,8 @@ class VLLMModelWrapper(Module):
             activation_remat=None,
             dump_folder="",
         )
+        _maybe_keep_moe_tokens_replicated(self.model, parallelism)
+        _maybe_overlap_shared_experts(self.model)
 
         # Preserve compute storage addresses across model state dict loads for CUDA graphs
         assert isinstance(self.model, FSDPModule)
@@ -420,16 +439,31 @@ class VLLMModelWrapper(Module):
         # is still sharded. Bind first so first-touch places them on the
         # NUMA node local to this rank's GPU.
         maybe_apply_numa_binding(torch.cuda.current_device(), "cuda")
-        with torch.device("cpu"):
-            self._prefetched_model_state_dict = _create_cpu_state_dict(
-                self.model.state_dict(), pin_memory=True
-            )
+        # TODO: allocating pinned memory still takes 13.7 s per 64 GiB (H100 host). A background
+        # thread during vLLM's memory profiling would hide it, but joining it before graph capture
+        # needs a model-runner hook.
+        model_state_dict = self.model.state_dict()
+        self._prefetched_model_state_dict = {
+            name: _empty_pinned_like(tensor)
+            for name, tensor in model_state_dict.items()
+        }
+        # A sync overwrites only the keys the trainer publishes; the rest
+        # (e.g. vLLM's attention scales) keep the values copied here.
+        _copy_state_dict(model_state_dict, self._prefetched_model_state_dict)
+
+        # vLLM switches torch to 1 CPU thread when warmup ends, and torch.compile recompiles
+        # a region when the thread count changes. Switch now, before the first compile.
+        _torch_utils.set_torch_threads_for_runtime()
 
         # Unshard the model here so vLLM performs its GPU memory profiling
         # based on the model's actual representation used during forward
         for module in self.model.modules():
             if isinstance(module, FSDPModule):
                 _unshard_and_free_sharded_params(module)
+        fused_gdn_proj.refresh(self.model)
+        with self.parallelism_context.activate_spmd():
+            tp_experts.relayout(self.model)
+            trtllm_moe.relayout(self.model)
 
     def load_state_dict(self, state_dict: Mapping[str, Any]):
         """Copy new weights into `self.model`, allocating about one FSDP group's sharded buffers at a time.
@@ -479,6 +513,11 @@ class VLLMModelWrapper(Module):
         incompatible_keys = self.model.load_state_dict(state_dict, strict=True)
         for handle in handles:
             handle.remove()
+        # In place, so CUDA graphs keep reading the same fused buffers.
+        fused_gdn_proj.refresh(self.model)
+        with self.parallelism_context.activate_spmd():
+            tp_experts.relayout(self.model)
+            trtllm_moe.relayout(self.model)
         return incompatible_keys
 
     def set_num_valid_tokens(self, num_valid_tokens: int) -> None:
@@ -743,3 +782,72 @@ class VLLMModelWrapper(Module):
 
         # Return the names of all loaded parameters so vLLM knows they were handled
         return loaded_param_names
+
+
+def _expandable_segments_enabled() -> bool:
+    """Whether the CUDA caching allocator was configured with expandable segments."""
+    return any(
+        "expandable_segments:True" in os.environ.get(name, "")
+        for name in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF")
+    )
+
+
+def _maybe_keep_moe_tokens_replicated(
+    model: torch.nn.Module, parallelism: InferenceParallelismConfig
+) -> None:
+    """Drop the EP all-gather from MoE decode graphs where every EP rank holds all tokens.
+
+    With EP = TP, one generator (DP = 1) and no sequence parallelism, the EP group is the
+    TP group and each rank enters the MoE with the same tokens. The capture dispatch
+    otherwise splits them across ranks, all-gathers them back and reduces the expert sums
+    in fp32 before the MoE output's all-reduce: three collectives per layer (~56 us on
+    A100 at 32 tokens, Qwen3.5-35B-A3B EP2) where one bf16 all-reduce suffices. Not
+    bitwise: each rank's expert sum rounds to bf16 before the cross-rank sum.
+    Opt-in with ``TORCHTITAN_EP_REPLICATED_TOKENS=1``.
+    """
+    if os.environ.get("TORCHTITAN_EP_REPLICATED_TOKENS") != "1":
+        return
+    if not (
+        parallelism.expert_parallel_degree == parallelism.tensor_parallel_degree > 1
+        and parallelism.data_parallel_degree == 1
+        and not parallelism.enable_sequence_parallel
+    ):
+        return
+    for module in model.modules():
+        # Subclasses (TorchAO) do not support the capture dispatch.
+        if type(module) is AllToAllTokenDispatcher:
+            module.replicated_tokens = True
+
+
+def _maybe_overlap_shared_experts(model: torch.nn.Module) -> None:
+    """Capture MoE shared experts on one side stream in decode graphs (see MoE.forward).
+
+    Native SGLang does the same for Qwen MoE models.
+    Opt-in with ``TORCHTITAN_MOE_SHARED_EXPERT_STREAM=1``.
+    """
+    if os.environ.get("TORCHTITAN_MOE_SHARED_EXPERT_STREAM") != "1":
+        return
+    stream = torch.cuda.Stream()
+    for module in model.modules():
+        if isinstance(module, MoE) and module.shared_experts is not None:
+            module.shared_experts_stream = stream
+
+
+def _empty_pinned_like(tensor: torch.Tensor) -> torch.Tensor:
+    """Allocate an uninitialized pinned CPU tensor for `tensor`'s local shard, with its DTensor spec.
+
+    Example:
+        DTensor [4096, 1024], Shard(0) over 2 ranks, on GPU
+        -> DTensor [4096, 1024], Shard(0); local tensor: pinned CPU [2048, 1024]
+        tensor [64] on GPU -> pinned CPU tensor [64]
+    """
+    if not isinstance(tensor, DTensor):
+        return torch.empty(
+            tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True
+        )
+    local_tensor = tensor._local_tensor
+    buffer = torch.empty(
+        local_tensor.shape, dtype=local_tensor.dtype, device="cpu", pin_memory=True
+    )
+    # Not DTensor.from_local: it moves the local tensor to the mesh's device (GPU).
+    return DTensor(buffer, tensor._spec, requires_grad=False)

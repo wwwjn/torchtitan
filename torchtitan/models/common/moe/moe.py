@@ -33,6 +33,7 @@ from torchtitan.models.base.module import Module
 from torchtitan.models.common.activation import (
     BinaryActivationFn,
     Sigmoid,
+    Softmax,
     SwiGLU,
     UnaryActivationFn,
 )
@@ -41,7 +42,8 @@ from torchtitan.models.common.feed_forward import DenseFeedForward, FeedForward
 from torchtitan.models.common.linear import GroupedLinear
 from torchtitan.models.common.linear.hi_mid_lo_linear import HiMidLoLinear
 
-from .token_dispatcher import LocalTokenDispatcher
+from . import fused_routing
+from .token_dispatcher import AllToAllTokenDispatcher, LocalTokenDispatcher
 
 # Shape suffix legend
 # (https://medium.com/@NoamShazeer/shape-suffixes-good-coding-style-f836e72e24fd):
@@ -133,11 +135,13 @@ class RoutedExperts(Module):
             topk_expert_ids_TK,
             num_local_tokens_per_expert_E,
         )
-        offsets_E = torch.cumsum(
-            num_global_tokens_per_local_expert_e,
-            dim=0,
-            dtype=torch.int32,
-        )
+        offsets_E = getattr(metadata, "offsets_e", None)
+        if offsets_E is None:
+            offsets_E = torch.cumsum(
+                num_global_tokens_per_local_expert_e,
+                dim=0,
+                dtype=torch.int32,
+            )
 
         with maybe_set_sparse_mesh():
             # w13 and w2 declare their own remat regions (<fqn>.grouped_mm).
@@ -145,6 +149,10 @@ class RoutedExperts(Module):
             remat.recompute_needs_tensor(routed_input_RD)
             gate_up_R2F = self.w13(routed_input_RD.bfloat16(), offsets_E)
             remat.recompute_needs_tensor(gate_up_R2F)
+            # Rows vary with routing under EP>1 and across CUDA-graph capture sizes (constant
+            # at EP=1), and a capture cannot compile a new shape: compile for any row count.
+            if not torch.compiler.is_compiling():
+                torch._dynamo.maybe_mark_dynamic(gate_up_R2F, 0)
             hidden_RF = self.activation_fn(gate_up_R2F, offsets=offsets_E)
             routed_output_RD = self.w2(hidden_RF, offsets_E)
             # A real dtype cast and the output postprocess read the w2 output with
@@ -249,6 +257,40 @@ class TokenChoiceTopKRouter(Module):
             topk_expert_ids_TK: Expert indices ``(T, K)``.
             routing_map_TE: One-hot boolean routing map ``(T, E)``.
         """
+        if (
+            fused_routing.ENABLED
+            and type(self) is TokenChoiceTopKRouter
+            and not self.training
+            and not torch.is_grad_enabled()
+            and x_TD.is_cuda
+            and isinstance(self.score_func, Softmax)
+            and expert_bias_E is None
+            and padding_mask_T is None
+            and not router_kwargs
+            and self.top_k & (self.top_k - 1) == 0
+        ):
+            # Inference: the third output is tokens per expert, not the routing map.
+            routing_args = (
+                self.top_k,
+                self.route_norm,
+                self.route_norm_epsilon,
+                self.route_scale,
+            )
+            weight_ED = self.gate.weight
+            if (
+                type(self.gate) is HiMidLoLinear
+                and self.gate.bias is None
+                and x_TD.dtype == weight_ED.dtype == torch.bfloat16
+                and fused_routing.gate_split_k(
+                    x_TD.shape[0], weight_ED.shape[0], x_TD.shape[1]
+                )
+                is not None
+            ):
+                # The gate's bf16 GEMM with fp32 accumulation, fused into the routing.
+                return fused_routing.gate_softmax_topk(
+                    x_TD.contiguous(), weight_ED, *routing_args
+                )
+            return fused_routing.softmax_topk(self.gate(x_TD), *routing_args)
         # HiMidLoLinear returns FP32, so configured scoring runs in FP32.
         gate_TE = self.gate(x_TD)
         # The scoring function reads the router gate projection output with bare ops.
@@ -757,6 +799,9 @@ class MoE(FeedForward):
         self.shared_experts = (
             config.shared_experts.build() if config.shared_experts is not None else None
         )
+        # Set by the generator: in decode CUDA graphs the shared experts run on this side
+        # stream, overlapping the router and routed experts.
+        self.shared_experts_stream: torch.cuda.Stream | None = None
 
         # define fields for auxiliary-loss-free load balancing (https://arxiv.org/abs/2408.15664)
         # NOTE: router.tokens_per_expert_E is accumulated in the router forward pass.
@@ -795,10 +840,19 @@ class MoE(FeedForward):
         runs in a local SPMD region. When EP internally sequence-shards tokens
         across TP, the caller must provide a TP-divisible token count.
         """
-        (
-            routed_x_TD,
-            routed_padding_mask_T,
-        ) = self._maybe_shard_routed_branch_inputs_across_tp(x_TD, padding_mask_T)
+        shared_stream = self._overlap_shared_experts_stream(x_TD)
+        if shared_stream is not None:
+            shared_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(shared_stream):
+                shared_TD = self.shared_experts(x_TD)
+        replicated = self._routed_tokens_replicated(x_TD)
+        if replicated:
+            routed_x_TD, routed_padding_mask_T = x_TD, padding_mask_T
+        else:
+            (
+                routed_x_TD,
+                routed_padding_mask_T,
+            ) = self._maybe_shard_routed_branch_inputs_across_tp(x_TD, padding_mask_T)
 
         # topk scores and expert IDs have shape (T, K); the routing map (T, E)
         # marks the experts each token is routed to (built inside the router).
@@ -809,7 +863,10 @@ class MoE(FeedForward):
             aux_loss_denominator=aux_loss_denominator,
             **router_kwargs,
         )
-        num_local_tokens_per_expert_E = routing_map_TE.sum(dim=0)
+        # The fused inference router returns tokens per expert directly.
+        num_local_tokens_per_expert_E = (
+            routing_map_TE if routing_map_TE.dim() == 1 else routing_map_TE.sum(dim=0)
+        )
 
         out_TD = self.routed_experts(
             routed_x_TD,
@@ -818,15 +875,49 @@ class MoE(FeedForward):
             num_local_tokens_per_expert_E,
             padding_mask_T=routed_padding_mask_T,
         )
-        out_TD = self._maybe_zero_fill_routed_output_to_tp_partial(out_TD)
+        if not replicated:
+            out_TD = self._maybe_zero_fill_routed_output_to_tp_partial(out_TD)
         if self.shared_experts is not None:
-            shared_TD = self.shared_experts(x_TD)
+            if shared_stream is None:
+                shared_TD = self.shared_experts(x_TD)
+            else:
+                torch.cuda.current_stream().wait_stream(shared_stream)
             # Trailing add, always saved: it saves nothing for backward, so replay skips
             # it and its inputs need no persisting, matching checkpoint early stop.
             out_TD = remat.region(
                 torch.add, self.remat_region_name("shared_add"), recompute=False
             )(out_TD, shared_TD)
         return self._maybe_all_reduce_moe_output_across_tp(out_TD)
+
+    def _overlap_shared_experts_stream(
+        self, x_TD: torch.Tensor
+    ) -> torch.cuda.Stream | None:
+        """The side stream for the shared experts while vLLM captures a decode graph.
+
+        At decode sizes the shared experts (~25 us per layer for Qwen3.5-35B-A3B on A100)
+        and the routed branch each leave the GPU partly idle; captured on a side stream
+        that forks from and joins the capture stream, they become a parallel graph branch.
+        """
+        if (
+            self.shared_experts is None
+            or self.shared_experts_stream is None
+            or not AllToAllTokenDispatcher.captures_inference(x_TD)
+        ):
+            return None
+        return self.shared_experts_stream
+
+    def _routed_tokens_replicated(self, x_TD: torch.Tensor) -> bool:
+        """Whether the routed branch keeps all T tokens on every TP rank.
+
+        In generator decode graphs where the EP group is the TP group, each rank already
+        holds every token: the dispatcher skips the all-gather that would undo the
+        ``Shard(0)`` split, and its combine returns the routed output as a TP partial, so
+        the MoE output's TP all-reduce is the layer's only collective.
+        """
+        dispatcher = getattr(self.routed_experts, "token_dispatcher", None)
+        if not getattr(dispatcher, "replicated_tokens", False):
+            return False
+        return dispatcher.experts_tp_sharded or dispatcher.captures_inference(x_TD)
 
     def _maybe_shard_routed_branch_inputs_across_tp(
         self,

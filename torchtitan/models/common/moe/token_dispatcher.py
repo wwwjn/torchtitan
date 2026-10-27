@@ -13,8 +13,10 @@ import torch_remat as remat
 from torch.distributed._functional_collectives import all_to_all_single
 from torch.distributed.tensor import DeviceMesh
 
+from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
 from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh, spmd_sparse_mesh
 from torchtitan.models.base.module import Module
+from torchtitan.models.common.moe import all_gather_combine, fused_routing
 from torchtitan.ops.scatter_add import deterministic_scatter_add
 
 
@@ -36,6 +38,20 @@ class AllToAllDispatchMetadata(LocalDispatchMetadata):
     output_splits: list[int]
 
 
+@dataclass(frozen=True, kw_only=True)
+class AllGatherDispatchMetadata:
+    """Metadata from the all-gather dispatch, for combine()."""
+
+    sorted_positions_GK: torch.Tensor  # noqa: N815
+    """Where each gathered token's pick sits among the expert-sorted rows."""
+    topk_scores_GK: torch.Tensor  # noqa: N815
+    """Router scores of the gathered tokens."""
+    is_local_GK: torch.Tensor  # noqa: N815
+    """True where the pick is one of this rank's experts."""
+    offsets_e: torch.Tensor | None = None
+    """int32 cumulative tokens per local expert, when the dispatch already computed them."""
+
+
 class LocalTokenDispatcher(Module):
     """Token dispatcher for EP=1. Handles local token reordering only.
 
@@ -55,6 +71,25 @@ class LocalTokenDispatcher(Module):
 
     def init_buffer(self) -> None:
         """Initialize backend communication buffers, if any."""
+
+    def _fused_inference(self, topk_expert_ids_TK: torch.Tensor) -> bool:
+        """Generator decode sizes with ``TORCHTITAN_FUSED_ROUTING=1`` and
+        ``TORCHTITAN_FUSED_AG_COMBINE=1``: the all-gather path's fused dispatch and combine
+        kernels, with every expert local. Qwen3.5-35B-A3B decode on GB300: ~70 us of sort,
+        scatter-add and index checks per layer. Not bitwise with the scatter-add, which
+        sums in bf16.
+        """
+        return (
+            # The EP dispatcher falls back to this local path at EP=1.
+            type(self) in (LocalTokenDispatcher, AllToAllTokenDispatcher)
+            and fused_routing.ENABLED
+            and all_gather_combine.ENABLED
+            and not torch.is_grad_enabled()
+            and topk_expert_ids_TK.is_cuda
+            and topk_expert_ids_TK.numel() <= fused_routing.MAX_DISPATCH_ROWS
+            and topk_expert_ids_TK.stride(1) == 1
+            and not is_in_batch_invariant_mode()
+        )
 
     def _local_reorder(
         self,
@@ -121,6 +156,22 @@ class LocalTokenDispatcher(Module):
                 src=spmd.P,
                 dst={"dp": spmd.V, "cp": spmd.V, "tp": spmd.V},
             )
+        if self._fused_inference(topk_expert_ids_TK):
+            # One counting-sort kernel instead of argsort, gathers and index math.
+            (
+                src_row_N,
+                sorted_positions_TK,
+                _,
+                is_local_TK,
+                offsets_E,
+            ) = fused_routing.dispatch_prep(topk_expert_ids_TK, 0, self.num_experts)
+            fused_metadata = AllGatherDispatchMetadata(
+                sorted_positions_GK=sorted_positions_TK,
+                topk_scores_GK=topk_scores_TK,
+                is_local_GK=is_local_TK,
+                offsets_e=offsets_E,
+            )
+            return x_TD[src_row_N], num_local_tokens_per_expert_E, fused_metadata
         # R = N (no EP all-to-all)
         (
             routed_input_RD,
@@ -148,6 +199,16 @@ class LocalTokenDispatcher(Module):
         Returns:
             out_TD: ``(T, D)`` combined output.
         """
+        if isinstance(metadata, AllGatherDispatchMetadata):
+            # Each token sums its own picks: no deterministic scatter-add, whose index
+            # checks and sort cost ~50 us per layer at decode sizes.
+            return all_gather_combine.score_sum(
+                routed_output_RD,
+                metadata.sorted_positions_GK,
+                metadata.topk_scores_GK,
+                metadata.is_local_GK,
+                out_dtype=x_TD.dtype,
+            )
         # The scatter-add reads the expert outputs with bare ops.
         remat.recompute_needs_tensor(routed_output_RD)
         return self._score_and_scatter_add(
@@ -241,6 +302,8 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
     With EP, each of dispatch and combine is one remat region,
     ``<fqn>.dispatch`` and ``<fqn>.combine``, covering its local reordering,
     collectives, and (for combine) the score-weighted scatter-add.
+    While vLLM captures a CUDA graph, it uses all-gather + reduce-scatter instead
+    (see ``_all_gather_dispatch``).
 
     The EP mesh is resolved from the ambient SPMD runtime.
     """
@@ -251,6 +314,26 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
 
     def __init__(self, config: Config):
         super().__init__(config)
+        # Set by the generator where every EP rank holds the same tokens (EP group = TP
+        # group, no sequence parallelism): the capture dispatch then skips its all-gather,
+        # and combine returns this rank's partial sums for MoE's TP all-reduce.
+        self.replicated_tokens = False
+        # Set by the generator once every expert is split across the EP ranks along its
+        # intermediate dimension (all experts local): every inference batch then takes the
+        # replicated-token dispatch, whose combine returns a TP partial.
+        self.experts_tp_sharded = False
+
+    @staticmethod
+    def captures_inference(x_TD: torch.Tensor) -> bool:
+        """Whether this is a vLLM inference CUDA-graph capture, the only case guaranteed
+        the same T on every EP rank. The capture query goes last: Dynamo can't trace it,
+        and it needs a GPU."""
+        return (
+            not torch.compiler.is_compiling()
+            and not torch.is_grad_enabled()
+            and x_TD.is_cuda
+            and torch.cuda.is_current_stream_capturing()
+        )
 
     def _token_count_exchange(
         self,
@@ -373,7 +456,9 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
         topk_expert_ids_TK: torch.Tensor,
         num_local_tokens_per_expert_E: torch.Tensor,
     ) -> tuple[
-        torch.Tensor, torch.Tensor, AllToAllDispatchMetadata | LocalDispatchMetadata
+        torch.Tensor,
+        torch.Tensor,
+        AllToAllDispatchMetadata | LocalDispatchMetadata | AllGatherDispatchMetadata,
     ]:
         """Reorder tokens, then all-to-all dispatch to expert-parallel ranks.
 
@@ -405,6 +490,10 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
                 topk_expert_ids_TK,
                 num_local_tokens_per_expert_E,
             )
+
+        # A CUDA graph cannot read the all-to-all split sizes on the host.
+        if self.experts_tp_sharded or self.captures_inference(x_TD):
+            return self._all_gather_dispatch(x_TD, topk_scores_TK, topk_expert_ids_TK)
 
         if spmd.is_type_checking():  # sparse mesh reinterpret
             spmd.mutate_type(
@@ -532,6 +621,157 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
             output_splits,
         )
 
+    @staticmethod
+    def _all_gather_routing(
+        x_TD: torch.Tensor,
+        topk_scores_TK: torch.Tensor,
+        topk_expert_ids_TK: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """All-gather tokens, scores and expert ids over EP in one collective.
+
+        Each all-gather costs ~15 us at decode sizes (A100, NVLink), mostly latency, so
+        the three tensors travel as 16-bit columns of one buffer and come back as views
+        (35B-A3B decode: 3 -> 1 all-gather per layer). Falls back to three all-gathers
+        when a view could not be reinterpreted at its dtype.
+        """
+        tensors = (x_TD, topk_scores_TK, topk_expert_ids_TK)
+        widths = [t.shape[1] * t.element_size() // 2 for t in tensors]
+        row = sum(widths)
+        starts = [0, widths[0], widths[0] + widths[1]]
+        aligned = all(t.element_size() % 2 == 0 for t in tensors) and all(
+            row % (t.element_size() // 2) == 0 and start % (t.element_size() // 2) == 0
+            for t, start in zip(tensors, starts)
+        )
+        if not aligned or spmd.is_type_checking():
+            return tuple(
+                spmd.all_gather(t, "ep", src=spmd.S(0), dst=spmd.R) for t in tensors
+            )
+        # bf16 only as a 16-bit container NCCL accepts (no int16); all-gather copies bits.
+        packed_TW = torch.cat(
+            [t.contiguous().view(torch.bfloat16) for t in tensors], dim=1
+        )
+        gathered_GW = spmd.all_gather(packed_TW, "ep", src=spmd.S(0), dst=spmd.R)
+        return tuple(
+            gathered_GW[:, start : start + width].view(t.dtype)
+            for t, start, width in zip(tensors, starts, widths)
+        )
+
+    def _all_gather_dispatch(
+        self,
+        x_TD: torch.Tensor,
+        topk_scores_TK: torch.Tensor,
+        topk_expert_ids_TK: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, AllGatherDispatchMetadata]:
+        """Dispatch with static shapes, so a CUDA graph can capture it.
+
+        Every EP rank all-gathers the tokens and their routing and sorts the rows
+        routed to its own experts to the front. ``combine`` sums each token's rows
+        and reduce-scatters the sums back.
+
+        Example (EP=2, T=2, K=1, 2 local experts, on EP rank 1)::
+
+            gathered_expert_ids_GK           [[3], [0], [2], [1]]
+            local_expert_ids_GK              [[1], [2], [0], [2]]  (2 = other rank)
+            routed_input_ND gathered tokens  [2, 0, 1, 3]  (rows 2-3: rank 0's, not computed)
+            sorted_positions_GK              [[1], [2], [0], [3]]
+            num_tokens_per_local_expert_e    [1, 1]
+
+        Returns:
+            routed_input_ND: ``(N = G * K, D)`` rows of the ``G = EP * T`` gathered
+                tokens, in local expert order.
+            num_tokens_per_local_expert_e: ``(num_local_experts,)`` token counts
+            metadata: AllGatherDispatchMetadata for combine()
+        """
+        if is_in_batch_invariant_mode():
+            raise NotImplementedError(
+                "For top-k > 2 a captured MoE combine sums in another order than the "
+                "all-to-all, so it is not bitwise with the trainer; batch-invariant "
+                "generators must run without CUDA graphs."
+            )
+        assert self.ep_mesh is not None
+        if self.experts_tp_sharded:
+            ep_rank, num_local_experts = 0, self.num_experts
+        else:
+            ep_rank = self.ep_mesh.get_local_rank()
+            num_local_experts = self.num_experts // self.ep_mesh.size()
+        # The sort below uses int16 keys (ids <= num_local_experts).
+        if num_local_experts > torch.iinfo(torch.int16).max:
+            raise ValueError(
+                f"{num_local_experts} experts per EP rank do not fit the int16 sort keys; "
+                "raise the EP degree or run the generator without CUDA graphs"
+            )
+        if self.replicated_tokens:
+            # Every EP rank already holds all G = T tokens and computes the same routing.
+            gathered_x_GD, gathered_scores_GK, gathered_expert_ids_GK = (
+                x_TD,
+                topk_scores_TK,
+                topk_expert_ids_TK,
+            )
+        else:
+            with maybe_set_sparse_mesh():
+                (
+                    gathered_x_GD,
+                    gathered_scores_GK,
+                    gathered_expert_ids_GK,
+                ) = self._all_gather_routing(x_TD, topk_scores_TK, topk_expert_ids_TK)
+
+        if (
+            fused_routing.ENABLED
+            and gathered_expert_ids_GK.numel() <= fused_routing.MAX_DISPATCH_ROWS
+            and gathered_expert_ids_GK.stride(1) == 1
+        ):
+            # Same stable order and outputs as the ops below, in one kernel.
+            (
+                src_row_N,
+                sorted_positions_GK,
+                num_tokens_per_local_expert_e,
+                is_local_GK,
+                offsets_e,
+            ) = fused_routing.dispatch_prep(
+                gathered_expert_ids_GK, ep_rank, num_local_experts
+            )
+            metadata = AllGatherDispatchMetadata(
+                sorted_positions_GK=sorted_positions_GK,
+                topk_scores_GK=gathered_scores_GK,
+                is_local_GK=is_local_GK,
+                offsets_e=offsets_e,
+            )
+            return gathered_x_GD[src_row_N], num_tokens_per_local_expert_e, metadata
+
+        # Other ranks' experts get local id num_local_experts, which sorts last.
+        local_expert_ids_GK = gathered_expert_ids_GK - ep_rank * num_local_experts
+        is_local_GK = (local_expert_ids_GK >= 0) & (
+            local_expert_ids_GK < num_local_experts
+        )
+        local_expert_ids_GK = local_expert_ids_GK.masked_fill(
+            ~is_local_GK, num_local_experts
+        )
+        # Not _local_reorder: combine needs this order's inverse, which it does not return.
+        # int16 keys sort faster than int64.
+        sorted_local_expert_ids_N, sorted_order_N = torch.sort(
+            local_expert_ids_GK.flatten().to(torch.int16), stable=True
+        )
+        routed_input_ND = gathered_x_GD[sorted_order_N // self.top_k]
+        # Inverse of sorted_order_N by scatter, not a second sort (except under deterministic
+        # algorithms, where scatter_ sorts too): [2, 0, 1, 3] -> [1, 2, 0, 3].
+        sorted_positions_N = torch.empty_like(sorted_order_N).scatter_(
+            0, sorted_order_N, torch.arange(sorted_order_N.numel(), device=x_TD.device)
+        )
+        # Expert e's rows start at the first sorted id >= e and end at the first >= e + 1, so
+        # an empty expert counts 0. The extra last entry is where other ranks' picks start
+        # (bincount would size its output on the host).
+        first_row_per_expert = torch.searchsorted(
+            sorted_local_expert_ids_N,
+            torch.arange(num_local_experts + 1, dtype=torch.int16, device=x_TD.device),
+        )
+        num_tokens_per_local_expert_e = first_row_per_expert.diff()
+        metadata = AllGatherDispatchMetadata(
+            sorted_positions_GK=sorted_positions_N.view_as(is_local_GK),
+            topk_scores_GK=gathered_scores_GK,
+            is_local_GK=is_local_GK,
+        )
+        return routed_input_ND, num_tokens_per_local_expert_e, metadata
+
     def _permute(
         self,
         routed_input_RD,
@@ -595,14 +835,15 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
     def combine(
         self,
         routed_output_RD: torch.Tensor,
-        metadata: AllToAllDispatchMetadata,
+        metadata: AllToAllDispatchMetadata | AllGatherDispatchMetadata,
         x_TD: torch.Tensor,
     ) -> torch.Tensor:
         """Reverse the dispatch: unpermute + all-to-all + score + scatter_add.
 
         Args:
             routed_output_RD: ``(R, D)`` expert outputs in expert-major order
-            metadata: AllToAllDispatchMetadata from dispatch()
+            metadata: AllToAllDispatchMetadata or AllGatherDispatchMetadata
+                from dispatch()
             x_TD: ``(T, D)`` original input tokens
 
         Returns:
@@ -616,6 +857,8 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
                 metadata,
                 x_TD,
             )
+        if isinstance(metadata, AllGatherDispatchMetadata):
+            return self._reduce_scatter_combine(routed_output_RD, metadata, x_TD)
 
         out_TD = remat.region(
             self._combine,
@@ -666,6 +909,80 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
             x_TD,
         )
 
+    def _reduce_scatter_combine(
+        self,
+        routed_output_ND: torch.Tensor,
+        metadata: AllGatherDispatchMetadata,
+        x_TD: torch.Tensor,
+    ) -> torch.Tensor:
+        """Reverse ``_all_gather_dispatch``: score, sum each token's local picks, reduce-scatter.
+
+        Inference only (``dispatch`` takes this path only without grad), so it scores the
+        gathered rows in place.
+
+        Not a scatter-add: (EP-1)/EP of the rows belong to other ranks and would all be
+        added into one extra row, which a deterministic scatter-add serializes (0.8 ms vs
+        59 us per layer for this gather; 35B-A3B, 128 seqs per DP rank, EP4, H100).
+        """
+        if all_gather_combine.ENABLED and routed_output_ND.is_cuda:
+            if self.replicated_tokens:
+                # MoE.forward all-reduces it with the shared experts' partial output.
+                return all_gather_combine.score_sum(
+                    routed_output_ND,
+                    metadata.sorted_positions_GK,
+                    metadata.topk_scores_GK,
+                    metadata.is_local_GK,
+                    out_dtype=x_TD.dtype,
+                )
+            partial_out_GD = all_gather_combine.score_sum(
+                routed_output_ND,
+                metadata.sorted_positions_GK,
+                metadata.topk_scores_GK,
+                metadata.is_local_GK,
+            )
+            if (
+                all_gather_combine.ALL_REDUCE
+                and partial_out_GD.numel() * partial_out_GD.element_size()
+                <= all_gather_combine.ALL_REDUCE_MAX_BYTES
+            ):
+                # Decode sizes: an all-reduce (vLLM's one-shot custom AR in the generator)
+                # then this rank's rows is 3-4x faster than NCCL's reduce-scatter, and a
+                # two-term fp32 sum is the same either way.
+                with maybe_set_sparse_mesh():
+                    full_GD = spmd.redistribute(
+                        partial_out_GD, "ep", src=spmd.P, dst=spmd.R
+                    )
+                assert self.ep_mesh is not None
+                tokens = x_TD.shape[0]
+                start = self.ep_mesh.get_local_rank() * tokens
+                return full_GD[start : start + tokens].to(x_TD.dtype)
+            with maybe_set_sparse_mesh():
+                out_TD = spmd.reduce_scatter(
+                    partial_out_GD, "ep", src=spmd.P, dst=spmd.S(0)
+                )
+            return out_TD.to(x_TD.dtype)
+        # Each gathered token's K picks, read at their sorted position (a copy, so it is
+        # safe to overwrite).
+        scored_GKD = routed_output_ND[metadata.sorted_positions_GK]
+        # Round each scored row to bf16 as the all-to-all combine does (top-2 stays
+        # bitwise), then sum in fp32 and round once after the reduce-scatter. bf16 *= fp32
+        # multiplies in fp32 and rounds once, with no fp32 temporary on CUDA.
+        scored_GKD.mul_(metadata.topk_scores_GK.unsqueeze(-1).to(torch.float32))
+        # grouped_mm never computed other ranks' rows (garbage, maybe NaN): zero them.
+        partial_out_GD = torch.where(
+            metadata.is_local_GK.unsqueeze(-1), scored_GKD, 0
+        ).sum(dim=1, dtype=torch.float32)
+        if self.replicated_tokens:
+            return partial_out_GD.to(x_TD.dtype)
+        # TODO: compiled, this combine is 179 vs 628 us per layer at 4096 gathered tokens
+        # (H100) but not bitwise (2e-7). It first runs inside capture, where Dynamo refuses
+        # to compile ("cannot JIT compile during CUDA graph capture"): call it once before.
+        with maybe_set_sparse_mesh():
+            out_TD = spmd.reduce_scatter(
+                partial_out_GD, "ep", src=spmd.P, dst=spmd.S(0)
+            )
+        return out_TD.to(x_TD.dtype)
+
 
 class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
     """Token dispatcher with token group padding for quantized grouped GEMMs.
@@ -689,6 +1006,12 @@ class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
     def __init__(self, config: Config):
         super().__init__(config)
         self.pad_multiple = config.pad_multiple
+
+    def _all_gather_dispatch(self, *args, **kwargs):
+        raise NotImplementedError(
+            "TorchAOTokenDispatcher with EP cannot be captured in a CUDA graph: "
+            "the all-gather path does not pad token groups."
+        )
 
     def dispatch(
         self,
