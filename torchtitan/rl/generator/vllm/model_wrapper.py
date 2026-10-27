@@ -48,6 +48,7 @@ from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.dist_moe import DistMoeRoutedExperts, DistMoeRuntime
 from torchtitan.quantization._fsdp_tensor import _ShardedFSDPTensor
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
+from torchtitan.rl.generator.vllm import trtllm_moe
 
 
 logger = init_logger(__name__)
@@ -339,6 +340,8 @@ class VLLMModelWrapper(Module):
         super().__init__()
 
         assert vllm_config is not None, "vllm_config is required"
+        # Before parallelize: it binds each module's forward into its SPMD wrapper.
+        trtllm_moe.maybe_patch_routed_experts()
 
         # Translate the inference parallelism into torchtitan's full
         # ParallelismConfig that ParallelismContext and model.parallelize consume.
@@ -430,6 +433,8 @@ class VLLMModelWrapper(Module):
         for module in self.model.modules():
             if isinstance(module, FSDPModule):
                 _unshard_and_free_sharded_params(module)
+        with self.parallelism_context.activate_spmd():
+            trtllm_moe.relayout(self.model)
 
     def load_state_dict(self, state_dict: Mapping[str, Any]):
         """Copy new weights into `self.model`, allocating about one FSDP group's sharded buffers at a time.
@@ -479,6 +484,9 @@ class VLLMModelWrapper(Module):
         incompatible_keys = self.model.load_state_dict(state_dict, strict=True)
         for handle in handles:
             handle.remove()
+        # The load wrote TorchTitan's layout; rewrite the TRT-LLM-gen experts in place.
+        with self.parallelism_context.activate_spmd():
+            trtllm_moe.relayout(self.model)
         return incompatible_keys
 
     def set_num_valid_tokens(self, num_valid_tokens: int) -> None:
