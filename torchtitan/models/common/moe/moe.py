@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+import os
 from typing import cast, Protocol
 
 import spmd_types as spmd
@@ -44,6 +45,9 @@ from torchtitan.models.common.linear.hi_mid_lo_linear import HiMidLoLinear
 
 from . import fused_routing
 from .token_dispatcher import AllToAllTokenDispatcher, LocalTokenDispatcher
+
+# See MoE._inference_tp_split_views.
+_TP_SPLIT_VIEWS = os.environ.get("TORCHTITAN_MOE_TP_SPLIT_VIEWS") == "1"
 
 # Shape suffix legend
 # (https://medium.com/@NoamShazeer/shape-suffixes-good-coding-style-f836e72e24fd):
@@ -862,8 +866,15 @@ class MoE(FeedForward):
             with torch.cuda.stream(shared_stream):
                 shared_TD = self.shared_experts(x_TD)
         replicated = self._routed_tokens_replicated(x_TD)
+        tp_split = None if replicated else self._inference_tp_split_views()
         if replicated:
             routed_x_TD, routed_padding_mask_T = x_TD, padding_mask_T
+        elif tp_split is not None:
+            tp_rank, tp_size = tp_split
+            routed_x_TD = x_TD.chunk(tp_size)[tp_rank]
+            routed_padding_mask_T = (
+                None if padding_mask_T is None else padding_mask_T.chunk(tp_size)[tp_rank]
+            )
         else:
             (
                 routed_x_TD,
@@ -896,19 +907,54 @@ class MoE(FeedForward):
             num_local_tokens_per_expert_E,
             padding_mask_T=routed_padding_mask_T,
         )
-        if not replicated:
+        if not replicated and tp_split is None:
             out_TD = self._maybe_zero_fill_routed_output_to_tp_partial(out_TD)
         if self.shared_experts is not None:
             if shared_stream is None:
                 shared_TD = self.shared_experts(x_TD)
             else:
                 torch.cuda.current_stream().wait_stream(shared_stream)
-            # Trailing add, always saved: it saves nothing for backward, so replay skips
-            # it and its inputs need no persisting, matching checkpoint early stop.
-            out_TD = remat.region(
-                torch.add, self.remat_region_name("shared_add"), recompute=False
-            )(out_TD, shared_TD)
+            if tp_split is not None:
+                # This rank's routed rows join the shared experts' TP partial in place.
+                tp_rank, tp_size = tp_split
+                shared_TD.chunk(tp_size)[tp_rank].add_(out_TD)
+                out_TD = shared_TD
+            else:
+                # Trailing add, always saved: it saves nothing for backward, so replay
+                # skips it and its inputs need no persisting, matching checkpoint early
+                # stop.
+                out_TD = remat.region(
+                    torch.add, self.remat_region_name("shared_add"), recompute=False
+                )(out_TD, shared_TD)
         return self._maybe_all_reduce_moe_output_across_tp(out_TD)
+
+    def _inference_tp_split_views(self) -> tuple[int, int] | None:
+        """This rank's ``(tp_rank, tp_size)`` when the routed branch splits tokens by row views.
+
+        Without grad, with EP and dense SP off, the routed branch takes this rank's rows
+        of the TP-replicated tokens and its output joins the shared experts' partial.
+        ``spmd.redistribute`` clones the token and padding-mask shards (it never aliases
+        its input) and zero-fills a full-size partial for the routed rows: three copies
+        and a memset per MoE layer (~6-8 us at decode, Qwen3.5-35B-A3B TP2 / EP2 on
+        GB300). Row views of the contiguous inputs and an in-place add into the shared
+        partial do the same. Needs shared experts. Opt-in with
+        ``TORCHTITAN_MOE_TP_SPLIT_VIEWS=1``.
+        """
+        if (
+            not _TP_SPLIT_VIEWS
+            or torch.is_grad_enabled()
+            or self.shared_experts is None
+            or spmd_sparse_mesh() is None
+            or spmd_dense_sp_enabled()
+        ):
+            return None
+        tp_group = spmd_mesh_group(MeshAxisName.TP)
+        if tp_group is None:
+            return None
+        return (
+            torch.distributed.get_rank(tp_group),
+            torch.distributed.get_world_size(tp_group),
+        )
 
     def _overlap_shared_experts_stream(
         self, x_TD: torch.Tensor
