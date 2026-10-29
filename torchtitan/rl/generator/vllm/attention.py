@@ -71,6 +71,16 @@ _TRTLLM_SPLIT_MIXED = (
 _FA4_SPLIT_MIXED = (
     not _TRTLLM_SPLIT_MIXED and os.environ.get("TORCHTITAN_FA4_SPLIT_MIXED") == "1"
 )
+# FA4's swap-AB split-KV decode kernel for decode requests (Dao-AILab/flash-attention #2973, with
+# head_dim 256 / SM103 / 128-token pages from the FA4 tree on PYTHONPATH; see _fa4_swapab_decode).
+# Opt-in with TORCHTITAN_FA4_SWAPAB_DECODE=1; the decodes of mixed batches too with
+# TORCHTITAN_FA4_SWAPAB_SPLIT_MIXED=1.
+_FA4_SWAPAB_DECODE = (
+    not _TRTLLM_DECODE and os.environ.get("TORCHTITAN_FA4_SWAPAB_DECODE") == "1"
+)
+_FA4_SWAPAB_SPLIT_MIXED = (
+    _FA4_SWAPAB_DECODE and os.environ.get("TORCHTITAN_FA4_SWAPAB_SPLIT_MIXED") == "1"
+)
 # vLLM's FlashInfer workspace size; TRT-LLM-gen keeps zero-initialized split counters in it.
 _TRTLLM_WORKSPACE_BYTES = 256 << 20
 _trtllm_workspaces: dict[torch.device, torch.Tensor] = {}
@@ -120,6 +130,50 @@ def _trtllm_decode(
         out=output[:batch],
         kv_layout="NHD",
     )
+
+
+def _fa4_swapab_decode(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    output: torch.Tensor,
+    block_table: torch.Tensor,
+    seqused_k: torch.Tensor,
+    softmax_scale: float,
+) -> None:
+    """Causal paged decode attention (one query token per request) on FA4's swap-AB kernel.
+
+    FA4's standard kernel puts the (packed GQA) query rows on the MMA's 128-row dimension, which
+    one decode token per request leaves mostly empty; at head_dim 256 on GB300 it reads the KV at
+    4.3-5.6 TB/s. The swap-AB kernel puts 128 KV tokens on that dimension and the query heads on N,
+    as TRT-LLM-gen's decode does, and splits each request's KV: 6.6-7.1 TB/s for Qwen3.5-35B-A3B
+    at 4-256 requests and 1-160K keys, vs 5.4-6.4 for TRT-LLM-gen. It takes a dense
+    (batch, 1, heads, head_dim) query, so the call goes to FA4's interface directly; the backend
+    is forced so an ineligible call fails instead of falling back. All on-device, so FULL CUDA
+    graphs replay it; the split count follows the batch and the block table's capacity.
+    """
+    from flash_attn.cute.interface import _flash_attn_fwd
+
+    # Padded FULL-graph batches: one query row per (possibly padded) request.
+    batch = seqused_k.shape[0]
+    previous = os.environ.get("FLASH_ATTENTION_SM100_BACKEND")
+    os.environ["FLASH_ATTENTION_SM100_BACKEND"] = "swapab"
+    try:
+        _flash_attn_fwd(
+            query[:batch].unsqueeze(1),
+            key_cache,
+            value_cache,
+            seqused_k=seqused_k,
+            page_table=block_table,
+            softmax_scale=softmax_scale,
+            causal=True,
+            out=output[:batch].unsqueeze(1),
+        )
+    finally:
+        if previous is None:
+            del os.environ["FLASH_ATTENTION_SM100_BACKEND"]
+        else:
+            os.environ["FLASH_ATTENTION_SM100_BACKEND"] = previous
 
 
 def _fa2_single_token(
@@ -197,7 +251,10 @@ class TorchTitanVarlenInnerAttentionBackend(FlashAttentionBackend):
             # _forward_mixed_trtllm, _forward_mixed_fa4).
             reorder_batch_threshold = (
                 1
-                if _SPLIT_MIXED_BATCHES or _TRTLLM_SPLIT_MIXED or _FA4_SPLIT_MIXED
+                if _SPLIT_MIXED_BATCHES
+                or _TRTLLM_SPLIT_MIXED
+                or _FA4_SPLIT_MIXED
+                or _FA4_SWAPAB_SPLIT_MIXED
                 else None
             )
 
@@ -472,6 +529,41 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
                 return output[:num_actual_tokens]
 
         if (
+            _FA4_SWAPAB_DECODE
+            and self.out_transform is None
+            and self.sliding_window == (-1, -1)
+            and not is_in_batch_invariant_mode()
+        ):
+            if max_seqlen_q == 1:
+                _fa4_swapab_decode(
+                    query,
+                    key_cache,
+                    value_cache,
+                    output,
+                    block_table,
+                    seqused_k,
+                    self.scale,
+                )
+                return output[:num_actual_tokens]
+            if (
+                _FA4_SWAPAB_SPLIT_MIXED
+                and max_seqlen_k >= max_seqlen_q
+                and cu_seqlens_q.shape[0] - 1 <= num_actual_tokens
+            ):
+                self._forward_mixed_swapab(
+                    query[:num_actual_tokens],
+                    key_cache,
+                    value_cache,
+                    output[:num_actual_tokens],
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                )
+                return output[:num_actual_tokens]
+
+        if (
             _FA4_SPLIT_MIXED
             and max_seqlen_q > 1
             and max_seqlen_k >= max_seqlen_q
@@ -580,6 +672,51 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
             block_table,
             torch.where(is_decode, seqused_k, 0),
             max_seqlen_k,
+            self.scale,
+        )
+        torch.nn.attention.varlen.varlen_attn_out(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            torch.maximum(cu_seqlens_q, is_decode.sum(dtype=cu_seqlens_q.dtype)),
+            None,
+            max_seqlen_q,
+            max_seqlen_k,
+            scale=self.scale,
+            window_size=(-1, 0),
+            block_table=block_table,
+            seqused_k=seqused_k,
+            enable_gqa=self.enable_gqa,
+        )
+
+    def _forward_mixed_swapab(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        seqused_k: torch.Tensor,
+        block_table: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+    ) -> None:
+        """A batch with prefills: the decodes on FA4's swap-AB kernel, the prefills on FA4.
+
+        ``_forward_mixed_trtllm`` with ``_fa4_swapab_decode`` for the decodes: the runner
+        orders decodes first, the decode call runs rows ``[0, num_requests)`` with the
+        prefills' key lengths masked to zero, then FA4's standard kernel runs the prefills
+        with the decodes as empty queries and rewrites the prefill rows.
+        """
+        is_decode = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]) == 1
+        _fa4_swapab_decode(
+            query,
+            key_cache,
+            value_cache,
+            output,
+            block_table,
+            torch.where(is_decode, seqused_k, 0),
             self.scale,
         )
         torch.nn.attention.varlen.varlen_attn_out(
