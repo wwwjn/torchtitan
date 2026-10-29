@@ -90,6 +90,7 @@ def _softmax_topk_kernel(
     scores_out,
     ids_out,
     counts,
+    padding,
     E,
     stride_logits,
     stride_split,
@@ -98,6 +99,7 @@ def _softmax_topk_kernel(
     K: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
     ROUTE_NORM: tl.constexpr,
+    HAS_PADDING: tl.constexpr,
     BLOCK_E: tl.constexpr,
 ):
     t = tl.program_id(0)
@@ -127,10 +129,19 @@ def _softmax_topk_kernel(
         keys = tl.where(keys == best, -1, keys)
     picked_ids = BLOCK_E - 1 - (picked & 0xFFFFFFFF)
     picked_scores = (picked >> 32).to(tl.int32).to(tl.float32, bitcast=True)
-    tl.atomic_add(counts + picked_ids, tl.full([K], 1, dtype=tl.int64))
     if ROUTE_NORM:
         picked_scores = picked_scores / (tl.sum(picked_scores, 0) + eps)
     picked_scores = picked_scores * scale
+    if HAS_PADDING:
+        # A padding row routes nowhere: expert id -1, score 0, not counted.
+        is_padding_K = (o_k >= 0) & (tl.load(padding + t) != 0)
+        tl.atomic_add(
+            counts + picked_ids, tl.full([K], 1, dtype=tl.int64), mask=~is_padding_K
+        )
+        picked_ids = tl.where(is_padding_K, -1, picked_ids)
+        picked_scores = tl.where(is_padding_K, 0.0, picked_scores)
+    else:
+        tl.atomic_add(counts + picked_ids, tl.full([K], 1, dtype=tl.int64))
     tl.store(scores_out + t * K + o_k, picked_scores)
     tl.store(ids_out + t * K + o_k, picked_ids)
 
@@ -147,8 +158,13 @@ def _topk(
     eps: float,
     scale: float,
     counts: torch.Tensor | None = None,
+    padding_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``counts``: zeroed ``(E,)`` int64 per-expert counts, or None to allocate them."""
+    """``counts``: zeroed ``(E,)`` int64 per-expert counts, or None to allocate them.
+
+    ``padding_mask``: optional bool ``(T,)``, true for padding rows, which get expert id -1
+    and score 0 and are not counted.
+    """
     assert top_k == triton.next_power_of_2(top_k)
     scores = torch.empty(tokens, top_k, device=logits.device, dtype=torch.float32)
     ids = torch.empty(tokens, top_k, device=logits.device, dtype=torch.int64)
@@ -160,6 +176,7 @@ def _topk(
             scores,
             ids,
             counts,
+            ids if padding_mask is None else padding_mask.view(torch.uint8),
             experts,
             stride_logits,
             stride_split,
@@ -168,6 +185,7 @@ def _topk(
             K=top_k,
             NUM_SPLITS=num_splits,
             ROUTE_NORM=route_norm,
+            HAS_PADDING=padding_mask is not None,
             BLOCK_E=triton.next_power_of_2(experts),
             # One warp per token keeps the K max reductions in shuffles (A100, E = 256).
             num_warps=1 if experts <= 512 else 4,
@@ -176,13 +194,28 @@ def _topk(
 
 
 def softmax_topk(
-    gate_TE: torch.Tensor, top_k: int, route_norm: bool, eps: float, scale: float
+    gate_TE: torch.Tensor,
+    top_k: int,
+    route_norm: bool,
+    eps: float,
+    scale: float,
+    padding_mask_T: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """(scores ``(T, K)`` fp32, expert ids ``(T, K)`` int64, tokens per expert ``(E,)`` int64)."""
     tokens, experts = gate_TE.shape
     assert gate_TE.stride(1) == 1
     return _topk(
-        gate_TE, tokens, experts, 1, gate_TE.stride(0), 0, top_k, route_norm, eps, scale
+        gate_TE,
+        tokens,
+        experts,
+        1,
+        gate_TE.stride(0),
+        0,
+        top_k,
+        route_norm,
+        eps,
+        scale,
+        padding_mask=padding_mask_T,
     )
 
 
@@ -215,6 +248,7 @@ def gate_softmax_topk(
     route_norm: bool,
     eps: float,
     scale: float,
+    padding_mask_T: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``softmax_topk`` of the bf16 router gate GEMM ``x_TD @ weight_ED.T`` (fp32 accumulate),
     without the fp32 logits: a split-K GEMM writes partial sums that the top-k kernel adds.
@@ -264,6 +298,7 @@ def gate_softmax_topk(
         eps,
         scale,
         counts=counts,
+        padding_mask=padding_mask_T,
     )
 
 

@@ -264,6 +264,7 @@ class TokenChoiceTopKRouter(Module):
         *,
         padding_mask_T: torch.Tensor | None = None,
         aux_loss_denominator: torch.Tensor | None = None,
+        padded_routes_to_minus_one: bool = False,
         **router_kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -271,6 +272,9 @@ class TokenChoiceTopKRouter(Module):
             x_TD: Input ``(T, D)``.
             expert_bias_E: Optional load-balancing bias ``(E,)``.
             padding_mask_T: Boolean ``(T,)`` mask that is true for padding.
+            padded_routes_to_minus_one: Return expert id ``-1`` and score ``0`` for
+                every padding row, for experts that skip ``-1`` routes (Dist-MoE).
+                The fused inference routing then masks inside its top-k kernel.
 
         Returns:
             topk_scores_TK: Routing scores ``(T, K)``.
@@ -285,7 +289,7 @@ class TokenChoiceTopKRouter(Module):
             and x_TD.is_cuda
             and isinstance(self.score_func, Softmax)
             and expert_bias_E is None
-            and padding_mask_T is None
+            and (padding_mask_T is None or padded_routes_to_minus_one)
             and not router_kwargs
             and self.top_k & (self.top_k - 1) == 0
         ):
@@ -295,6 +299,7 @@ class TokenChoiceTopKRouter(Module):
                 self.route_norm,
                 self.route_norm_epsilon,
                 self.route_scale,
+                padding_mask_T,
             )
             weight_ED = self.gate.weight
             if (
@@ -383,6 +388,10 @@ class TokenChoiceTopKRouter(Module):
                     padding_mask_T=padding_mask_T,
                     denominator=aux_loss_denominator,
                 )
+        if padded_routes_to_minus_one and padding_mask_T is not None:
+            padding_mask_TK = padding_mask_T.unsqueeze(-1)
+            topk_expert_ids_TK = topk_expert_ids_TK.masked_fill(padding_mask_TK, -1)
+            topk_scores_TK = topk_scores_TK.masked_fill(padding_mask_TK, 0.0)
         return (
             topk_scores_TK,
             topk_expert_ids_TK,
@@ -881,21 +890,23 @@ class MoE(FeedForward):
                 routed_padding_mask_T,
             ) = self._maybe_shard_routed_branch_inputs_across_tp(x_TD, padding_mask_T)
 
-        # Without grad the router reads the padding mask only for load-balance counts
-        # and the aux loss; experts that turn padded rows into -1 routes themselves
-        # (Dist-MoE) then let the router take its fused inference path.
-        router_padding_mask_T = routed_padding_mask_T
-        if getattr(self.routed_experts, "masks_padding_routes", False) and (
-            not torch.is_grad_enabled()
-        ):
-            router_padding_mask_T = None
+        # Without grad, experts that skip -1 routes (Dist-MoE) take the padding as -1
+        # routes from the router, whose fused inference routing writes them in its
+        # top-k kernel, instead of masking the routes themselves.
+        router_masks_padding = (
+            getattr(self.routed_experts, "masks_padding_routes", False)
+            and not torch.is_grad_enabled()
+            and routed_padding_mask_T is not None
+        )
         # topk scores and expert IDs have shape (T, K); the routing map (T, E)
         # marks the experts each token is routed to (built inside the router).
+        router_extra = {"padded_routes_to_minus_one": True} if router_masks_padding else {}
         (topk_scores_TK, topk_expert_ids_TK, routing_map_TE,) = self.router(
             routed_x_TD,
             self.expert_bias_E,
-            padding_mask_T=router_padding_mask_T,
+            padding_mask_T=routed_padding_mask_T,
             aux_loss_denominator=aux_loss_denominator,
+            **router_extra,
             **router_kwargs,
         )
         num_local_tokens_per_expert_E = self.routed_experts.count_tokens(routing_map_TE)
@@ -905,7 +916,7 @@ class MoE(FeedForward):
             topk_scores_TK,
             topk_expert_ids_TK,
             num_local_tokens_per_expert_E,
-            padding_mask_T=routed_padding_mask_T,
+            padding_mask_T=None if router_masks_padding else routed_padding_mask_T,
         )
         if not replicated and tp_split is None:
             out_TD = self._maybe_zero_fill_routed_output_to_tp_partial(out_TD)
