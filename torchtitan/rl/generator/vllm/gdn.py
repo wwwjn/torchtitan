@@ -58,6 +58,10 @@ from torchtitan.rl.generator.vllm.linear_attention import (
 )
 from torchtitan.rl.generator.vllm.sm80_gdn_delta_h import maybe_use_sm80_delta_h
 
+# AgentX A/B (bench tree): TORCHTITAN_GDN_DECODE_ROUTING=0 runs a mixed step's decode requests
+# through the chunk kernel again, as before torchtitan #5671.
+_DECODE_ROUTING = os.environ.get("TORCHTITAN_GDN_DECODE_ROUTING", "1") == "1"
+
 
 def _maybe_tune_sm80_delta_h() -> None:
     """Launch Attention Gym's GDN state recurrence with 8 warps before Hopper.
@@ -323,7 +327,7 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             cu_seqlens=cu_seqlens,
             has_initial_state=has_initial_state,
         ).squeeze(0)
-        if is_in_batch_invariant_mode():
+        if is_in_batch_invariant_mode() or not _DECODE_ROUTING:
             output = self._forward_gdn(
                 conv_output,
                 a[:num_actual_tokens],
