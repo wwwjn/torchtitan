@@ -168,6 +168,9 @@ def _fa4_swapab_decode(
             softmax_scale=softmax_scale,
             causal=True,
             out=output[:batch].unsqueeze(1),
+            # 0: FA4's decode split heuristic (the interface's default, 1, leaves 64 CTAs for
+            # 32 requests x 2 KV heads, slower than the standard kernel).
+            num_splits=0,
         )
     finally:
         if previous is None:
