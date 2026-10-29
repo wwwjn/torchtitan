@@ -56,6 +56,21 @@ PPActivationSlotPolicy = Literal["stage_microbatch", "microbatch"]
 _BATCH_INVARIANT_BF16_GROUPED_GEMM_PRESET = "2cta2mma_bm512_bn256"
 
 
+def _own_single_rank_group() -> torch.distributed.ProcessGroup:
+    """Return this rank's single-rank process group.
+
+    Collective: every rank of the default group must call it, in the same order.
+    """
+    rank = torch.distributed.get_rank()
+    own_group = None
+    for peer in range(torch.distributed.get_world_size()):
+        group = torch.distributed.new_group([peer])
+        if peer == rank:
+            own_group = group
+    assert own_group is not None
+    return own_group
+
+
 @dataclass(frozen=True, slots=True)
 class _DistMoePipelineActivationPlan:
     """Static activation-slot assignment for Dist-MoE stages on one PP rank.
@@ -308,7 +323,21 @@ class DistMoeRuntime(Configurable):
             raise RuntimeError("Dist-MoE requires an expert-parallel mesh")
         ep_pg = ep_mesh.get_group()
 
+        self.replicated_tokens = self._modules[0].replicated_tokens
+        if any(m.replicated_tokens != self.replicated_tokens for m in self._modules):
+            raise ValueError("Dist-MoE layers must agree on replicated tokens")
+        self._ep_size = ep_mesh.size()
+        self.num_local_experts = self._modules[0].num_experts // self._ep_size
+        self.local_expert_offset = ep_mesh.get_local_rank() * self.num_local_experts
         num_token_shards = parallelism_context.cp * parallelism_context.tp
+        if self.replicated_tokens:
+            # Every EP rank already holds all of the step's tokens (EP = TP, DP = 1), so
+            # no rank needs another's: each runs a single-rank context over its local
+            # experts, with no dispatch or barrier wait on peers.
+            if not config.inference or parallelism_context.tp != self._ep_size:
+                raise ValueError("replicated Dist-MoE tokens need inference and EP = TP")
+            ep_pg = _own_single_rank_group()
+            num_token_shards = parallelism_context.cp
         if num_tokens_per_microbatch_per_dp_rank % num_token_shards:
             raise ValueError(
                 "Dist-MoE input tokens must divide evenly across CP and TP"
@@ -451,7 +480,9 @@ class DistMoeRuntime(Configurable):
             hidden_dim=module.hidden_dim,
             intermediate_dim=module.intermediate_dim,
             top_k=module.top_k,
-            num_experts=module.num_experts,
+            num_experts=(
+                self.num_local_experts if self.replicated_tokens else module.num_experts
+            ),
             max_moe_layers_per_activation_slot=max_moe_layers_per_activation_slot,
             device_scratch_capacity_factor=self.config.scratch_capacity_factor,
             activation_slot_bytes=self.config.activation_slot_bytes,

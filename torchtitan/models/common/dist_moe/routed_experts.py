@@ -124,6 +124,9 @@ class DistMoeRoutedExperts(Module):
         self.activation = config.activation
         self.swiglu_alpha = config.swiglu_alpha
         self.swiglu_limit = config.swiglu_limit
+        # Generator decode with EP = TP: every rank holds all tokens and runs only its
+        # local experts, without dispatch (set before the runtime is built).
+        self.replicated_tokens = False
         self._runtime: DistMoeRuntime | None = None
 
     def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
@@ -203,6 +206,15 @@ class DistMoeRoutedExperts(Module):
             padding_mask_TK = padding_mask_T.unsqueeze(-1)
             topk_expert_ids_TK = topk_expert_ids_TK.masked_fill(padding_mask_TK, -1)
             topk_scores_TK = topk_scores_TK.masked_fill(padding_mask_TK, 0.0)
+        if self.replicated_tokens:
+            # The single-rank context numbers this rank's experts from 0. Routes to
+            # other ranks' experts become -1 routes with score 0; their ranks add them.
+            local_ids_TK = topk_expert_ids_TK - runtime.local_expert_offset
+            is_local_TK = (local_ids_TK >= 0) & (
+                local_ids_TK < runtime.num_local_experts
+            )
+            topk_expert_ids_TK = torch.where(is_local_TK, local_ids_TK, -1)
+            topk_scores_TK = topk_scores_TK.masked_fill(~is_local_TK, 0.0)
         # Every EP rank must pass the annex the same row count, and local batches
         # can differ across ranks. Pad to the call's count with rows routed to
         # expert -1, then slice the output.

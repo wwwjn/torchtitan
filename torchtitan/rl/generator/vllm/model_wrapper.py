@@ -535,8 +535,12 @@ class VLLMModelWrapper(Module):
         """Return the Dist-MoE row count every EP rank passes in this step.
 
         Every EP rank must pass the same count, and the routed tokens are split
-        evenly over TP, so this is the step's token count over TP.
+        evenly over TP, so this is the step's token count over TP. With replicated
+        tokens every rank passes all of them.
         """
+        assert self._dist_moe_runtime is not None
+        if self._dist_moe_runtime.replicated_tokens:
+            return num_tokens
         tp = self.parallelism_context.tp
         # TorchTitanGPUModelRunner pads every step to a multiple of TP when TP
         # shards the routed tokens, and every DP replica does the same.
@@ -803,6 +807,9 @@ def _maybe_keep_moe_tokens_replicated(
     in fp32 before the MoE output's all-reduce: three collectives per layer (~56 us on
     A100 at 32 tokens, Qwen3.5-35B-A3B EP2) where one bf16 all-reduce suffices. Not
     bitwise: each rank's expert sum rounds to bf16 before the cross-rank sum.
+    Dist-MoE experts skip their dispatch the same way, in every step: each rank runs its
+    local experts on all tokens through a single-rank Dist-MoE context (see
+    ``DistMoeRuntime``), and the MoE output's all-reduce sums the ranks' partial outputs.
     Opt-in with ``TORCHTITAN_EP_REPLICATED_TOKENS=1``.
     """
     if os.environ.get("TORCHTITAN_EP_REPLICATED_TOKENS") != "1":
@@ -815,7 +822,9 @@ def _maybe_keep_moe_tokens_replicated(
         return
     for module in model.modules():
         # Subclasses (TorchAO) do not support the capture dispatch.
-        if type(module) is AllToAllTokenDispatcher:
+        if type(module) is AllToAllTokenDispatcher or isinstance(
+            module, DistMoeRoutedExperts
+        ):
             module.replicated_tokens = True
 
 

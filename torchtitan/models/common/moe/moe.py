@@ -925,8 +925,11 @@ class MoE(FeedForward):
         In generator decode graphs where the EP group is the TP group, each rank already
         holds every token: the dispatcher skips the all-gather that would undo the
         ``Shard(0)`` split, and its combine returns the routed output as a TP partial, so
-        the MoE output's TP all-reduce is the layer's only collective.
+        the MoE output's TP all-reduce is the layer's only collective. Dist-MoE experts
+        sized for replicated tokens (``DistMoeRuntime``) take them in every step.
         """
+        if getattr(self.routed_experts, "replicated_tokens", False):
+            return True
         dispatcher = getattr(self.routed_experts, "token_dispatcher", None)
         if not getattr(dispatcher, "replicated_tokens", False):
             return False
