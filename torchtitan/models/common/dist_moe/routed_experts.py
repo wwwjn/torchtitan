@@ -105,6 +105,9 @@ class DistMoeRoutedExperts(Module):
                     "inside Dist-MoE"
                 )
 
+    # forward turns padded rows into -1 routes, so the router can ignore the mask.
+    masks_padding_routes = True
+
     def __init__(self, config: Config):
         Module.__init__(self)
         self.w13 = config.w13.build()

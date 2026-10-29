@@ -870,12 +870,20 @@ class MoE(FeedForward):
                 routed_padding_mask_T,
             ) = self._maybe_shard_routed_branch_inputs_across_tp(x_TD, padding_mask_T)
 
+        # Without grad the router reads the padding mask only for load-balance counts
+        # and the aux loss; experts that turn padded rows into -1 routes themselves
+        # (Dist-MoE) then let the router take its fused inference path.
+        router_padding_mask_T = routed_padding_mask_T
+        if getattr(self.routed_experts, "masks_padding_routes", False) and (
+            not torch.is_grad_enabled()
+        ):
+            router_padding_mask_T = None
         # topk scores and expert IDs have shape (T, K); the routing map (T, E)
         # marks the experts each token is routed to (built inside the router).
         (topk_scores_TK, topk_expert_ids_TK, routing_map_TE,) = self.router(
             routed_x_TD,
             self.expert_bias_E,
-            padding_mask_T=routed_padding_mask_T,
+            padding_mask_T=router_padding_mask_T,
             aux_loss_denominator=aux_loss_denominator,
             **router_kwargs,
         )
