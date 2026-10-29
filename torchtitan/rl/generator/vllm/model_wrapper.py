@@ -464,6 +464,8 @@ class VLLMModelWrapper(Module):
         with self.parallelism_context.activate_spmd():
             tp_experts.relayout(self.model)
             trtllm_moe.relayout(self.model)
+        if self._dist_moe_runtime is not None:
+            self._dist_moe_runtime.relayout_inference_weights()
 
     def load_state_dict(self, state_dict: Mapping[str, Any]):
         """Copy new weights into `self.model`, allocating about one FSDP group's sharded buffers at a time.
@@ -518,6 +520,8 @@ class VLLMModelWrapper(Module):
         with self.parallelism_context.activate_spmd():
             tp_experts.relayout(self.model)
             trtllm_moe.relayout(self.model)
+        if self._dist_moe_runtime is not None:
+            self._dist_moe_runtime.relayout_inference_weights()
         return incompatible_keys
 
     def set_num_valid_tokens(self, num_valid_tokens: int) -> None:

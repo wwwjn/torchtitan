@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -54,6 +55,16 @@ PPActivationSlotPolicy = Literal["stage_microbatch", "microbatch"]
 # rows of its expert group. Batch-invariant mode fixes the schedule to the tile
 # shape of the trainer's fixed schedule.
 _BATCH_INVARIANT_BF16_GROUPED_GEMM_PRESET = "2cta2mma_bm512_bn256"
+
+# Generator (inference contexts) only: the experts' W13 / W2 are rewritten block-major after every
+# full weight load (``dist_moe.relayout_to_block_major``: each 64-wide K tile of a weight is one
+# contiguous TMA box), optionally with W13's gate / up rows interleaved so the dispatch GEMM
+# writes the SwiGLU output itself. Opt-in with TORCHTITAN_DIST_MOE_BLOCK_MAJOR=1 (and
+# TORCHTITAN_DIST_MOE_INTERLEAVED_W13=1); see ``DistMoeRuntime.relayout_inference_weights``.
+_BLOCK_MAJOR_WEIGHTS = os.environ.get("TORCHTITAN_DIST_MOE_BLOCK_MAJOR") == "1"
+_INTERLEAVED_W13 = (
+    _BLOCK_MAJOR_WEIGHTS and os.environ.get("TORCHTITAN_DIST_MOE_INTERLEAVED_W13") == "1"
+)
 
 
 def _own_single_rank_group() -> torch.distributed.ProcessGroup:
@@ -298,6 +309,8 @@ class DistMoeRuntime(Configurable):
         from .routed_experts import DistMoeRoutedExperts
 
         self.config = config
+        self.block_major_weights = config.inference and _BLOCK_MAJOR_WEIGHTS
+        self.interleaved_w13 = self.block_major_weights and _INTERLEAVED_W13
         self._num_local_input_tokens_per_call: int | None = None
         self._closed = False
         self._forward_context_handles: list[RemovableHandle] = []
@@ -496,6 +509,14 @@ class DistMoeRuntime(Configurable):
             activation=module.activation,
             wgrad_dtype=wgrad_dtype,
             inference=self.config.inference,
+            **(
+                {
+                    "block_major_weights": True,
+                    "interleaved_gate_up": self.interleaved_w13,
+                }
+                if self.block_major_weights
+                else {}
+            ),
             **activation_options,
         )
 
@@ -611,6 +632,26 @@ class DistMoeRuntime(Configurable):
         if self._num_local_input_tokens_per_call is None:
             return self.context.max_num_local_input_tokens
         return self._num_local_input_tokens_per_call
+
+    def relayout_inference_weights(self) -> None:
+        """After each full weight load: rewrite every layer's experts block-major.
+
+        The generator calls it after the initial load and after every weight sync, which
+        writes row-major weights. Afterwards only Dist-MoE may read the expert weights.
+        """
+        if not self.block_major_weights:
+            return
+        # Loaded weights are inference tensors, writable in place only in inference mode.
+        with torch.inference_mode():
+            for module in self._modules:
+                w13, w2 = module.w13.weight, module.w2.weight
+                w13 = w13.to_local() if hasattr(w13, "to_local") else w13
+                w2 = w2.to_local() if hasattr(w2, "to_local") else w2
+                dist_moe.relayout_to_block_major(
+                    w13.flatten(1, 2), interleave_gate_up=self.interleaved_w13
+                )
+                dist_moe.relayout_to_block_major(w2)
+                module.block_major_weights = True
 
     def close(self) -> None:
         """Remove PP registrations, detach modules, and close Annex state."""
