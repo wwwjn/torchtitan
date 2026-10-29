@@ -9,10 +9,13 @@
 """Triton grouped GEMMs for the routed experts' no-grad forward (generation).
 
 One kernel, launched for w13 (+ SwiGLU on the fp32 accumulators) and for w2. With any
-dispatcher it runs on the expert-sorted rows; with all experts local (EP=1) it reads the
-routes directly, so dispatch and the scatter go away and one kernel sums each token's
-routes. Forwards with grad, batch-invariant mode and quantized expert linears keep the
-stock path.
+dispatcher it runs on the expert-sorted rows; where every rank holds all T tokens it reads
+the routes directly, so dispatch and the scatter go away and one kernel sums each token's
+routes: all experts local (EP=1), and the generator's replicated-token MoE (EP group = TP
+group, ``TORCHTITAN_EP_REPLICATED_TOKENS=1``), where each rank sums the routes to its own
+experts (or, with ``TORCHTITAN_MOE_TP_EXPERTS=1``, every expert's half of the columns) into
+the TP partial that MoE's all-reduce completes. Forwards with grad, batch-invariant mode
+and quantized expert linears keep the stock path.
 
 Example:
     >>> cfg = triton_routed_experts(moe_cfg.routed_experts)  # or the override import
@@ -507,8 +510,9 @@ class TritonRoutedExperts(RoutedExperts):
         *,
         padding_mask_T: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        route_ep = self._route_reading_ep(x_TD)
         if (
-            self._runs_ep1_path()
+            route_ep is not None
             and x_TD.dtype == torch.bfloat16
             and x_TD.shape[0] > 0
             and x_TD.is_cuda
@@ -519,8 +523,9 @@ class TritonRoutedExperts(RoutedExperts):
                 x_TD,
                 topk_scores_TK,
                 topk_expert_ids_TK,
-                _local(self.w13.weight),
-                _local(self.w2.weight),
+                *self._expert_weights(),
+                ep_rank=route_ep[0],
+                ep_size=route_ep[1],
             )
         if num_local_tokens_per_expert_E is None:  # count_tokens left it to us
             ids_N = topk_expert_ids_TK.reshape(-1)
@@ -537,16 +542,42 @@ class TritonRoutedExperts(RoutedExperts):
         )
 
     def count_tokens(self, routing_map_TE: torch.Tensor) -> torch.Tensor | None:
-        if self._runs_ep1_path():
-            return None  # the EP=1 kernels count the expert ids themselves
+        if self._route_reading_ep(routing_map_TE) is not None:
+            return None  # the route-reading kernels count the expert ids themselves
         return super().count_tokens(routing_map_TE)
 
-    def _runs_ep1_path(self) -> bool:
-        return (
-            self._all_experts_local()
-            and self.output_postprocess is None
-            and self._can_run_triton(_local(self.w13.weight), _local(self.w2.weight))
-        )
+    def _route_reading_ep(self, x: torch.Tensor) -> tuple[int, int] | None:
+        """``(ep_rank, ep_size)`` for the route-reading kernels, or None for the dispatcher.
+
+        They need every token on this rank: all experts local (EP=1), or the generator's
+        replicated-token MoE (the same condition as ``MoE._routed_tokens_replicated``),
+        whose output is this rank's TP partial. With TP-sharded experts every expert is
+        local at half width, so all routes count (``ep_size`` 1).
+        """
+        if self.output_postprocess is not None or not self._can_run_triton(
+            *self._expert_weights()
+        ):
+            return None
+        dispatcher = self.token_dispatcher
+        if self._all_experts_local():
+            return 0, 1
+        if type(dispatcher) is not AllToAllTokenDispatcher or not dispatcher.replicated_tokens:
+            return None
+        if dispatcher.experts_tp_sharded:
+            return 0, 1
+        if dispatcher.captures_inference(x):
+            return dispatcher.ep_mesh.get_local_rank(), dispatcher.ep_mesh.size()
+        return None
+
+    def _expert_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """w13 ``[E, 2, F, D]`` and w2 ``[E, D, F]`` as the GEMMs read them: after
+        ``tp_experts.relayout``, every expert's TP half (``F / 2``) from ``_tp_weight``
+        (the parameters' storage then holds that layout); else this rank's experts."""
+        w13 = getattr(self.w13, "_tp_weight", None)
+        w2 = getattr(self.w2, "_tp_weight", None)
+        if w13 is not None and w2 is not None:
+            return w13, w2
+        return _local(self.w13.weight), _local(self.w2.weight)
 
     def _all_experts_local(self) -> bool:
         dispatcher = self.token_dispatcher
@@ -561,7 +592,7 @@ class TritonRoutedExperts(RoutedExperts):
         self, routed_input_RD: torch.Tensor, offsets_E: torch.Tensor
     ) -> torch.Tensor:
         routed_input_RD = routed_input_RD.bfloat16()
-        w13_E2FD, w2_EDF = _local(self.w13.weight), _local(self.w2.weight)
+        w13_E2FD, w2_EDF = self._expert_weights()
         if not (
             self._can_run_triton(w13_E2FD, w2_EDF)
             and routed_input_RD.is_cuda
