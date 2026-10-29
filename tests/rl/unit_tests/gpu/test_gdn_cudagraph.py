@@ -198,10 +198,9 @@ def test_single_token_reused_state_capture(monkeypatch, batch_invariant: bool) -
     weight = torch.randn(6144, 4, device=device, dtype=torch.bfloat16)
     a, b = torch.randn(2, 4, 16, device=device)
     A_log, bias = torch.randn(2, 16, device=device)
-    output = torch.zeros(4, 16, 128, device=device, dtype=torch.bfloat16)
 
     def forward():
-        layer._forward(inputs, a, b, weight, None, A_log, bias, output)
+        return layer._forward(inputs, a, b, weight, None, A_log, bias)
 
     def without_mask(kernel):
         def resumed(*args, has_initial_state=None, **kwargs):
@@ -217,7 +216,7 @@ def test_single_token_reused_state_capture(monkeypatch, batch_invariant: bool) -
         stream.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            forward()
+            output = forward()
         # The first replay occupies both slots. Later requests reuse dirty slots,
         # alone and beside a continuing request, without changing the graph key.
         for slots, initial in (
@@ -248,8 +247,7 @@ def test_single_token_reused_state_capture(monkeypatch, batch_invariant: bool) -
                     "recurrent_gdn",
                 ):
                     unmasked.setattr(gdn, name, without_mask(getattr(gdn, name)))
-                forward()
-            expected = output.clone()
+                expected = forward()
             layer.kv_cache = cache_views(pools)
             has_initial_state.copy_(
                 torch.tensor(initial + [False] * (4 - len(slots)), device=device)
