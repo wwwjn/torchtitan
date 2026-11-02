@@ -27,7 +27,7 @@ caches on every weight load instead:
 
 Normalizing and patchifying on the GPU instead of the CPU keeps ~20 ms per image off
 the engine loop thread and sends 8x fewer bytes host to device; the values are the
-ones ``ImageCache.load_pixel_values`` computes on the CPU.
+ones `patchify` computes on the CPU.
 
 The processor registered with vLLM only serves vLLM's startup: the largest cached
 image sizes the encoder budget, and a dummy image of that size profiles the encoder's

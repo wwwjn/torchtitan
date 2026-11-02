@@ -14,6 +14,7 @@ from PIL import Image
 from torchtitan.components.data.multimodal.image_cache import (
     build_image_cache,
     ImageCacheSpec,
+    patchify,
 )
 from torchtitan.components.data.multimodal.utils.image import (
     process_image,
@@ -43,7 +44,8 @@ def test_cached_patches_match_process_image(tmp_path, image_paths) -> None:
     cache = build_image_cache(image_paths, str(tmp_path / "cache"), spec, num_workers=1)
 
     images = [cache.lookup(path) for path in image_paths]
-    pixel_values, grid_thw = cache.load_pixel_values([image.key for image in images])
+    pixel_values = patchify(cache.load_images([image.key for image in images]), spec)
+    grid_thw = torch.tensor([image.grid_thw for image in images])
 
     expected = [
         vision_to_patches(

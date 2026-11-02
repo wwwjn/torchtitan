@@ -21,7 +21,11 @@ from typing import Any
 import numpy as np
 import torch
 
-from torchtitan.components.data.multimodal.image_cache import ImageCache
+from torchtitan.components.data.multimodal.image_cache import (
+    ImageCache,
+    ImageCacheSpec,
+    patchify_flat,
+)
 from torchtitan.components.data.multimodal.mrope import get_mrope_positions
 from torchtitan.components.data.types import TokenizedTrainingMicrobatch
 
@@ -53,6 +57,32 @@ class TrainingMicrobatch(TokenizedTrainingMicrobatch):
     temperature: torch.Tensor  # [T]
     loss_mask: torch.Tensor  # [T]
     advantages: torch.Tensor  # [T]
+    image_spec: ImageCacheSpec | None = None
+    """Patchify settings for ``model_kwargs["images"]`` (the cache's resized uint8 images,
+    flattened and concatenated); `to_input_dict` turns them into ``pixel_values``. None
+    without images."""
+
+    def to_input_dict(
+        self, device: torch.device | str, *, non_blocking: bool = False
+    ) -> dict[str, Any]:
+        """Move the inputs to ``device``, patchifying uint8 images there.
+
+        The batcher ships the cached uint8 images, 8x fewer bytes than float32 patches,
+        and the patches computed on the device equal the CPU's bitwise. ``as_input_dict``
+        still holds the uint8 ``images``; only this method gives model inputs.
+        """
+        # Explicit base call: zero-argument super() fails in slots=True dataclasses.
+        input_dict = TokenizedTrainingMicrobatch.to_input_dict(
+            self, device, non_blocking=non_blocking
+        )
+        images = input_dict.pop("images", None)
+        if images is not None:
+            assert self.image_spec is not None
+            # The CPU copy of the grid: no device sync for the shapes.
+            input_dict["pixel_values"] = patchify_flat(
+                images, self.model_kwargs["grid_thw"].tolist(), self.image_spec
+            )
+        return input_dict
 
     def as_input_dict(self) -> dict[str, Any]:
         """Return the model inputs plus the per-token RL loss arguments.
@@ -572,11 +602,13 @@ class Batcher(Configurable):
         of PP microbatches per scheduling step. First-fit decreasing (FFD)
         determines B bins subject to T and max_num_documents. Each step has
         M * D slots, so G = ceil(B / (M * D)) steps form a ``[G][M][D]`` grid.
-        Try longest-processing-time (LPT) packing: place longest samples first in
-        the feasible bin with the highest padding-aware attention work,
-        breaking ties by fewer packed tokens. If any
+        Try longest-processing-time (LPT) packing: place longest samples first,
+        preferring a feasible bin that already holds one of the sample's images,
+        then the one with the highest padding-aware attention work, breaking
+        ties by fewer packed tokens. If any
         sample cannot fit, discard the partial LPT assignment and reuse FFD,
-        splitting its bins to fill the extra slots where possible. Both paths
+        splitting its bins to fill the extra slots where possible (the FFD
+        fallback ignores image affinity). Both paths
         have the same grid size and therefore the same total padding fraction.
 
         Sort the bins by padding-aware attention cost (see
@@ -663,7 +695,8 @@ class Batcher(Configurable):
         This models the existing padding segments without increasing their
         number or changing fixed-size varlen metadata.
         """
-        # TODO(rl): Account for hybrid sliding-window or linear-attention layers.
+        # TODO(rl): Account for hybrid sliding-window or linear-attention layers, and for
+        #   vision encoder work (distinct images per bin), which image affinity concentrates.
         sample_lengths = [
             self.num_tokens_to_pack(sample) for sample in training_samples
         ]
@@ -683,8 +716,11 @@ class Batcher(Configurable):
         *,
         target_num_bins: int,
     ) -> list[list[TrainingSample]] | None:
-        """Put longest samples in the highest-workload feasible fixed bin.
+        """Put longest samples first into a feasible bin that already holds one of their
+        images, else into the highest-workload feasible bin.
 
+        Image affinity lets the trainer encode the images of a GRPO group in fewer
+        microbatches.
         Adding a sample cannot increase padding-aware attention work. Break
         workload ties by fewer packed tokens to spread full-length documents
         whose work exactly replaces one padding segment.
@@ -695,9 +731,11 @@ class Batcher(Configurable):
         bins: list[list[TrainingSample]] = [[] for _ in range(target_num_bins)]
         bin_num_tokens = [0] * target_num_bins
         bin_workloads = [self._attention_workload([])] * target_num_bins
+        bin_image_keys: list[set[str]] = [set() for _ in range(target_num_bins)]
 
         for sample in ordered_samples:
             num_tokens = self.num_tokens_to_pack(sample)
+            image_keys = {image.key for image in sample.images}
             destination = max(
                 (
                     index
@@ -708,7 +746,13 @@ class Batcher(Configurable):
                         or len(bin_) < self._max_num_documents
                     )
                 ),
-                key=lambda index: (bin_workloads[index], -bin_num_tokens[index]),
+                # False for every bin when a sample has no images, so text samples pick
+                # the same bin as before.
+                key=lambda index: (
+                    not image_keys.isdisjoint(bin_image_keys[index]),
+                    bin_workloads[index],
+                    -bin_num_tokens[index],
+                ),
                 default=None,
             )
             if destination is None:
@@ -717,6 +761,7 @@ class Batcher(Configurable):
             bins[destination].append(sample)
             bin_num_tokens[destination] += num_tokens
             bin_workloads[destination] = self._attention_workload(bins[destination])
+            bin_image_keys[destination] |= image_keys
 
         return bins
 
@@ -931,6 +976,9 @@ class Batcher(Configurable):
             loss_token_counts=loss_token_counts,
             routing_token_counts=routing_token_counts,
             model_kwargs=model_kwargs,
+            image_spec=(
+                self._images.spec if self._images is not None and model_kwargs else None
+            ),
         )
 
     def _image_model_kwargs(
@@ -955,7 +1003,7 @@ class Batcher(Configurable):
 
             input tokens                 t  k  k  k  t  t | t  k  k  k  t  t
             image_vision_bank_indices_T -1  0  1  2 -1 -1 |-1  0  1  2 -1 -1
-            pixel_values                 patches of k, once
+            images                       uint8 pixels of k, once (patchified on the trainer)
 
         Args:
             training_samples: The packed samples, in packing order.
@@ -993,11 +1041,17 @@ class Batcher(Configurable):
                     spatial_merge_size=self._images.spec.merge_size,
                 )
             start += sample_len
-        pixel_values, grid_thw = self._images.load_pixel_values(list(bank_start_by_key))
+        keys = list(bank_start_by_key)
         return {
             "mrope_positions": mrope_positions,
-            "pixel_values": pixel_values,
-            "grid_thw": grid_thw,
+            # Resized uint8 images, flattened; `TrainingMicrobatch.to_input_dict` patchifies
+            # them on the trainer's device.
+            "images": torch.cat(
+                [image.flatten() for image in self._images.load_images(keys)]
+            ),
+            "grid_thw": torch.tensor(
+                [self._images.get(key).grid_thw for key in keys], dtype=torch.int64
+            ),
             "image_vision_bank_indices_T": torch.from_numpy(bank_rows),
         }
 

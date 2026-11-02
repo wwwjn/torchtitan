@@ -16,6 +16,7 @@ from PIL import Image
 from torchtitan.components.data.multimodal.image_cache import (
     build_image_cache,
     ImageCacheSpec,
+    patchify,
 )
 from torchtitan.components.data.multimodal.mrope import get_mrope_positions
 from torchtitan.rl.rollout.types import PromptImage, RolloutTurnID
@@ -321,8 +322,14 @@ def test_microbatch_encodes_each_distinct_image_once(image_cache) -> None:
     microbatch = batcher._pack_training_samples(samples)
     kwargs = microbatch.model_kwargs
 
-    pixel_values, grid_thw = image_cache.load_pixel_values([a.key, b.key])
-    assert torch.equal(kwargs["pixel_values"], pixel_values)
+    # The batcher ships the uint8 images once each; moving the inputs to the trainer's
+    # device patchifies them into the model's pixel_values.
+    pixel_values = patchify(image_cache.load_images([a.key, b.key]), image_cache.spec)
+    grid_thw = torch.tensor([a.grid_thw, b.grid_thw])
+    assert kwargs["images"].dtype == torch.uint8
+    input_dict = microbatch.to_input_dict("cpu")
+    assert "images" not in input_dict
+    assert torch.equal(input_dict["pixel_values"], pixel_values)
     assert torch.equal(kwargs["grid_thw"], grid_thw)
     rows = kwargs["image_vision_bank_indices_T"].tolist()
     a_rows = list(range(image_a.length))
@@ -391,3 +398,36 @@ def test_image_grid_must_match_the_batcher_cache(image_cache) -> None:
 
     with pytest.raises(ValueError, match="same spec"):
         batcher._pack_training_samples([_image_sample(0, [image], 12)])
+
+
+def test_packing_keeps_samples_of_an_image_together(image_cache) -> None:
+    # Two groups of three samples, one image per group: each group fits one microbatch.
+    batcher = Batcher.Config(image_cache_dir=image_cache.cache_dir).build(
+        num_tokens_per_microbatch_per_dp_rank=64,
+        max_context_length=64,
+        num_prompts_per_train_step=1,
+        dp_degree=2,
+        pad_id=0,
+        temperature=1.0,
+    )
+    a, b = list(image_cache)
+    samples = []
+    for group, cached in enumerate((a, b)):
+        image = PromptImage(
+            key=cached.key,
+            grid_thw=cached.grid_thw,
+            offset=1,
+            length=image_cache.num_tokens(cached),
+        )
+        samples += [
+            _image_sample(3 * group + index, [image], 18 + index * 2 - group)
+            for index in range(3)
+        ]
+
+    [row] = batcher._assign_training_samples_to_microbatches(samples)
+
+    keys_per_microbatch = sorted(
+        sorted({image.key for sample in bin_ for image in sample.images})
+        for bin_ in row
+    )
+    assert keys_per_microbatch == sorted([[a.key], [b.key]])

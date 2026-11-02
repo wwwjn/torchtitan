@@ -11,16 +11,16 @@ of a GRPO group, every epoch, generator and trainer). Decoding and resizing on
 each use would put JPEG decode and bicubic resize on the rollout controller's
 event loop and ship megabytes of ``pixel_values`` through every RPC. Instead a
 dataset's images are processed once, offline, into resized ``uint8`` arrays
-keyed by a content hash. Callers pass the key; only the processes that need
-pixels (generator, batcher) load and patchify them.
+keyed by a content hash. Callers pass the key; the generator and the batcher
+load the uint8 images, and the generator and the trainer patchify them on the
+GPU.
 
 The stored array is ``decode_and_resize_image``'s output (``process_image``
-before normalization), so ``ImageCache.load_pixel_values`` returns exactly the
-patches ``process_image`` + ``vision_to_patches`` produce, at ~8x fewer stored
-bytes than float32 patches (uint8, no temporal-patch duplication). Normalizing
-and patchifying on the CPU costs ~20 ms per image on one thread; callers on a
-hot path load the uint8 images (``load_images``, ~0.6 ms) and run `patchify` on
-the GPU instead, which gives the same values.
+before normalization), so ``patchify(cache.load_images(keys), cache.spec)``
+returns exactly the patches ``process_image`` + ``vision_to_patches`` produce,
+at ~8x fewer stored bytes than float32 patches (uint8, no temporal-patch
+duplication). Loading takes ~0.6 ms per image; normalizing and patchifying on
+the CPU ~20 ms on one thread, and on the GPU it gives the same values.
 
 An image's key is a hash of its file bytes, so `ImageCache.lookup` finds an
 image by content wherever the dataset is mounted, without decoding it.
@@ -103,7 +103,7 @@ class ImageCache:
         cache = ImageCache("/data/slake/image_cache")
         image = cache.lookup("/data/slake/imgs/xmlab1/source.jpg")
         cache.num_tokens(image)  # placeholder tokens after spatial merging
-        pixel_values, grid_thw = cache.load_pixel_values([image.key])
+        pixel_values = patchify(cache.load_images([image.key]), cache.spec)
     """
 
     def __init__(self, cache_dir: str) -> None:
@@ -151,18 +151,6 @@ class ImageCache:
         t, h, w = image.grid_thw
         return t * h * w // self.spec.merge_size**2
 
-    def load_pixel_values(
-        self, keys: Sequence[str]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return float32 patches and ``grid_thw (n, 3)``.
-
-        Patches are ``(num_patches, C * temporal_patch_size * patch_size**2)``.
-        Patches are in block order, concatenated in ``keys`` order, matching
-        ``MultiModalCollator`` and the Qwen-style vision encoders.
-        """
-        grid_thw = torch.tensor([self._grids[key] for key in keys], dtype=torch.int64)
-        return patchify(self.load_images(keys), self.spec), grid_thw
-
     def load_images(self, keys: Sequence[str]) -> list[torch.Tensor]:
         """Return the resized uint8 images ``(C, H, W)`` of ``keys``, unnormalized."""
         return [
@@ -188,6 +176,23 @@ def patchify(images: Sequence[torch.Tensor], spec: ImageCacheSpec) -> torch.Tens
         )
         patches.append(image_patches)
     return torch.cat(patches)
+
+
+def patchify_flat(
+    flat_images: torch.Tensor, grid_thw: list[list[int]], spec: ImageCacheSpec
+) -> torch.Tensor:
+    """`patchify` for `ImageCache.load_images` outputs flattened and concatenated in
+    ``grid_thw`` order.
+
+    Cached images are ``(3, h * patch_size, w * patch_size)`` with ``t == 1`` (see
+    `_process_one`).
+    """
+    assert all(t == 1 for t, _, _ in grid_thw), grid_thw
+    shapes = [(3, h * spec.patch_size, w * spec.patch_size) for _, h, w in grid_thw]
+    flat = flat_images.split([c * h * w for c, h, w in shapes])
+    return patchify(
+        [image.view(shape) for image, shape in zip(flat, shapes, strict=True)], spec
+    )
 
 
 def _content_key(data: bytes) -> str:
