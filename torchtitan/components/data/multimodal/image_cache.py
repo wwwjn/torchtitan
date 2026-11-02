@@ -132,6 +132,16 @@ class ImageCache:
             )
         return CachedImage(key=key, grid_thw=self._grids[key])
 
+    def get(self, key: str) -> CachedImage:
+        """Return the cached image whose content key is ``key``."""
+        try:
+            grid_thw = self._grids[key]
+        except KeyError:
+            raise KeyError(
+                f"Image {key!r} is not in the image cache at {self.cache_dir!r}."
+            ) from None
+        return CachedImage(key=key, grid_thw=grid_thw)
+
     def __iter__(self) -> Iterator[CachedImage]:
         for key, grid_thw in self._grids.items():
             yield CachedImage(key=key, grid_thw=grid_thw)

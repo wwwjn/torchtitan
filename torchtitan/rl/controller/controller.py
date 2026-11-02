@@ -385,6 +385,18 @@ class Controller(Configurable):
                     "async_loop.batcher.rdma_min_tensor_bytes does not support "
                     "trainer pipeline parallelism yet."
                 )
+            # Engines without image support have no image_cache_dir.
+            serves_images = (
+                getattr(self.generator.engine, "image_cache_dir", None) is not None
+            )
+            trains_on_images = self.async_loop.batcher.image_cache_dir is not None
+            if serves_images != trains_on_images:
+                raise ValueError(
+                    "Set both generator.engine.image_cache_dir and "
+                    "async_loop.batcher.image_cache_dir for image prompts, or neither; got "
+                    f"{getattr(self.generator.engine, 'image_cache_dir', None)!r} and "
+                    f"{self.async_loop.batcher.image_cache_dir!r}."
+                )
             if self.trainer.parallelism.enable_sequence_parallel:
                 sp_degree = self.trainer.parallelism.tensor_parallel_degree
                 max_context_length = self.trainer.training.max_context_length

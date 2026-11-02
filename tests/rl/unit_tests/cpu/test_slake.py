@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import asyncio
+import dataclasses
 import json
 
 import numpy as np
@@ -140,3 +141,16 @@ def test_reward_scores_the_last_turn() -> None:
     )
     reward = RewardSlakeAnswer(RewardSlakeAnswer.Config())
     assert asyncio.run(reward(rollout, sample)) == 1.0
+
+
+def test_image_recipe_needs_the_image_cache_on_generator_and_batcher() -> None:
+    from torchtitan_recipes.rl.slake import rl_grpo_qwen3_5_0_8b_slake
+
+    config = rl_grpo_qwen3_5_0_8b_slake()
+    async_loop = config.async_loop
+    batcher = dataclasses.replace(async_loop.batcher, image_cache_dir=None)
+
+    with pytest.raises(ValueError, match="or neither"):
+        dataclasses.replace(
+            config, async_loop=dataclasses.replace(async_loop, batcher=batcher)
+        )

@@ -4,13 +4,21 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""CPU tests for fixed-bin LPT packing and its FFD fallback."""
+"""CPU tests for batcher packing (fixed-bin LPT, FFD fallback) and image microbatches."""
 
+import dataclasses
 import random
 
 import numpy as np
+import pytest
 import torch
-from torchtitan.rl.rollout.types import RolloutTurnID
+from PIL import Image
+from torchtitan.components.data.multimodal.image_cache import (
+    build_image_cache,
+    ImageCacheSpec,
+)
+from torchtitan.components.data.multimodal.mrope import get_mrope_positions
+from torchtitan.rl.rollout.types import PromptImage, RolloutTurnID
 
 from torchtitan.rl.trainer.batcher import Batcher
 from torchtitan.rl.trainer.training_sample_builder import TrainingSample
@@ -259,3 +267,127 @@ def test_microbatch_moves_loss_kwargs_with_the_model_inputs() -> None:
     }
     for value in input_dict["loss_kwargs"].values():
         assert value.device.type == "meta"
+
+
+@pytest.fixture
+def image_cache(tmp_path):
+    rng = np.random.default_rng(0)
+    paths = []
+    for name, (width, height) in (("a.png", (64, 32)), ("b.png", (32, 64))):
+        path = tmp_path / name
+        Image.fromarray(
+            rng.integers(0, 256, size=(height, width, 3), dtype=np.uint8)
+        ).save(path)
+        paths.append(str(path))
+    spec = ImageCacheSpec(min_pixels=32 * 32, max_pixels=64 * 64)
+    return build_image_cache(paths, str(tmp_path / "cache"), spec, num_workers=1)
+
+
+def _image_sample(index: int, images: list[PromptImage], length: int) -> TrainingSample:
+    [sample] = _make_samples([length])
+    return dataclasses.replace(
+        sample,
+        rollout_id=RolloutTurnID(group_id=0, rollout_id=index, turn_id=0),
+        images=tuple(images),
+    )
+
+
+def test_microbatch_encodes_each_distinct_image_once(image_cache) -> None:
+    batcher = Batcher.Config(image_cache_dir=image_cache.cache_dir).build(
+        num_tokens_per_microbatch_per_dp_rank=64,
+        max_context_length=32,
+        num_prompts_per_train_step=1,
+        dp_degree=1,
+        pad_id=0,
+        temperature=1.0,
+    )
+    a, b = list(image_cache)
+    image_a = PromptImage(
+        key=a.key, grid_thw=a.grid_thw, offset=1, length=image_cache.num_tokens(a)
+    )
+    image_b = PromptImage(
+        key=b.key,
+        grid_thw=b.grid_thw,
+        offset=2 + image_a.length,
+        length=image_cache.num_tokens(b),
+    )
+    # Two samples of one group show image a; the second also shows image b; a third is text.
+    samples = [
+        _image_sample(0, [image_a], 12),
+        _image_sample(1, [image_a, image_b], 16),
+        _image_sample(2, [], 5),
+    ]
+
+    microbatch = batcher._pack_training_samples(samples)
+    kwargs = microbatch.model_kwargs
+
+    pixel_values, grid_thw = image_cache.load_pixel_values([a.key, b.key])
+    assert torch.equal(kwargs["pixel_values"], pixel_values)
+    assert torch.equal(kwargs["grid_thw"], grid_thw)
+    rows = kwargs["image_vision_bank_indices_T"].tolist()
+    a_rows = list(range(image_a.length))
+    b_rows = list(range(image_a.length, image_a.length + image_b.length))
+    expected = [-1] * 64
+    expected[1 : 1 + image_a.length] = a_rows
+    expected[13 : 13 + image_a.length] = a_rows
+    start_b = 12 + image_b.offset
+    expected[start_b : start_b + image_b.length] = b_rows
+    assert rows == expected
+    expected_mrope = torch.cat(
+        [
+            get_mrope_positions(12, [(1, a.grid_thw)], spatial_merge_size=2),
+            get_mrope_positions(
+                16,
+                [(1, a.grid_thw), (image_b.offset, b.grid_thw)],
+                spatial_merge_size=2,
+            ),
+            torch.arange(5).unsqueeze(1).expand(5, 3),
+            (torch.arange(64 - 33) % 32).unsqueeze(1).expand(64 - 33, 3),
+        ]
+    )
+    assert torch.equal(kwargs["mrope_positions"], expected_mrope)
+
+
+def _image_batcher(cache_dir: str | None, num_tokens: int = 16) -> Batcher:
+    return Batcher.Config(image_cache_dir=cache_dir).build(
+        num_tokens_per_microbatch_per_dp_rank=num_tokens,
+        max_context_length=num_tokens,
+        num_prompts_per_train_step=1,
+        dp_degree=1,
+        pad_id=0,
+        temperature=1.0,
+    )
+
+
+def test_text_microbatch_in_image_mode_has_no_image_inputs(image_cache) -> None:
+    batcher = _image_batcher(image_cache.cache_dir)
+
+    microbatch = batcher._pack_training_samples(_make_samples([5]))
+
+    # The model uses the 1D positions and runs its dummy vision forward, as on every
+    # rank without images.
+    assert microbatch.model_kwargs == {}
+
+
+def test_image_samples_need_an_image_cache(image_cache) -> None:
+    a = next(iter(image_cache))
+    image = PromptImage(
+        key=a.key, grid_thw=a.grid_thw, offset=1, length=image_cache.num_tokens(a)
+    )
+    batcher = _image_batcher(None, num_tokens=64)
+
+    with pytest.raises(ValueError, match="image_cache_dir is None"):
+        batcher._pack_training_samples([_image_sample(0, [image], 12)])
+
+
+def test_image_grid_must_match_the_batcher_cache(image_cache) -> None:
+    a = next(iter(image_cache))
+    t, h, w = a.grid_thw
+    # The renderer's cache had another spec: another grid for the same content key.
+    image = PromptImage(
+        key=a.key, grid_thw=(t, h + 2, w), offset=1, length=image_cache.num_tokens(a)
+    )
+    batcher = _image_batcher(image_cache.cache_dir, num_tokens=64)
+
+    with pytest.raises(ValueError, match="same spec"):
+        batcher._pack_training_samples([_image_sample(0, [image], 12)])
