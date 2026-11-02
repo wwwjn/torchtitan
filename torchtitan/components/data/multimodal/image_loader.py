@@ -23,7 +23,9 @@ no access to the file system the dataset is on.
 
 Loading runs ``decode_and_resize_image`` (``process_image`` before
 normalization), so ``patchify(loader.load_images(files), loader.spec)``
-returns exactly the patches ``process_image`` + ``vision_to_patches`` produce.
+returns exactly the patches ``process_image`` + ``vision_to_patches`` produce
+for the loader's `ImageSpec` (e.g. Qwen3.5's pixel budget and block order, or
+Muse Spark's merged-patch grid and raster order).
 Normalizing and patchifying costs ~20 ms per image on one CPU thread, so the
 generator and the trainer run `patchify` on the GPU, which gives the same
 values. The key is a hash of the file bytes, so the samples
@@ -36,8 +38,9 @@ import functools
 import hashlib
 import io
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from typing import Literal
 
 import torch
 from PIL import Image
@@ -45,6 +48,7 @@ from PIL import Image
 from torchtitan.components.data.multimodal.utils.image import (
     decode_and_resize_image,
     normalize_image,
+    resize_to_merged_patch_grid,
     resize_to_pixel_budget,
     vision_to_patches,
 )
@@ -56,19 +60,36 @@ class ImageSpec:
     """The model's image preprocessing; defaults match Qwen3-VL / Qwen3.5.
 
     The arguments of ``process_image`` + ``vision_to_patches`` for the model's
-    vision encoder.
+    vision encoder. It must match the model's vision encoder and the SFT data
+    pipeline of the same model, so the generator and the trainer see the pixels
+    the model was trained on.
     """
 
     patch_size: int = 16
     temporal_patch_size: int = 2
     merge_size: int = 2
     """Patches merged per side into one placeholder token (``spatial_merge_size``)."""
+    resize: Literal["pixel_budget", "merged_patch_grid"] = "pixel_budget"
+    """``resize_to_pixel_budget`` (bounded by ``min_pixels``/``max_pixels``) or
+    ``resize_to_merged_patch_grid`` (bounded by ``max_image_tokens``)."""
     min_pixels: int = 65536
     """Lower bound on H * W after the resize."""
     max_pixels: int = 16777216
     """Upper bound on H * W after the resize."""
+    max_image_tokens: int = 4096
+    patch_order: Literal["block", "raster"] = "block"
+    """Patch sequence layout the vision encoder expects (see ``vision_to_patches``)."""
     image_mean: tuple[float, float, float] = (0.5, 0.5, 0.5)
     image_std: tuple[float, float, float] = (0.5, 0.5, 0.5)
+
+
+IMAGE_SPECS = {
+    "qwen3_5": ImageSpec(),
+    # Muse Spark's SFT pipeline: `torchtitan_recipes.models.muse_spark._muse_spark_mm_dataloader`.
+    "muse_spark": ImageSpec(
+        patch_size=14, resize="merged_patch_grid", patch_order="raster"
+    ),
+}
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -101,7 +122,8 @@ class ImageLoader(Configurable):
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
         spec: ImageSpec = field(default_factory=ImageSpec)
-        """The model's preprocessing; the defaults are Qwen3-VL / Qwen3.5's."""
+        """The model's preprocessing; the defaults are Qwen3-VL / Qwen3.5's, and
+        ``IMAGE_SPECS`` has other models'."""
 
     def __init__(self, config: Config) -> None:
         self.spec = config.spec
@@ -125,12 +147,15 @@ class ImageLoader(Configurable):
         return t * h * w // self.spec.merge_size**2
 
     def largest_grid(self, max_tokens: int) -> tuple[int, int, int]:
-        """The largest square grid within the pixel budget and ``max_tokens``
+        """The largest square grid within the resize budget and ``max_tokens``
         placeholder tokens; vLLM profiles the vision encoder with it. The encoder's
         cost depends on the token count, not on the shape."""
         spec = self.spec
-        merged_pixels = (spec.patch_size * spec.merge_size) ** 2
-        side = math.isqrt(min(max_tokens, spec.max_pixels // merged_pixels))
+        if spec.resize == "pixel_budget":
+            budget = spec.max_pixels // (spec.patch_size * spec.merge_size) ** 2
+        else:
+            budget = spec.max_image_tokens
+        side = math.isqrt(min(max_tokens, budget))
         if side == 0:
             raise ValueError(
                 f"No image fits {max_tokens} tokens with patch size {spec.patch_size} "
@@ -198,7 +223,7 @@ def decode_flat(
 
 
 def patchify(images: Sequence[torch.Tensor], spec: ImageSpec) -> torch.Tensor:
-    """Normalize resized uint8 images and cut them into concatenated block-order patches.
+    """Normalize resized uint8 images and cut them into concatenated patches.
 
     These are ``normalize_image`` and ``vision_to_patches``. They run on the images'
     device and are elementwise float32 ops plus reshapes, so the CPU and the GPU
@@ -211,6 +236,7 @@ def patchify(images: Sequence[torch.Tensor], spec: ImageSpec) -> torch.Tensor:
             spec.patch_size,
             spec.temporal_patch_size,
             spec.merge_size,
+            patch_order=spec.patch_order,
         )
         patches.append(image_patches)
     return torch.cat(patches)
@@ -244,12 +270,22 @@ def _decode_and_resize(data: bytes, spec: ImageSpec) -> torch.Tensor:
         merge_size=spec.merge_size,
         min_pixels=spec.min_pixels,
         max_pixels=spec.max_pixels,
+        resize_fn=_resize_fn(spec),
+    )
+
+
+def _resize_fn(spec: ImageSpec) -> Callable[..., tuple[int, int, int, int]]:
+    """``spec``'s resize strategy, called with ``decode_and_resize_image``'s kwargs."""
+    if spec.resize == "pixel_budget":
+        return resize_to_pixel_budget
+    return functools.partial(
+        resize_to_merged_patch_grid, max_image_tokens=spec.max_image_tokens
     )
 
 
 def _grid_thw(height: int, width: int, spec: ImageSpec) -> tuple[int, int, int]:
     """Patch grid of a ``height x width`` image after `_decode_and_resize`."""
-    resize_h, resize_w, pad_h, pad_w = resize_to_pixel_budget(
+    resize_h, resize_w, pad_h, pad_w = _resize_fn(spec)(
         height,
         width,
         patch_size=spec.patch_size,

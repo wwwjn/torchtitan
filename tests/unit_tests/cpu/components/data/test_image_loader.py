@@ -13,6 +13,7 @@ from PIL import Image
 
 from torchtitan.components.data.multimodal.image_loader import (
     decode_flat,
+    IMAGE_SPECS,
     ImageLoader,
     ImageSpec,
     patchify,
@@ -20,6 +21,7 @@ from torchtitan.components.data.multimodal.image_loader import (
 )
 from torchtitan.components.data.multimodal.utils.image import (
     process_image,
+    resize_to_merged_patch_grid,
     vision_to_patches,
 )
 
@@ -64,6 +66,38 @@ def test_patches_and_header_grids_match_process_image(image_paths) -> None:
     for image, (patches, grid) in zip(images, expected):
         assert image.grid_thw == tuple(grid.tolist())
         assert loader.num_tokens(image) == patches.shape[0] // spec.merge_size**2
+
+
+def test_muse_spark_spec_matches_its_sft_preprocessing(image_paths) -> None:
+    # `_muse_spark_mm_dataloader`: 14-px patches, merged-patch-grid resize, raster order.
+    spec = IMAGE_SPECS["muse_spark"]
+    loader = ImageLoader.Config(spec=spec).build()
+
+    images = [loader.lookup(path) for path in image_paths]
+    pixel_values = patchify(loader.load_images([image.data for image in images]), spec)
+    grid_thw = torch.tensor([image.grid_thw for image in images])
+
+    expected = [
+        vision_to_patches(
+            process_image(
+                path,
+                patch_size=14,
+                merge_size=2,
+                resize_fn=resize_to_merged_patch_grid,
+                image_mean=(0.5, 0.5, 0.5),
+                image_std=(0.5, 0.5, 0.5),
+            ),
+            14,
+            2,
+            2,
+            patch_order="raster",
+        )
+        for path in image_paths
+    ]
+    assert torch.equal(pixel_values, torch.cat([patches for patches, _ in expected]))
+    assert torch.equal(grid_thw, torch.stack([grid for _, grid in expected]))
+    # 300x200 -> the closest merged grid (h, w) = (7, 11): 77 <|patch|> tokens.
+    assert loader.num_tokens(images[0]) == 77
 
 
 def test_lookup_keys_an_image_by_content_from_any_path(
