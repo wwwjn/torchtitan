@@ -8,25 +8,25 @@
 
 RL renders, generates and trains on the same images many times (every sample
 of a GRPO group, generator and trainer). Rendering needs only each image's
-patch grid, for its placeholder count; the generator and the batcher need its
+patch grid, for its placeholder count; the generator and the trainer need its
 pixels. So prompts carry each image's file bytes (JPEG, PNG, ...), not pixels
-(see `ImageInfo`), and the processes that need pixels decode them:
+(see `ImageInfo`), and the generator and the trainer decode them:
 
 - `ImageLoader.lookup` (the renderer): reads the file, hashes it into the key,
   and computes the grid from the image header, without decoding the pixels.
-- `ImageLoader.load_pixel_values` (the generator and the batcher): decodes and
-  resizes the file bytes.
+- `ImageLoader.load_images` (the generator) and `decode_flat` (the trainer):
+  decode and resize the file bytes.
 
 A file is usually much smaller than its resized pixels (SLAKE median: 53 KB vs 0.79 MB;
 a large photo the resize scales down gains less), and the processes that decode it need
 no access to the file system the dataset is on.
 
 Loading runs ``decode_and_resize_image`` (``process_image`` before
-normalization), so ``load_pixel_values`` returns exactly the patches
-``process_image`` + ``vision_to_patches`` produce. Normalizing and patchifying
-on the CPU costs ~20 ms per image on one thread; callers on a hot path load
-the uint8 images (``load_images``) and run `patchify` on the GPU instead, which
-gives the same values. The key is a hash of the file bytes, so the samples
+normalization), so ``patchify(loader.load_images(files), loader.spec)``
+returns exactly the patches ``process_image`` + ``vision_to_patches`` produce.
+Normalizing and patchifying costs ~20 ms per image on one CPU thread, so the
+generator and the trainer run `patchify` on the GPU, which gives the same
+values. The key is a hash of the file bytes, so the samples
 that show one image share it.
 """
 
@@ -95,7 +95,7 @@ class ImageLoader(Configurable):
         images = ImageLoader.Config().build()
         image = images.lookup("/data/slake/imgs/xmlab1/source.jpg")
         images.num_tokens(image)  # placeholder tokens after spatial merging
-        pixel_values, grid_thw = images.load_pixel_values([image.data])
+        pixel_values = patchify(images.load_images([image.data]), images.spec)
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -142,26 +142,6 @@ class ImageLoader(Configurable):
         """Return the resized uint8 images ``(C, H, W)`` of image ``files``, unnormalized."""
         return [_decode_and_resize(data, self.spec) for data in files]
 
-    def load_pixel_values(
-        self, files: Sequence[bytes]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return the float32 patches and ``grid_thw (n, 3)`` of image ``files``.
-
-        Patches are ``(num_patches, C * temporal_patch_size * patch_size**2)``.
-        Patches are in block order, concatenated in ``files`` order, matching
-        ``MultiModalCollator`` and the Qwen-style vision encoders.
-        """
-        uint8_images = self.load_images(files)
-        patch_size = self.spec.patch_size
-        grid_thw = torch.tensor(
-            [
-                (1, image.shape[1] // patch_size, image.shape[2] // patch_size)
-                for image in uint8_images
-            ],
-            dtype=torch.int64,
-        )
-        return patchify(uint8_images, self.spec), grid_thw
-
 
 @functools.lru_cache(maxsize=64)
 def read_image_file(path: str, key: str) -> bytes:
@@ -183,6 +163,40 @@ def read_image_file(path: str, key: str) -> bytes:
     return data
 
 
+def decode_flat(
+    image_files: torch.Tensor,
+    file_sizes: list[int],
+    grid_thw: list[list[int]],
+    spec: ImageSpec,
+) -> torch.Tensor:
+    """Decode and resize concatenated image files into `patchify_flat`'s input.
+
+    Raises unless each file decodes to the grid its prompt has: placeholders and
+    M-RoPE positions follow the prompt's grid, the patches the decoded image.
+
+    Args:
+        image_files: uint8 ``(sum(file_sizes),)``, the files' bytes concatenated.
+        file_sizes: Bytes per file.
+        grid_thw: Each file's raw patch grid ``(T, H, W)``, from its prompt.
+        spec: The model's image preprocessing.
+    """
+    images = []
+    for index, (data, (t, h, w)) in enumerate(
+        zip(image_files.split(file_sizes), grid_thw, strict=True)
+    ):
+        image = _decode_and_resize(data.numpy().tobytes(), spec)
+        patch = spec.patch_size
+        decoded_grid = (1, image.shape[1] // patch, image.shape[2] // patch)
+        if decoded_grid != (t, h, w):
+            raise ValueError(
+                f"Image file {index} decodes to grid {decoded_grid}, but its prompt has "
+                f"{(t, h, w)}; the renderer and the batcher must use image loaders "
+                "with the same spec."
+            )
+        images.append(image.flatten())
+    return torch.cat(images)
+
+
 def patchify(images: Sequence[torch.Tensor], spec: ImageSpec) -> torch.Tensor:
     """Normalize resized uint8 images and cut them into concatenated block-order patches.
 
@@ -200,6 +214,23 @@ def patchify(images: Sequence[torch.Tensor], spec: ImageSpec) -> torch.Tensor:
         )
         patches.append(image_patches)
     return torch.cat(patches)
+
+
+def patchify_flat(
+    flat_images: torch.Tensor, grid_thw: list[list[int]], spec: ImageSpec
+) -> torch.Tensor:
+    """`patchify` for ``load_images`` outputs flattened and concatenated in
+    ``grid_thw`` order.
+
+    Loaded images are ``(3, h * patch_size, w * patch_size)`` with ``t == 1`` (see
+    `_decode_and_resize`).
+    """
+    assert all(t == 1 for t, _, _ in grid_thw), grid_thw
+    shapes = [(3, h * spec.patch_size, w * spec.patch_size) for _, h, w in grid_thw]
+    flat = flat_images.split([c * h * w for c, h, w in shapes])
+    return patchify(
+        [image.view(shape) for image, shape in zip(flat, shapes, strict=True)], spec
+    )
 
 
 def _content_key(data: bytes) -> str:

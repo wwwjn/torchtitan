@@ -20,7 +20,7 @@ from PIL import Image
 from renderers import create_renderer, CustomRendererConfig, Qwen35RendererConfig
 from renderers.qwen35 import Qwen35Renderer
 
-from torchtitan.components.data.multimodal.image_loader import ImageLoader
+from torchtitan.components.data.multimodal.image_loader import ImageLoader, patchify
 from torchtitan.components.renderer import from_renderers
 from torchtitan.models.qwen3_5.renderer import (
     Qwen35ImageRefRenderer,
@@ -110,7 +110,7 @@ def test_matches_library_renderer(tokenizer, images, image_paths) -> None:
 
     # The loader's patches are what the HF processor feeds the encoder (equal up to
     # float32 rounding of the normalization).
-    pixel_values, _ = loader.load_pixel_values([ref.data for ref in refs])
+    pixel_values = patchify(loader.load_images([ref.data for ref in refs]), loader.spec)
     hf_pixel_values = np.concatenate(
         [item["pixel_values"] for item in expected_mm.mm_items["image"]]
     )
