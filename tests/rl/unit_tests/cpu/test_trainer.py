@@ -17,6 +17,9 @@ from torchtitan.components.data.types import (
     TrainingMicrobatch as CoreTrainingMicrobatch,
 )
 from torchtitan.config import Configurable, DebugConfig, TrainingConfig
+from torchtitan.config.transform import LoRATransform
+from torchtitan.models.common.feed_forward import DenseFeedForward
+from torchtitan.models.common.linear import Linear
 from torchtitan.observability.sdc_replayer import SDCReplayer
 from torchtitan.rl.actors.monarch.trainer import TrainerActor
 from torchtitan.rl.trainer.batcher import TrainingMicrobatch
@@ -80,6 +83,7 @@ def test_push_model_state_dict_reuses_final_dtype_cpu_staging_buffers() -> None:
         )
         trainer._transfer_dtype = torch.bfloat16
         trainer._staging_model_state_dict_stream = None
+        trainer._lora_projections = {}
 
         empty_like = torch.empty_like
         pin_memory_requests = []
@@ -132,6 +136,7 @@ def test_push_model_state_dict_stages_on_dedicated_stream() -> None:
         trainer = object.__new__(Trainer)
         trainer._staging_state_dict = {"weight": torch.empty(4)}
         trainer._staging_model_state_dict_stream = MagicMock()
+        trainer._lora_projections = {}
         source = torch.arange(4, dtype=torch.float32)
         trainer.engine = SimpleNamespace(
             model_parts=[
@@ -187,6 +192,7 @@ def test_push_staging_copies_parameters_already_in_transfer_dtype() -> None:
         model_parts=[torch.nn.Linear(2, 2, bias=False, dtype=torch.bfloat16)],
     )
     trainer._transfer_dtype = torch.bfloat16
+    trainer._lora_projections = {}
 
     empty_like = torch.empty_like
     pin_memory_requests = []
@@ -205,6 +211,54 @@ def test_push_staging_copies_parameters_already_in_transfer_dtype() -> None:
     assert set(staging) == {"weight"}
     assert staging["weight"].dtype == torch.bfloat16
     assert pin_memory_requests == [True]
+
+
+def test_push_model_state_dict_merges_lora_into_base_weights() -> None:
+    def feed_forward_config() -> DenseFeedForward.Config:
+        return DenseFeedForward.Config(
+            w13=Linear.Config(in_features=4, out_features=8, num_linears=2),
+            w2=Linear.Config(in_features=8, out_features=4),
+        )
+
+    async def run() -> None:
+        lora_config = LoRATransform(rank=2, alpha=4.0).transform(feed_forward_config())
+        lora_model = lora_config.build()
+        lora_model.init_states()
+        with torch.no_grad():
+            for name, param in lora_model.named_parameters():
+                if "lora_" in name:
+                    param.copy_(torch.randn_like(param))
+
+        trainer = object.__new__(Trainer)
+        trainer.engine = SimpleNamespace(
+            device=torch.device("cpu"), model_parts=[lora_model]
+        )
+        trainer._transfer_dtype = None
+        trainer._staging_model_state_dict_stream = None
+        trainer._lora_projections = trainer._find_lora_projections()
+        trainer._local_lora_a_weights = {}
+        trainer._mark_model_state_dict_ready_for_staging()
+        with patch(
+            "torchtitan.rl.trainer.trainer.torch.empty_like",
+            side_effect=lambda *args, **kwargs: torch.zeros_like(
+                *args, **{**kwargs, "pin_memory": False}
+            ),
+        ):
+            trainer._staging_state_dict = trainer._setup_staging_model_state_dict()
+        with patch(
+            "torchtitan.rl.trainer.trainer.ts.put_state_dict", new_callable=AsyncMock
+        ):
+            await trainer.push_model_state_dict()
+
+        # A generator runs the base model on the pushed weights.
+        assert set(trainer._staging_state_dict) == {"w13.weight", "w2.weight"}
+        base_model = feed_forward_config().build()
+        base_model.load_state_dict(trainer._staging_state_dict)
+        x = torch.randn(3, 4)
+        with torch.no_grad():
+            torch.testing.assert_close(base_model(x), lora_model(x))
+
+    asyncio.run(run())
 
 
 def test_rl_trainer_accepts_core_sdc_replay_config() -> None:
@@ -564,6 +618,7 @@ def test_optim_step_advances_profiler_and_reports_aux_loss_metrics() -> None:
         trainer._step_compute_start = 0.0
         trainer._step_num_tokens_per_dp_rank = 10
         trainer._staging_model_state_dict_stream = MagicMock()
+        trainer._lora_projections = {}
         compute_stream = MagicMock()
 
         with (

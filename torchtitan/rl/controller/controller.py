@@ -334,8 +334,10 @@ class Controller(Configurable):
                 logger.info(f"Saved job configs to {config_file}")
 
         def __post_init__(self):
-            trainer_model_cls = type(self.trainer.model)
-            generator_model_cls = type(self.generator.model)
+            # Compare built model classes, not config types: a trainer-only
+            # transform such as LoRA may swap in a config subclass.
+            trainer_model_cls = self.trainer.model._owner
+            generator_model_cls = self.generator.model._owner
             if trainer_model_cls is not generator_model_cls:
                 raise ValueError(
                     "The trainer and generator must use the same model class, got "

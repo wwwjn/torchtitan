@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 
 import numpy as np
 import pytest
@@ -33,6 +34,7 @@ from torchtitan_recipes.rl.alphabet_sort import _alphabet_sort_rollouter_config
 
 from torchtitan_recipes.tests.rl.alphabet_sort import (
     rl_grpo_fsdp2_gen_tp2_no_compile,
+    rl_grpo_lora_fsdp2_tp2_gen_tp2,
     rl_grpo_moe_debug_tp4_ep4,
     rl_grpo_moe_debug_tp4_ep4_batch_invariant,
     rl_grpo_qwen3_5_debug_tp2_batch_invariant,
@@ -110,6 +112,13 @@ def _rollout(turns: list[RolloutTurn]) -> Rollout:
 
 
 # --- Dataset ---
+
+
+def test_trainer_only_lora_recipe_passes_controller_validation() -> None:
+    config = rl_grpo_lora_fsdp2_tp2_gen_tp2()
+    # LoRA replaces the trainer's root config with a frozen subclass; replace()
+    # reruns the controller's check that both roles build the same model class.
+    dataclasses.replace(config)
 
 
 def test_dataset_rejects_invalid_max_turns() -> None:

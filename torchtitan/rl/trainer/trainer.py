@@ -16,7 +16,7 @@ from typing import Any
 import torch
 import torchstore as ts
 from torch.distributed.checkpoint.stateful import Stateful
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Replicate, Shard
 from torchstore import RankRole
 
 from torchtitan.components.checkpointer.utils import canonical_fqn
@@ -26,6 +26,7 @@ from torchtitan.distributed import maybe_apply_numa_binding, utils as dist_utils
 from torchtitan.distributed.utils import get_local_tensor
 from torchtitan.models.base.model import BaseModel
 from torchtitan.models.common.aux_loss import collect_aux_loss_metrics
+from torchtitan.models.common.lora import LoRAMixin
 from torchtitan.observability import structured_logger as sl
 from torchtitan.observability.logging import init_logger
 from torchtitan.observability.metrics import compute_training_performance_metrics
@@ -153,12 +154,14 @@ class Trainer(Configurable):
         )
 
         engine.load_checkpoint()
+        self._lora_projections = self._find_lora_projections()
+        self._local_lora_a_weights: dict[str, torch.Tensor] = {}
         self._staging_state_dict = self._setup_staging_model_state_dict()
         if engine.device.type == "cpu":
             self._staging_model_state_dict_stream = None
         else:
             self._staging_model_state_dict_stream = torch.Stream(device=engine.device)
-            self._mark_model_state_dict_ready_for_staging()
+        self._mark_model_state_dict_ready_for_staging()
         if config.checkpointer is None:
             logger.warning(
                 "Checkpoint disabled, skip weight loading and use random-initialized weights. "
@@ -191,6 +194,7 @@ class Trainer(Configurable):
 
     def _mark_model_state_dict_ready_for_staging(self) -> None:
         """Order the staging stream after the latest model-weight updates."""
+        self._gather_lora_a_weights()
         if self._staging_model_state_dict_stream is None:
             return
 
@@ -200,6 +204,46 @@ class Trainer(Configurable):
         self._staging_model_state_dict_stream.wait_stream(
             torch.accelerator.current_stream(self.engine.device)
         )
+
+    def _find_lora_projections(self) -> dict[str, LoRAMixin]:
+        """Map each LoRA projection's base weight name to the projection.
+
+        Generators run the base model, so a push sends each LoRA projection's
+        merged weight under its base weight's name instead of its adapters.
+        """
+        return {
+            canonical_fqn(f"{fqn}.weight"): module
+            for model_part in self.engine.model_parts
+            for fqn, module in model_part.named_modules()
+            if isinstance(module, LoRAMixin)
+        }
+
+    @torch.no_grad()
+    def _gather_lora_a_weights(self) -> None:
+        """All-gather each LoRA A's rank dimension for the next push's merge.
+
+        A push merges LoRA projections shard by shard: a base weight's local
+        rows match its B's local rows, and its local columns match A's, but
+        FSDP may shard A's rank dimension. The push overlaps the next
+        forward/backward and must not issue collectives, so gather A here,
+        after the optimizer step.
+        """
+        for name, projection in self._lora_projections.items():
+            lora_a_weight = projection.lora_a.weight.detach()
+            if isinstance(lora_a_weight, DTensor):
+                rank_dim = lora_a_weight.ndim - 2
+                lora_a_weight = lora_a_weight.redistribute(
+                    placements=[
+                        (
+                            Replicate()
+                            if isinstance(placement, Shard)
+                            and placement.dim == rank_dim
+                            else placement
+                        )
+                        for placement in lora_a_weight.placements
+                    ]
+                )
+            self._local_lora_a_weights[name] = get_local_tensor(lora_a_weight)
 
     async def close(self) -> None:
         """Close actor-local resources before the process mesh stops.
@@ -460,11 +504,19 @@ class Trainer(Configurable):
         stream = self._staging_model_state_dict_stream
         stream_context = stream if stream is not None else nullcontext()
         staging_complete: torch.Event | None = None
-        with stream_context:
+        with stream_context, torch.no_grad():
             for name, destination in self._staging_state_dict.items():
-                source = model_state_dict[name]
+                source = get_local_tensor(model_state_dict[name])
+                if (projection := self._lora_projections.get(name)) is not None:
+                    # Allocated on the staging stream, so freeing it after the
+                    # non-blocking copy is stream-ordered.
+                    source = projection.merged_weight(
+                        source,
+                        self._local_lora_a_weights[name],
+                        get_local_tensor(projection.lora_b.weight),
+                    )
                 get_local_tensor(destination).copy_(
-                    get_local_tensor(source), non_blocking=stream is not None
+                    source, non_blocking=stream is not None
                 )
             if stream is not None:
                 staging_complete = torch.Event()
@@ -490,13 +542,19 @@ class Trainer(Configurable):
         """Merge the state dicts of this rank's model parts.
 
         Under PP each rank holds only its own stages, so every stage publishes
-        a partial state dict into the same TorchStore key.
+        a partial state dict into the same TorchStore key. LoRA adapters are
+        left out because the push merges them into their base weights.
         """
-        return {
+        state_dict = {
             name: tensor
             for model_part in self.engine.model_parts
             for name, tensor in model_part.state_dict().items()
         }
+        for name in self._lora_projections:
+            prefix = name.removesuffix("weight")
+            del state_dict[f"{prefix}lora_a.weight"]
+            del state_dict[f"{prefix}lora_b.weight"]
+        return state_dict
 
     def _setup_staging_model_state_dict(self) -> dict[str, torch.Tensor]:
         """Allocate a final-dtype pinned CPU mirror of the model state dict."""

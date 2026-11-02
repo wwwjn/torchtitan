@@ -30,6 +30,7 @@ from torchtitan.models.common.linear import GroupedLinear, Linear
 from torchtitan.models.common.moe.sharding import expert_param_placement_sparse
 
 __all__ = [
+    "LoRAMixin",
     "get_lora_dist_moe_routed_experts",
     "get_lora_grouped_linear",
     "get_lora_linear",
@@ -39,7 +40,9 @@ __all__ = [
 # TODO: Support checkpoint interoperability for LoRA adapter state. Native DCP
 # base checkpoints cannot initialize LoRA models because lora_a/lora_b keys are
 # absent, and Hugging Face state-dict adapters omit those keys during export.
-class _LoRAMixin:
+class LoRAMixin:
+    """Base of the LoRA projections: frozen base parameters plus adapters."""
+
     _lora_scaling: float
 
     def __init__(self, config) -> None:
@@ -48,8 +51,22 @@ class _LoRAMixin:
             param.requires_grad_(False)
         self._lora_scaling = config.alpha / config.rank
 
+    def merged_weight(
+        self,
+        weight: torch.Tensor,
+        lora_a_weight: torch.Tensor,
+        lora_b_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return ``weight + (alpha / rank) * lora_b_weight @ lora_a_weight``.
 
-class _LoRALinearMixin(_LoRAMixin):
+        The operands are this projection's base, A and B weights, or local
+        shards of them whose base rows match B's rows and whose base columns
+        match A's columns. The result has ``weight``'s shape.
+        """
+        raise NotImplementedError
+
+
+class _LoRALinearMixin(LoRAMixin):
     """Add a LoRA update to a Linear's local computation."""
 
     num_linears: int
@@ -117,6 +134,15 @@ class _LoRALinearMixin(_LoRAMixin):
             None,
         )
         return base_out_XO + self._lora_scaling * lora_out_XO
+
+    def merged_weight(
+        self,
+        weight: torch.Tensor,
+        lora_a_weight: torch.Tensor,
+        lora_b_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        # B is [O, L], or [N, O, L] for a stacked projection sharing one A.
+        return weight + self._lora_scaling * (lora_b_weight @ lora_a_weight)
 
     @staticmethod
     def _adapter_sharding(
@@ -200,7 +226,7 @@ def _build_grouped_lora_adapters(
     return lora_a, lora_b
 
 
-class _LoRAGroupedLinearMixin(_LoRAMixin):
+class _LoRAGroupedLinearMixin(LoRAMixin):
     """Add an expert-specific LoRA update to a GroupedLinear."""
 
     num_linears: int
@@ -240,6 +266,21 @@ class _LoRAGroupedLinearMixin(_LoRAMixin):
             offsets_E=offsets_E,
         )
         return base_out_RO + self._lora_scaling * lora_out_RO
+
+    def merged_weight(
+        self,
+        weight: torch.Tensor,
+        lora_a_weight: torch.Tensor,
+        lora_b_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        # Stacked [E, N, O, *] weights use their [E, N * O, *] view, as in
+        # GroupedLinear.forward.
+        return torch.baddbmm(
+            weight.flatten(1, -2),
+            lora_b_weight.flatten(1, -2),
+            lora_a_weight,
+            alpha=self._lora_scaling,
+        ).view_as(weight)
 
 
 class _LoRADistMoeRoutedExpertsMixin:
@@ -285,29 +326,19 @@ class _LoRADistMoeRoutedExpertsMixin:
         w13_EFD = base_w13_EFD
         w13 = self.w13
         if isinstance(w13, _LoRAGroupedLinearMixin):
-            w13_EFD = torch.baddbmm(
-                base_w13_EFD,
-                w13.lora_b.weight.flatten(1, -2),
-                w13.lora_a.weight,
-                beta=1,
-                alpha=w13._lora_scaling,
+            w13_EFD = w13.merged_weight(
+                base_w13_EFD, w13.lora_a.weight, w13.lora_b.weight
             )
         w2_EDF = base_w2_EDF
         w2 = self.w2
         if isinstance(w2, _LoRAGroupedLinearMixin):
-            w2_EDF = torch.baddbmm(
-                base_w2_EDF,
-                w2.lora_b.weight,
-                w2.lora_a.weight,
-                beta=1,
-                alpha=w2._lora_scaling,
-            )
+            w2_EDF = w2.merged_weight(base_w2_EDF, w2.lora_a.weight, w2.lora_b.weight)
         return w13_EFD, w2_EDF
 
 
 def _create_lora_class(
     parent_cls: type[Module],
-    mixin_cls: type[_LoRAMixin],
+    mixin_cls: type[LoRAMixin],
 ) -> type[Module]:
     parent_config_cls = parent_cls.Config
 

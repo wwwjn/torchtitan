@@ -29,6 +29,7 @@ from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.config.transform import (
     apply_transforms,
     ContextParallelTransform,
+    LoRATransform,
     ModelConfigConverter,
     TokenDispatcherTransform,
 )
@@ -912,6 +913,35 @@ def rl_grpo_fsdp2_gen_tp2_compile() -> Controller.Config:
     config.trainer.parallelism.data_parallel_shard_degree = 2
     config.trainer.parallelism.tensor_parallel_degree = 1
     config.generator.parallelism.tensor_parallel_degree = 2
+    return _configure_ci(
+        config,
+        steps=5,
+        num_tokens_per_microbatch=2048,
+        max_generated_tokens=256,
+        use_hf_assets_from_env=True,
+    )
+
+
+def rl_grpo_lora_fsdp2_tp2_gen_tp2() -> Controller.Config:
+    """LoRA on the trainer only; each push merges adapters into base weights.
+
+    Trainer FSDP=2 x TP=2 shards column-parallel (wqkv), row-parallel (wo, w2)
+    and stacked (w13) projections, whose LoRA A is FSDP-sharded on its rank
+    dimension. Generators stay plain models (TP=2).
+    """
+    config = rl_grpo_qwen3_0_6b_varlen_no_compile(seq_len=1024)
+    config.num_generators = 2
+    config.trainer.parallelism.data_parallel_shard_degree = 2
+    config.trainer.parallelism.tensor_parallel_degree = 2
+    config.generator.parallelism.tensor_parallel_degree = 2
+    config.trainer = apply_transforms(
+        config.trainer,
+        [
+            LoRATransform(
+                rank=16, alpha=32.0, target_modules=["wqkv", "wo", "w13", "w2"]
+            )
+        ],
+    )
     return _configure_ci(
         config,
         steps=5,
