@@ -271,6 +271,7 @@ class InterGeneratorRouter(Configurable):
         routing_session_id: str | None,
         sampling_config: Any | None,
         metrics_prefix: str,
+        images: tuple[Any, ...],
     ) -> Any:
         """Route one generation call to a generator and return its completion."""
         return await self._route(
@@ -283,6 +284,7 @@ class InterGeneratorRouter(Configurable):
             routing_session_id=routing_session_id,
             sampling_config=sampling_config,
             metrics_prefix=metrics_prefix,
+            images=images,
             # Load is measured as in-flight request count (one unit per call).
             routing_ctx=RoutingContext(
                 estimated_cost=1,

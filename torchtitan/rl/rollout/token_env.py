@@ -11,11 +11,16 @@ import logging
 from dataclasses import dataclass, field
 
 import numpy as np
-from renderers import Message, Renderer, ToolSpec
+from renderers import is_multimodal, Message, MultiModalData, Renderer, ToolSpec
 
 from torchtitan.config import Configurable
 from torchtitan.rl.rollout.message_env import MessageEnv
-from torchtitan.rl.rollout.types import Completion, RolloutStatus, split_prompt
+from torchtitan.rl.rollout.types import (
+    Completion,
+    PromptImage,
+    RolloutStatus,
+    split_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +41,10 @@ class TokenEnvOutput:
 
     next_prompt_messages: list[Message] | None = None  # [num_prompt_messages] or None
     """Message form of `next_prompt_token_ids`; `None` whenever that is `None`."""
+
+    next_prompt_images: tuple[PromptImage, ...] = ()
+    """Images whose placeholders are in `next_prompt_token_ids`, in prompt order, with offsets
+    into the full prompt (not the delta). Empty whenever `next_prompt_token_ids` is `None`."""
 
     status: RolloutStatus
     """`ONGOING` while the rollout runs; a terminal `RolloutStatus` otherwise."""
@@ -117,10 +126,16 @@ class TokenEnv(Configurable):
     ) -> None:
         self._message_env = message_env
         self._renderer = renderer
+        # Only a multimodal renderer's prompts carry images; text renderers keep
+        # the ids-only calls.
+        self._multimodal = is_multimodal(renderer)
         self._config = config
         self._tools: list[ToolSpec] | None = None
         self._messages: list[Message] = []
         self._last_prompt_token_ids: list[int] = []
+        # The renderer's multimodal sidecar for `_last_prompt_token_ids`, which a
+        # multimodal renderer's bridge extends.
+        self._last_multi_modal_data: MultiModalData | None = None
         self._num_turns = 0
 
     async def init(self) -> TokenEnvOutput:
@@ -132,21 +147,18 @@ class TokenEnv(Configurable):
 
         # Render messages into tokens
         self._tools = env_init_output.tools if env_init_output.tools else None
-        token_ids = await asyncio.to_thread(
-            self._renderer.render_ids,
-            messages=self._messages,
-            tools=self._tools,
-            add_generation_prompt=True,
-        )
+        token_ids, multi_modal_data = await self._render_prompt()
 
         # Carry the prompt either way: ONGOING if it fits, else
         # TRUNCATED_PROMPT_TOO_LONG so the over-budget prompt stays debuggable.
         prompt_too_long = self._is_prompt_too_long(prompt_len=len(token_ids))
         if not prompt_too_long:
             self._last_prompt_token_ids = token_ids
+            self._last_multi_modal_data = multi_modal_data
         return TokenEnvOutput(
             next_prompt_token_ids=token_ids,
             next_prompt_messages=self._messages,
+            next_prompt_images=to_prompt_images(multi_modal_data),
             status=(
                 RolloutStatus.TRUNCATED_PROMPT_TOO_LONG
                 if prompt_too_long
@@ -266,22 +278,23 @@ class TokenEnv(Configurable):
         # Prepare the next prompt; full re-render if the renderer can't bridge.
         # `tools` is passed because tool schemas are part of the chat template, so
         # the bridged tokens must match what a full re-render (also tools-aware) produces.
+        bridge_kwargs = {}
+        if self._multimodal:
+            # The bridge must know the earlier images to number and place new ones.
+            bridge_kwargs["previous_multi_modal_data"] = self._last_multi_modal_data
         bridged = await asyncio.to_thread(
             self._renderer.bridge_to_next_turn,
             previous_prompt_ids=self._last_prompt_token_ids,
             previous_completion_ids=completion.token_ids,
             new_messages=step_output.env_messages,
             tools=self._tools,
+            **bridge_kwargs,
         )
         if bridged is None:
-            next_prompt_token_ids = await asyncio.to_thread(
-                self._renderer.render_ids,
-                messages=self._messages,
-                tools=self._tools,
-                add_generation_prompt=True,
-            )
+            next_prompt_token_ids, multi_modal_data = await self._render_prompt()
         else:
             next_prompt_token_ids = bridged.token_ids
+            multi_modal_data = bridged.multi_modal_data
 
         # Terminal if the next prompt is over budget
         if self._is_prompt_too_long(prompt_len=len(next_prompt_token_ids)):
@@ -300,10 +313,12 @@ class TokenEnv(Configurable):
             previous_token_ids=self._last_prompt_token_ids + completion.token_ids,
         )
         self._last_prompt_token_ids = next_prompt_token_ids
+        self._last_multi_modal_data = multi_modal_data
         return TokenEnvOutput(
             next_prompt_token_ids=next_prompt_token_ids,
             next_prompt_prefix_len=next_prompt_prefix_len,
             next_prompt_messages=self._messages,
+            next_prompt_images=to_prompt_images(multi_modal_data),
             status=RolloutStatus.ONGOING,
             completion_message=completion_message,
             env_messages=step_output.env_messages,
@@ -313,6 +328,76 @@ class TokenEnv(Configurable):
     async def close(self) -> None:
         await self._message_env.close()
 
+    async def _render_prompt(self) -> tuple[list[int], MultiModalData | None]:
+        """Render the whole conversation with a generation prompt (and its images)."""
+        if self._multimodal:
+            rendered = await asyncio.to_thread(
+                self._renderer.render,
+                messages=self._messages,
+                tools=self._tools,
+                add_generation_prompt=True,
+            )
+            return rendered.token_ids, rendered.multi_modal_data
+        token_ids = await asyncio.to_thread(
+            self._renderer.render_ids,
+            messages=self._messages,
+            tools=self._tools,
+            add_generation_prompt=True,
+        )
+        return token_ids, None
+
     def _is_prompt_too_long(self, *, prompt_len: int) -> bool:
         cap = self._config.max_rollout_tokens
         return cap is not None and prompt_len >= cap
+
+
+def to_prompt_images(
+    multi_modal_data: MultiModalData | None,
+) -> tuple[PromptImage, ...]:
+    """Convert a rendered prompt's multimodal sidecar into image references.
+
+    Requires an image-cache renderer (e.g. ``Qwen35ImageCacheRenderer``): each
+    image's mm_hash is its `ImageCache` key and its ``pixel_values`` is None.
+    Raises otherwise, and on non-image modalities.
+    """
+    if multi_modal_data is None:
+        return ()
+    modalities = {
+        modality
+        for items in (
+            multi_modal_data.mm_hashes,
+            multi_modal_data.mm_placeholders,
+            multi_modal_data.mm_items,
+        )
+        for modality, values in items.items()
+        if values
+    }
+    if modalities - {"image"}:
+        # TODO: video prompts need video grids in PromptImage, the generator and the batcher.
+        raise NotImplementedError(
+            f"RL prompts support images only, got modalities {sorted(modalities)}."
+        )
+    images = []
+    for key, placeholder, item in zip(
+        multi_modal_data.mm_hashes.get("image", []),
+        multi_modal_data.mm_placeholders.get("image", []),
+        multi_modal_data.mm_items.get("image", []),
+        strict=True,
+    ):
+        if item.get("pixel_values") is not None:
+            raise ValueError(
+                "RL image prompts need an image-cache renderer (e.g. "
+                "Qwen35ImageCacheRenderer), which sets each image's mm_hash to its "
+                f"ImageCache key and leaves pixel_values None; got pixel_values for "
+                f"image {key!r}."
+            )
+        t, h, w = item["image_grid_thw"][0]
+        images.append(
+            PromptImage(
+                key=key,
+                grid_thw=(int(t), int(h), int(w)),
+                offset=placeholder.offset,
+                length=placeholder.length,
+            )
+        )
+    return tuple(images)

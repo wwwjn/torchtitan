@@ -26,6 +26,32 @@ _TRUNCATED = frozenset(
 _ERROR = frozenset({"error_parse", "error_timeout", "error_abort", "error"})
 
 
+@dataclass(frozen=True, kw_only=True, slots=True)
+class PromptImage:
+    """One image in a prompt: which cached image fills which placeholder tokens.
+
+    Prompts carry these references instead of pixels; the generator and the
+    trainer load the pixels by ``key`` from the same `ImageCache`.
+
+    Example (a 64x64-patch image whose 1024 placeholders start at token 5):
+
+        PromptImage(key="9f2c...", grid_thw=(1, 64, 64), offset=5, length=1024)
+    """
+
+    key: str
+    """`ImageCache` key (a content hash); also the generator's multimodal hash."""
+
+    grid_thw: tuple[int, int, int]
+    """Raw patch grid ``(T, H, W)`` before spatial merging."""
+
+    offset: int
+    """Index of the first placeholder token in the prompt."""
+
+    length: int
+    """Number of placeholder tokens the renderer emitted (``T * H * W // merge_size**2``
+    with Qwen-VL merging)."""
+
+
 @dataclass(frozen=True, slots=True)
 class RolloutTurnID:
     """A turn's id: (group, sibling rollout, turn index); renders to the generator request_id.
@@ -97,6 +123,7 @@ class GenerateFn(Protocol):
         group_id: int,
         routing_session_id: str | None = None,
         sampling_config: SamplingConfig | None = None,
+        images: tuple[PromptImage, ...] = (),
     ) -> Completion | None:
         """Run one generation.
 
@@ -109,6 +136,8 @@ class GenerateFn(Protocol):
                 belongs to. A router may use it for session affinity, routing same-key
                 calls to the same generator when possible. `None` means no affinity.
             sampling_config: Optional per-call sampling overrides.
+            images: Images whose placeholder tokens appear in `prompt_token_ids`, in
+                prompt order.
 
         Returns:
             The generated `Completion`, or `None` if none is produced.
@@ -160,7 +189,7 @@ class RolloutTurn:
     `rollout_to_training_samples` packs the rollout into training tokens.
 
     A turn doesn't store its full prompt. It stores how many leading tokens it copies from the previous
-    turn's prompt + completion, then its new tokens (`prompt_messages` stay in full):
+    turn's prompt + completion, then its new tokens (`prompt_messages` and `prompt_images` stay in full):
 
         full prompt = (previous prompt + completion)[:prompt_prefix_len] + prompt_delta_token_ids
 
@@ -186,6 +215,9 @@ class RolloutTurn:
 
     prompt_delta_token_ids: np.ndarray  # [num_prompt_tokens - prompt_prefix_len] int32
     """The prompt after its first `prompt_prefix_len` tokens."""
+
+    prompt_images: tuple[PromptImage, ...] = ()
+    """Images of the full prompt (not the delta), with offsets into the full prompt."""
 
     completion_token_ids: np.ndarray  # [num_completion_tokens] int32
     """This turn's completion token ids."""

@@ -8,6 +8,7 @@
 # which imports `rollout.types` — re-exporting it from this package `__init__` would make
 # that a circular import. Import it from the submodule: `rollout.rollouter import Rollouter`.
 from torchtitan.rl.rollout.types import (
+    PromptImage,
     Rollout,
     RolloutGroup,
     RolloutStatus,
@@ -15,6 +16,7 @@ from torchtitan.rl.rollout.types import (
 )
 
 __all__ = [
+    "PromptImage",
     "Rollout",
     "RolloutGroup",
     "RolloutStatus",

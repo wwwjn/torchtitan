@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from torchtitan.rl.rollout.types import PromptImage
+
 
 @dataclass(kw_only=True, slots=True)
 class SamplingConfig:
@@ -67,6 +69,9 @@ class EngineRequest:
     arrival_time: float
     """Rank 0's `time.time()` in `generate`; vLLM breaks priority ties by it and measures TTFT from it.
     All TP ranks pass this one value, so they order ties the same way even if their clocks differ."""
+    images: tuple[PromptImage, ...] = ()
+    """Images whose placeholders are in `prompt_token_ids`, as `ImageCache` references, so the
+    broadcast to TP ranks carries no pixels."""
     min_policy_version: int = field(init=False)
     """Oldest policy version this request's KV can come from; rank 0 sets it at admission.
     Without a KV reset on model state dict load it is the group's pinned version and salts the
