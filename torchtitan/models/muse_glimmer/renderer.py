@@ -44,6 +44,7 @@ import re
 from typing import Literal, NamedTuple
 
 from pydantic import StrictBool
+from renderers import MultiModalData
 from renderers.base import (
     extract_message_tool_names,
     ParsedResponse,
@@ -55,6 +56,8 @@ from renderers.base import (
     trim_to_turn_close,
 )
 from renderers.configs import BaseRendererConfig
+
+from torchtitan.models.muse_spark.renderer import MuseImagePlaceholders
 
 from .atem import parse_atem_tool_calls, render_atem_tool_call
 
@@ -106,6 +109,13 @@ class MuseGlimmerRendererConfig(BaseRendererConfig):
     empty ``content`` is unscoreable and the answer is often the final reasoning line.
     """
 
+    image_cache_dir: str | None = None
+    """`ImageCache` (built with ``--spec muse_spark``; Glimmer preprocesses images like
+    Muse Spark) holding every image the messages can show. Each image part then renders
+    as the processor's expansion of the template's ``<|patch|>``: ``<|image_start|>`` +
+    N x ``<|patch|>`` + ``<|image_end|>``, and ``multi_modal_data`` carries the images.
+    None renders the template's single ``<|patch|>``."""
+
     _template_fields = frozenset(
         {
             "reasoning_strength",
@@ -114,7 +124,7 @@ class MuseGlimmerRendererConfig(BaseRendererConfig):
             "retain_reasoning_in_history",
         }
     )
-    _internal_fields = frozenset({"answer_from_reasoning_fallback"})
+    _internal_fields = frozenset({"answer_from_reasoning_fallback", "image_cache_dir"})
 
 
 # Muse Glimmer special tokens. The ids are checked against the tokenizer in __init__
@@ -157,17 +167,17 @@ def _tojson(value) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def _render_content(content) -> str:
+def _render_content(content, images: MuseImagePlaceholders | None = None) -> str:
     """A message body: a plain string, or a list of typed multimodal parts."""
     if content is None:
         return ""
     if isinstance(content, str):
         return content
-    out = []
+    out: list[str] = []
     for part in content:
         kind = part.get("type")
         if kind == "image":
-            out.append("<|patch|>")
+            out.append("<|patch|>" if images is None else images.span(part))
         elif kind == "video":
             out.append("<|video|>")
         elif kind == "text":
@@ -353,6 +363,18 @@ class MuseGlimmerRenderer:
             "all" if self._config.retain_reasoning_in_history else "tool_cycle",
         )
         self._verify_special_ids()
+        self._images = (
+            None
+            if self._config.image_cache_dir is None
+            else MuseImagePlaceholders(self._config.image_cache_dir, tokenizer)
+        )
+        # Read by `renderers.is_multimodal`: rollouts then carry `multi_modal_data`.
+        self.is_multimodal = self._images is not None
+
+    @property
+    def mm_token_type_id_map(self) -> dict[int, int]:
+        """``renderers.MultimodalRenderer``: ``<|patch|>`` marks image tokens."""
+        return {} if self._images is None else {self._images.patch_id: 1}
 
     def _verify_special_ids(self) -> None:
         """The special-token ids are baked into parse_response and the loss mask.
@@ -400,7 +422,7 @@ class MuseGlimmerRenderer:
         return body + "\n\n" + _render_system_meta(tools)
 
     def _explicit_system_body(self, message, tools) -> str:
-        text = _render_content(message.get("content"))
+        text = _render_content(message.get("content"), self._images)
         for old, new in _EFFORT_TO_STRENGTH:
             text = text.replace(old, new)
         body = text
@@ -493,7 +515,7 @@ class MuseGlimmerRenderer:
             elif role == "user":
                 block(
                     "user",
-                    _render_content(message.get("content")),
+                    _render_content(message.get("content"), self._images),
                     EOT_STR,
                     idx=i,
                     sampled=False,
@@ -502,7 +524,8 @@ class MuseGlimmerRenderer:
                 name = self._tool_name(message, messages)
                 body = (
                     f'<tool_output name="{name}">\n'
-                    f'{_render_content(message.get("content"))}\n</tool_output>'
+                    f'{_render_content(message.get("content"), self._images)}\n'
+                    "</tool_output>"
                 )
                 block(f"tool {name}", body, EOT_STR, idx=i, sampled=False)
             elif role == "assistant":
@@ -532,7 +555,7 @@ class MuseGlimmerRenderer:
                         end_turn = recipient == "user"
                     block(
                         f"assistant to={recipient}",
-                        _render_content(message.get("content")),
+                        _render_content(message.get("content"), self._images),
                         EOT_STR if end_turn else EOM_STR,
                         idx=i,
                         sampled=True,
@@ -615,7 +638,11 @@ class MuseGlimmerRenderer:
             is_content=is_content,
             message_roles=[m.get("role") for m in messages],
             message_tool_names=[m.get("name") for m in messages],
-            multi_modal_data=None,
+            multi_modal_data=(
+                None
+                if self._images is None
+                else self._images.multi_modal_data(messages, token_ids)
+            ),
         )
 
     def bridge_to_next_turn(
@@ -625,6 +652,7 @@ class MuseGlimmerRenderer:
         new_messages,
         *,
         tools=None,
+        previous_multi_modal_data: MultiModalData | None = None,
     ) -> RenderedTokens | None:
         """Extend prompt + sampled completion with the next turn, without re-rendering.
 
@@ -641,6 +669,10 @@ class MuseGlimmerRenderer:
         The output is a prompt, so nothing in it is sampled. ``message_indices`` follows
         the library convention: -1 over the carried-forward prefix and the trailing
         generation prompt, and the index into ``new_messages`` elsewhere.
+
+        With images, ``previous_multi_modal_data`` places the previous prompt's images;
+        the new messages' images follow them. Without it, a previous prompt with
+        images is re-rendered.
         """
         if not previous_prompt_ids or not new_messages:
             return None
@@ -662,6 +694,12 @@ class MuseGlimmerRenderer:
             synthesize_close=EOT_ID,
         )
         if previous_ids is None:
+            return None
+        if (
+            self._images is not None
+            and previous_multi_modal_data is None
+            and self._images.image_start_id in previous_prompt_ids
+        ):
             return None
 
         prepared = self._prepare(list(new_messages))
@@ -689,15 +727,25 @@ class MuseGlimmerRenderer:
             )
             ext_content += [piece.is_body] * len(encoded)
 
-        total = len(previous_ids) + len(ext)
+        token_ids = previous_ids + ext
+        total = len(token_ids)
         return RenderedTokens(
-            token_ids=previous_ids + ext,
+            token_ids=token_ids,
             message_indices=[-1] * len(previous_ids) + ext_indices,
             sampled_mask=[False] * total,
             is_content=[False] * len(previous_ids) + ext_content,
             message_roles=[m.get("role") or "" for m in new_messages],
             message_tool_names=extract_message_tool_names(new_messages),
-            multi_modal_data=None,
+            multi_modal_data=(
+                None
+                if self._images is None
+                else self._images.multi_modal_data(
+                    new_messages,
+                    token_ids,
+                    start=len(previous_ids),
+                    previous=previous_multi_modal_data,
+                )
+            ),
         )
 
     # ------------------------------------------------------------------ parsing
