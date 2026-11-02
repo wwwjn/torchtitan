@@ -95,6 +95,7 @@ class _FakeLLMEngine:
     def __init__(self):
         self.add_requests = []
         self.reset_prefix_cache_calls = []
+        self.reset_encoder_cache_calls = 0
         self.renderer = _FakeRenderer()
 
     def add_request(self, *args, **kwargs):
@@ -105,6 +106,9 @@ class _FakeLLMEngine:
 
     def reset_prefix_cache(self, *args, **kwargs):
         self.reset_prefix_cache_calls.append((args, kwargs))
+
+    def reset_encoder_cache(self):
+        self.reset_encoder_cache_calls += 1
 
 
 def _sample(*, token_ids=(10, 11), finish_reason="stop"):
@@ -414,11 +418,24 @@ def test_generate_shares_one_bytes_object_per_image_file(monkeypatch):
 
 def test_admission_with_kv_reset_does_not_salt_prompt():
     engine = _vllm_engine(reset_kv_cache_on_model_state_dict_load=True)
+    engine._load_image = lambda image: torch.zeros(3, 32, 32, dtype=torch.uint8)
+    image_request = _engine_request("r1", min_policy_version=6)
+    image_request.prompt_token_ids = [1, 7, 7, 7, 7, 2]
+    image_request.images = (
+        PromptImage(
+            key="k", path="k.png", grid_thw=(1, 4, 4), offset=1, length=4, data=b"k"
+        ),
+    )
 
-    engine.add_requests([_engine_request("r0", min_policy_version=6)])
+    engine.add_requests([_engine_request("r0", min_policy_version=6), image_request])
 
-    _, kwargs = cast(_FakeLLMEngine, engine._engine).add_requests[0]
-    assert kwargs["prompt"]["cache_salt"] is None
+    [(_, text_kwargs), (_, image_kwargs)] = cast(
+        _FakeLLMEngine, engine._engine
+    ).add_requests
+    assert text_kwargs["prompt"]["cache_salt"] is None
+    assert image_kwargs["prompt"].get("cache_salt") is None
+    # The engine resets its encoder cache on every load instead.
+    assert image_kwargs["prompt"]["mm_hashes"] == {"image": ["k"]}
 
 
 def test_admission_submits_image_prompts_as_multimodal_inputs():
@@ -445,7 +462,8 @@ def test_admission_submits_image_prompts_as_multimodal_inputs():
     assert prompt["type"] == "multimodal"
     assert prompt["prompt_token_ids"] == [1, 7, 7, 7, 7, 2]
     assert prompt["cache_salt"] == "6"
-    assert prompt["mm_hashes"] == {"image": ["k"]}
+    # The image hash carries the pinned version: encoder outputs follow the vision weights.
+    assert prompt["mm_hashes"] == {"image": ["k@6"]}
     assert prompt["mm_kwargs"]["image"][0]["images"].data is loaded
     assert text_kwargs["prompt"]["type"] == "token"
 
@@ -597,9 +615,10 @@ def test_prefetched_model_state_dict_is_the_buffers_the_load_reads():
     assert loaded == [buffers]
 
 
+@pytest.mark.parametrize("serves_images", [False, True])
 @pytest.mark.parametrize("reset_kv_cache", [False, True])
 def test_reset_kv_cache_on_model_state_dict_load_controls_cache_reset(
-    reset_kv_cache: bool,
+    reset_kv_cache: bool, serves_images: bool
 ):
     model = SimpleNamespace(
         load_state_dict=lambda state_dict: None, _prefetched_model_state_dict={}
@@ -607,11 +626,16 @@ def test_reset_kv_cache_on_model_state_dict_load_controls_cache_reset(
     engine = _vllm_engine(
         reset_kv_cache_on_model_state_dict_load=reset_kv_cache, model=model
     )
+    if serves_images:
+        engine._load_image = lambda image: torch.zeros(3, 32, 32, dtype=torch.uint8)
 
     engine.load_prefetched_model_state_dict()
 
+    fake = cast(_FakeLLMEngine, engine._engine)
     expected = [((), {"reset_running_requests": True})] if reset_kv_cache else []
-    assert cast(_FakeLLMEngine, engine._engine).reset_prefix_cache_calls == expected
+    assert fake.reset_prefix_cache_calls == expected
+    # Unsalted image hashes would let new requests reuse old encoder outputs.
+    assert fake.reset_encoder_cache_calls == int(reset_kv_cache and serves_images)
 
 
 def test_sampling_config_rejects_top_p_below_one():
