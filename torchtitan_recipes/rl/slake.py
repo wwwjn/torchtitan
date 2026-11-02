@@ -9,14 +9,18 @@
 Data: the English part of SLAKE (CC-BY-4.0, Hugging Face ``BoKelvin/SLAKE``).
 Download ``train.json``, ``validation.json``, ``test.json`` and ``imgs.zip``
 into ``./assets/datasets/slake`` and unzip ``imgs.zip`` there, so images live
-under ``./assets/datasets/slake/imgs/``.
+under ``./assets/datasets/slake/imgs/``. The image recipe reads them where
+they are used: the renderer reads each image's header, and the generator and
+the batcher decode and resize the file, so ``imgs/`` must be readable at the
+same path on every host.
 
 Run with ``--module torchtitan_recipes.rl.slake --config rl_grpo_*``.
 """
 
-from renderers import Qwen35RendererConfig
+from renderers import CustomRendererConfig, Qwen35RendererConfig
 
 from torchtitan.components.checkpointer import CheckpointManager
+from torchtitan.components.data.multimodal.image_loader import ImageLoader
 from torchtitan.components.loss import ChunkedLossWrapper
 from torchtitan.components.optim import (
     AdamW,
@@ -38,10 +42,12 @@ from torchtitan.rl.examples.slake import RewardSlakeAnswer, SlakeDataset, SlakeE
 from torchtitan.rl.generator.generator import Generator
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
 from torchtitan.rl.generator.types import SamplingConfig
+from torchtitan.rl.generator.vllm.engine import VLLMEngine
 from torchtitan.rl.observability.metrics import MetricsProcessor
 from torchtitan.rl.rollout.data import IterableRolloutDataLoader
 from torchtitan.rl.rollout.rollouter import Rollouter, RolloutWorker
 from torchtitan.rl.rollout.rubric import Rubric
+from torchtitan.rl.trainer.batcher import Batcher
 from torchtitan.rl.trainer.losses import GRPOLoss
 from torchtitan.rl.trainer.trainer import Trainer
 
@@ -65,12 +71,27 @@ def _slake_rollouter_config(*, include_image: bool) -> Rollouter.Config:
     )
 
 
+def rl_grpo_qwen3_5_0_8b_slake() -> Controller.Config:
+    """Qwen3.5-0.8B on SLAKE closed questions with the image (4 GPUs).
+
+    The renderer reads each image's placeholder count from its header, the
+    generator and the batcher decode its pixels. The vision tower trains with the rest of the model. Trainer FSDP=2 +
+    2 generators at TP=1; ``rl_grpo_qwen3_5_0_8b_slake_text`` is its control.
+    """
+    return _qwen3_5_0_8b_slake(images=ImageLoader.Config())
+
+
 def rl_grpo_qwen3_5_0_8b_slake_text() -> Controller.Config:
     """Qwen3.5-0.8B on SLAKE closed questions without the image (4 GPUs).
 
     The text-only baseline: how often the model answers from the question
     alone. Trainer FSDP=2 + 2 generators at TP=1.
     """
+    return _qwen3_5_0_8b_slake(images=None)
+
+
+def _qwen3_5_0_8b_slake(*, images: ImageLoader.Config | None) -> Controller.Config:
+    """The SLAKE recipe, with images from ``images`` or text only (None)."""
     # SLAKE images expand to 64-1024 vision tokens (median 256) at the default
     # pixel budget, plus the question and a short answer.
     seq_len = 2048
@@ -92,9 +113,18 @@ def rl_grpo_qwen3_5_0_8b_slake_text() -> Controller.Config:
             num_prompts_per_train_step=16,
             num_samples_per_prompt=8,
             validation=ValidationConfig(steps=10),
+            batcher=Batcher.Config(images=images),
         ),
-        rollouter=_slake_rollouter_config(include_image=False),
-        renderer=from_renderers(Qwen35RendererConfig(enable_thinking=False)),
+        rollouter=_slake_rollouter_config(include_image=images is not None),
+        renderer=from_renderers(
+            Qwen35RendererConfig(enable_thinking=False)
+            if images is None
+            else CustomRendererConfig(
+                import_path="torchtitan.models.qwen3_5.renderer.Qwen35ImageRefRenderer",
+                images=images,
+                enable_thinking=False,
+            )
+        ),
         metrics=MetricsProcessor.Config(enable_wandb=True),
         trainer=Trainer.Config(
             model=trainer_model,
@@ -134,5 +164,6 @@ def rl_grpo_qwen3_5_0_8b_slake_text() -> Controller.Config:
             parallelism=generator_parallelism,
             checkpointer=None,
             sampling=SamplingConfig(temperature=1.0, max_tokens=128),
+            engine=VLLMEngine.Config(images=images),
         ),
     )

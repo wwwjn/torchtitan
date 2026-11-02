@@ -4,13 +4,18 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""CPU tests for fixed-bin LPT packing and its FFD fallback."""
+"""CPU tests for batcher packing (fixed-bin LPT, FFD fallback) and image microbatches."""
 
+import dataclasses
 import random
 
 import numpy as np
+import pytest
 import torch
-from torchtitan.rl.rollout.types import RolloutTurnID
+from PIL import Image
+from torchtitan.components.data.multimodal.image_loader import ImageLoader, ImageSpec
+from torchtitan.components.data.multimodal.mrope import get_mrope_positions
+from torchtitan.rl.rollout.types import PromptImage, RolloutTurnID
 
 from torchtitan.rl.trainer.batcher import Batcher
 from torchtitan.rl.trainer.training_sample_builder import TrainingSample
@@ -259,3 +264,133 @@ def test_microbatch_moves_loss_kwargs_with_the_model_inputs() -> None:
     }
     for value in input_dict["loss_kwargs"].values():
         assert value.device.type == "meta"
+
+
+_IMAGE_SPEC = ImageSpec(min_pixels=32 * 32, max_pixels=64 * 64)
+
+
+@pytest.fixture
+def image_paths(tmp_path) -> list[str]:
+    rng = np.random.default_rng(0)
+    paths = []
+    for name, (width, height) in (("a.png", (64, 32)), ("b.png", (32, 64))):
+        path = tmp_path / name
+        Image.fromarray(
+            rng.integers(0, 256, size=(height, width, 3), dtype=np.uint8)
+        ).save(path)
+        paths.append(str(path))
+    return paths
+
+
+@pytest.fixture
+def loader() -> ImageLoader:
+    return ImageLoader.Config(spec=_IMAGE_SPEC).build()
+
+
+def _prompt_image(loader: ImageLoader, path: str, offset: int) -> PromptImage:
+    image = loader.lookup(path)
+    return PromptImage(
+        key=image.key,
+        path=path,
+        grid_thw=image.grid_thw,
+        offset=offset,
+        length=loader.num_tokens(image),
+        data=image.data,
+    )
+
+
+def _image_sample(index: int, images: list[PromptImage], length: int) -> TrainingSample:
+    [sample] = _make_samples([length])
+    return dataclasses.replace(
+        sample,
+        rollout_id=RolloutTurnID(group_id=0, rollout_id=index, turn_id=0),
+        images=tuple(images),
+    )
+
+
+def test_microbatch_encodes_each_distinct_image_once(loader, image_paths) -> None:
+    batcher = Batcher.Config(images=ImageLoader.Config(spec=_IMAGE_SPEC)).build(
+        num_tokens_per_microbatch_per_dp_rank=64,
+        max_context_length=32,
+        num_prompts_per_train_step=1,
+        dp_degree=1,
+        pad_id=0,
+        temperature=1.0,
+    )
+    image_a = _prompt_image(loader, image_paths[0], offset=1)
+    image_b = _prompt_image(loader, image_paths[1], offset=2 + image_a.length)
+    # Two samples of one group show image a; the second also shows image b; a third is text.
+    samples = [
+        _image_sample(0, [image_a], 12),
+        _image_sample(1, [image_a, image_b], 16),
+        _image_sample(2, [], 5),
+    ]
+
+    microbatch = batcher._pack_training_samples(samples)
+    kwargs = microbatch.model_kwargs
+
+    pixel_values, grid_thw = loader.load_pixel_values([image_a.data, image_b.data])
+    assert torch.equal(kwargs["pixel_values"], pixel_values)
+    assert torch.equal(kwargs["grid_thw"], grid_thw)
+    rows = kwargs["image_vision_bank_indices_T"].tolist()
+    a_rows = list(range(image_a.length))
+    b_rows = list(range(image_a.length, image_a.length + image_b.length))
+    expected = [-1] * 64
+    expected[1 : 1 + image_a.length] = a_rows
+    expected[13 : 13 + image_a.length] = a_rows
+    start_b = 12 + image_b.offset
+    expected[start_b : start_b + image_b.length] = b_rows
+    assert rows == expected
+    expected_mrope = torch.cat(
+        [
+            get_mrope_positions(12, [(1, image_a.grid_thw)], spatial_merge_size=2),
+            get_mrope_positions(
+                16,
+                [(1, image_a.grid_thw), (image_b.offset, image_b.grid_thw)],
+                spatial_merge_size=2,
+            ),
+            torch.arange(5).unsqueeze(1).expand(5, 3),
+            (torch.arange(64 - 33) % 32).unsqueeze(1).expand(64 - 33, 3),
+        ]
+    )
+    assert torch.equal(kwargs["mrope_positions"], expected_mrope)
+
+
+def _image_batcher(images: ImageLoader.Config | None, num_tokens: int = 16) -> Batcher:
+    return Batcher.Config(images=images).build(
+        num_tokens_per_microbatch_per_dp_rank=num_tokens,
+        max_context_length=num_tokens,
+        num_prompts_per_train_step=1,
+        dp_degree=1,
+        pad_id=0,
+        temperature=1.0,
+    )
+
+
+def test_text_microbatch_in_image_mode_has_no_image_inputs(loader) -> None:
+    batcher = _image_batcher(ImageLoader.Config(spec=_IMAGE_SPEC))
+
+    microbatch = batcher._pack_training_samples(_make_samples([5]))
+
+    # The model uses the 1D positions and runs its dummy vision forward, as on every
+    # rank without images.
+    assert microbatch.model_kwargs == {}
+
+
+def test_image_samples_need_an_image_source(loader, image_paths) -> None:
+    image = _prompt_image(loader, image_paths[0], offset=1)
+    batcher = _image_batcher(None, num_tokens=64)
+
+    with pytest.raises(ValueError, match="Batcher.Config.images is None"):
+        batcher._pack_training_samples([_image_sample(0, [image], 12)])
+
+
+def test_image_grid_must_match_the_batcher_source(loader, image_paths) -> None:
+    image = _prompt_image(loader, image_paths[0], offset=1)
+    t, h, w = image.grid_thw
+    # The renderer's source had another spec: another grid for the same image.
+    image = dataclasses.replace(image, grid_thw=(t, h + 2, w))
+    batcher = _image_batcher(ImageLoader.Config(spec=_IMAGE_SPEC), num_tokens=64)
+
+    with pytest.raises(ValueError, match="same spec"):
+        batcher._pack_training_samples([_image_sample(0, [image], 12)])
