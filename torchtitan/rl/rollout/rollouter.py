@@ -449,6 +449,7 @@ class RolloutWorker(Configurable):
                     group_id=group_id,
                     routing_session_id=routing_session_id,
                     sampling_config=sampling,
+                    images=env_step.next_prompt_images,
                 )
 
                 # env call
@@ -460,6 +461,7 @@ class RolloutWorker(Configurable):
                         rollout_id=turn_rollout_id,
                         prompt_prefix_len=env_step.next_prompt_prefix_len,
                         prompt_delta_token_ids=env_step.next_prompt_delta_token_ids,
+                        prompt_images=env_step.next_prompt_images,
                         prompt_messages=env_step.next_prompt_messages or [],
                         completion_token_ids=np.asarray(
                             completion.token_ids, dtype=np.int32

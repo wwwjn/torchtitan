@@ -10,14 +10,14 @@ import asyncio
 import random
 from types import SimpleNamespace
 
-from renderers import ParsedResponse, Qwen3RendererConfig
+from renderers import ParsedResponse, Qwen3RendererConfig, RenderedTokens
 
 from torchtitan.components.renderer import from_renderers
 
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 
 from torchtitan.rl.generator.types import SamplingConfig
-from torchtitan.rl.rollout import RolloutStatus
+from torchtitan.rl.rollout import PromptImage, RolloutStatus
 from torchtitan.rl.rollout.message_env import MessageEnvInitOutput, MessageEnvStepOutput
 from torchtitan.rl.rollout.rollouter import RolloutWorker
 from torchtitan.rl.rollout.rubric import RubricOutput
@@ -207,7 +207,7 @@ class _RewritingRenderer:
 
         # Only a continuation bridges; a rewrite returns None, as when a renderer can't bridge
         if kind == "continue":
-            return SimpleNamespace(token_ids=list(next_prompt))
+            return RenderedTokens(token_ids=list(next_prompt))
         return None
 
     def parse_response(self, token_ids, *, tools=None):
@@ -302,3 +302,43 @@ def test_delta_prompts_rebuild_the_full_prompt_samples() -> None:
             ] == expected
 
     asyncio.run(run())
+
+
+def test_rollout_sends_and_records_prompt_images() -> None:
+    image = PromptImage(
+        key="img-a", path="a.png", grid_thw=(1, 4, 4), offset=1, length=4, data=b"img-a"
+    )
+
+    class _ImageTokenEnv(_TokenEnv):
+        async def init(self) -> TokenEnvOutput:
+            return TokenEnvOutput(
+                next_prompt_token_ids=[1, 9, 9, 9, 9, 2],
+                next_prompt_images=(image,),
+                status=RolloutStatus.ONGOING,
+            )
+
+    worker = RolloutWorker(
+        SimpleNamespace(
+            rubric=_Config(None),
+            message_env=None,
+            token_env=None,
+            advantage=_Config(None),
+        )
+    )
+    generate_fn = _GenerateFn()
+
+    async def release_session_fn(**kwargs) -> None:
+        pass
+
+    rollout = asyncio.run(
+        worker._run_single_rollout(
+            generate_fn=generate_fn,
+            release_session_fn=release_session_fn,
+            env=_ImageTokenEnv(),
+            sampling=SamplingConfig(),
+            group_id=0,
+            rollout_id=0,
+        )
+    )
+    assert generate_fn.calls[0][1]["images"] == (image,)
+    assert rollout.turns[0].prompt_images == (image,)

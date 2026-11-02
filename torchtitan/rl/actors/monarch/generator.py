@@ -13,7 +13,7 @@ from monarch.actor import Actor, Channel, concurrent_endpoint, context, current_
 from torchtitan.rl.generator.generator import Generator
 
 from torchtitan.rl.generator.types import SamplingConfig
-from torchtitan.rl.rollout.types import Completion
+from torchtitan.rl.rollout.types import Completion, PromptImage
 
 
 class _GeneratorActorEndpoints:
@@ -61,6 +61,7 @@ class _GeneratorActorEndpoints:
         routing_session_id: str,
         sampling_config: SamplingConfig | None = None,
         metrics_prefix: str = "generator",
+        images: tuple[PromptImage, ...] = (),
     ) -> Completion:
         return await super().generate(
             prompt_token_ids,
@@ -69,6 +70,7 @@ class _GeneratorActorEndpoints:
             routing_session_id=routing_session_id,
             sampling_config=sampling_config,
             metrics_prefix=metrics_prefix,
+            images=images,
         )
 
     @concurrent_endpoint
