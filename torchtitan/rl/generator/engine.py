@@ -43,8 +43,8 @@ class GenerationEngine(Configurable, abc.ABC):
         dist_moe_runtime: Dist-MoE runtime policy, when the model has Dist-MoE experts.
         debug: Debug and determinism settings.
         reset_kv_cache_on_model_state_dict_load: Whether each model state dict load resets
-            all KV. When False, a request may reuse only KV computed under its
-            ``min_policy_version``.
+            all KV (and vLLM's encoder cache for image prompts). When False, a request may
+            reuse only KV and image embeddings salted with its ``min_policy_version``.
         rank: Global rank of this process.
         generator_name: Name of the generator, for engine metrics.
         output_dir: Output directory, for engine metrics.

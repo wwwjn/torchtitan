@@ -10,13 +10,18 @@ multimodal interface.
 Requests carry images as `PromptImage` references (cache key, patch grid, placeholder
 range). ``VLLMEngine`` reads each key's resized uint8 image from the `ImageCache` and
 submits vLLM's multimodal input directly (`image_prompt`), so vLLM's Hugging Face
-processor never runs. The image's mm hash is its cache key, so vLLM's encoder cache
-and prefix cache share one image across the samples of a GRPO group:
+processor never runs. The image's mm hash is its cache key, salted like the prefix
+cache with the request's pinned policy version (``key@version``), so vLLM's encoder
+and prefix caches reuse an image's embedding only among requests pinned to the same
+version, e.g. the samples of a GRPO group. With
+``reset_kv_cache_on_model_state_dict_load`` there is no salt; the engine resets both
+caches on every weight load instead:
 
     PromptImage(key, grid, offset, length)          controller -> generator, ~100 bytes
       -> ImageCache.load_images: uint8 (C, H, W)    each TP rank, ~0.6 ms per image
-      -> vLLM mm_input(prompt ids, {"images", "image_grid_thw"}, hashes=key, placeholders)
-      -> embed_multimodal: patchify on GPU + vision encoder, once per key while cached
+      -> vLLM mm_input(prompt ids, {"images", "image_grid_thw"}, hashes=key[@version],
+                       placeholders)
+      -> embed_multimodal: patchify on GPU + vision encoder, once per mm hash while cached
       -> embed_input_ids: token embeddings with image embeddings at the placeholders
       -> forward(inputs_embeds, 3D M-RoPE positions)
 
@@ -145,7 +150,11 @@ def image_prompt(
         prompt_token_ids: Prompt ids with each image's placeholder run expanded.
         images: The prompt's images, in any order.
         pixels: Each image's resized uint8 image ``(C, H, W)``, in ``images`` order.
-        cache_salt: vLLM prefix-cache salt.
+        cache_salt: vLLM prefix-cache salt: the request's pinned policy version, the
+            oldest one its KV may come from. It also salts the image hashes
+            (``key@salt``), because an image's encoder output depends on the vision
+            weights, which train. None (the engine resets its caches on every weight
+            load): the hashes are the bare cache keys.
     """
     kwargs = MultiModalKwargsItems.from_hf_inputs(
         {
@@ -157,7 +166,12 @@ def image_prompt(
     return mm_input(
         prompt_token_ids=prompt_token_ids,
         mm_kwargs=kwargs,
-        mm_hashes={"image": [image.key for image in images]},
+        mm_hashes={
+            "image": [
+                image.key if cache_salt is None else f"{image.key}@{cache_salt}"
+                for image in images
+            ]
+        },
         mm_placeholders={
             "image": [
                 PlaceholderRange(offset=image.offset, length=image.length)
