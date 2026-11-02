@@ -12,6 +12,7 @@ from monarch.actor import Actor, Channel, concurrent_endpoint, context, current_
 
 from torchtitan.rl.generator.generator import Generator
 
+from torchtitan.rl.generator.rdma_prompt_image import RDMAPromptImage
 from torchtitan.rl.generator.types import SamplingConfig
 from torchtitan.rl.rollout.types import Completion, PromptImage
 
@@ -61,7 +62,7 @@ class _GeneratorActorEndpoints:
         routing_session_id: str,
         sampling_config: SamplingConfig | None = None,
         metrics_prefix: str = "generator",
-        images: tuple[PromptImage, ...] = (),
+        images: tuple[PromptImage | RDMAPromptImage, ...] = (),
     ) -> Completion:
         return await super().generate(
             prompt_token_ids,

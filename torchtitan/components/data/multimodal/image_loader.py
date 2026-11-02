@@ -23,8 +23,11 @@ no access to the file system the dataset is on.
 
 Loading runs ``decode_and_resize_image`` (``process_image`` before
 normalization), so ``load_pixel_values`` returns exactly the patches
-``process_image`` + ``vision_to_patches`` produce. The key is a hash of the
-file bytes, so the samples that show one image share it.
+``process_image`` + ``vision_to_patches`` produce. Normalizing and patchifying
+on the CPU costs ~20 ms per image on one thread; callers on a hot path load
+the uint8 images (``load_images``) and run `patchify` on the GPU instead, which
+gives the same values. The key is a hash of the file bytes, so the samples
+that show one image share it.
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import io
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
@@ -120,6 +124,24 @@ class ImageLoader(Configurable):
         t, h, w = image.grid_thw
         return t * h * w // self.spec.merge_size**2
 
+    def largest_grid(self, max_tokens: int) -> tuple[int, int, int]:
+        """The largest square grid within the pixel budget and ``max_tokens``
+        placeholder tokens; vLLM profiles the vision encoder with it. The encoder's
+        cost depends on the token count, not on the shape."""
+        spec = self.spec
+        merged_pixels = (spec.patch_size * spec.merge_size) ** 2
+        side = math.isqrt(min(max_tokens, spec.max_pixels // merged_pixels))
+        if side == 0:
+            raise ValueError(
+                f"No image fits {max_tokens} tokens with patch size {spec.patch_size} "
+                f"and merge size {spec.merge_size}."
+            )
+        return (1, side * spec.merge_size, side * spec.merge_size)
+
+    def load_images(self, files: Sequence[bytes]) -> list[torch.Tensor]:
+        """Return the resized uint8 images ``(C, H, W)`` of image ``files``, unnormalized."""
+        return [_decode_and_resize(data, self.spec) for data in files]
+
     def load_pixel_values(
         self, files: Sequence[bytes]
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -129,20 +151,16 @@ class ImageLoader(Configurable):
         Patches are in block order, concatenated in ``files`` order, matching
         ``MultiModalCollator`` and the Qwen-style vision encoders.
         """
-        spec = self.spec
-        patches, grids = [], []
-        for data in files:
-            image_patches, grid = vision_to_patches(
-                normalize_image(
-                    _decode_and_resize(data, spec), spec.image_mean, spec.image_std
-                ),
-                spec.patch_size,
-                spec.temporal_patch_size,
-                spec.merge_size,
-            )
-            patches.append(image_patches)
-            grids.append(grid)
-        return torch.cat(patches), torch.stack(grids)
+        uint8_images = self.load_images(files)
+        patch_size = self.spec.patch_size
+        grid_thw = torch.tensor(
+            [
+                (1, image.shape[1] // patch_size, image.shape[2] // patch_size)
+                for image in uint8_images
+            ],
+            dtype=torch.int64,
+        )
+        return patchify(uint8_images, self.spec), grid_thw
 
 
 @functools.lru_cache(maxsize=64)
@@ -163,6 +181,25 @@ def read_image_file(path: str, key: str) -> bytes:
             f"{_content_key(data)}, the prompt has {key}."
         )
     return data
+
+
+def patchify(images: Sequence[torch.Tensor], spec: ImageSpec) -> torch.Tensor:
+    """Normalize resized uint8 images and cut them into concatenated block-order patches.
+
+    These are ``normalize_image`` and ``vision_to_patches``. They run on the images'
+    device and are elementwise float32 ops plus reshapes, so the CPU and the GPU
+    give bitwise-equal patches.
+    """
+    patches = []
+    for image in images:
+        image_patches, _ = vision_to_patches(
+            normalize_image(image, spec.image_mean, spec.image_std),
+            spec.patch_size,
+            spec.temporal_patch_size,
+            spec.merge_size,
+        )
+        patches.append(image_patches)
+    return torch.cat(patches)
 
 
 def _content_key(data: bytes) -> str:

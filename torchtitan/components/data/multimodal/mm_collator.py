@@ -198,6 +198,10 @@ class MultiModalCollator(Collator):
     ) -> torch.Tensor:
         """Build 3D (temporal, height, width) MRoPE position IDs per token.
 
+        TODO: build each document's positions with
+        ``multimodal.mrope.get_mrope_positions`` (same values, from placeholder
+        offsets) so the two implementations cannot drift.
+
         Returns ``(num_tokens, 3)`` with temporal/height/width coordinates in
         the final dimension. Runs here on CPU data workers, off the GPU path.
 

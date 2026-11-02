@@ -70,8 +70,9 @@ class EngineRequest:
     """Rank 0's `time.time()` in `generate`; vLLM breaks priority ties by it and measures TTFT from it.
     All TP ranks pass this one value, so they order ties the same way even if their clocks differ."""
     images: tuple[PromptImage, ...] = ()
-    """Images whose placeholders are in `prompt_token_ids`, with their files' bytes (not
-    pixels)."""
+    """Images whose placeholders are in `prompt_token_ids`, with their files' bytes (not pixels);
+    the broadcast to TP ranks carries each file once per decision (`Generator.generate` keeps
+    one bytes object per image)."""
     min_policy_version: int = field(init=False)
     """Oldest policy version this request's KV can come from; rank 0 sets it at admission.
     Without a KV reset on model state dict load it is the group's pinned version and salts the
