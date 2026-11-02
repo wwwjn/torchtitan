@@ -17,7 +17,10 @@ pixels (generator, batcher) load and patchify them.
 The stored array is ``decode_and_resize_image``'s output (``process_image``
 before normalization), so ``ImageCache.load_pixel_values`` returns exactly the
 patches ``process_image`` + ``vision_to_patches`` produce, at ~8x fewer stored
-bytes than float32 patches (uint8, no temporal-patch duplication).
+bytes than float32 patches (uint8, no temporal-patch duplication). Normalizing
+and patchifying on the CPU costs ~20 ms per image on one thread; callers on a
+hot path load the uint8 images (``load_images``, ~0.6 ms) and run `patchify` on
+the GPU instead, which gives the same values.
 
 An image's key is a hash of its file bytes, so `ImageCache.lookup` finds an
 image by content wherever the dataset is mounted, without decoding it.
@@ -44,7 +47,7 @@ import json
 import logging
 import multiprocessing
 import os
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 
@@ -129,6 +132,10 @@ class ImageCache:
             )
         return CachedImage(key=key, grid_thw=self._grids[key])
 
+    def __iter__(self) -> Iterator[CachedImage]:
+        for key, grid_thw in self._grids.items():
+            yield CachedImage(key=key, grid_thw=grid_thw)
+
     def num_tokens(self, image: CachedImage) -> int:
         """Placeholder tokens of ``image`` after ``merge_size x merge_size`` merging."""
         t, h, w = image.grid_thw
@@ -143,20 +150,34 @@ class ImageCache:
         Patches are in block order, concatenated in ``keys`` order, matching
         ``MultiModalCollator`` and the Qwen-style vision encoders.
         """
-        patches = [self._load_patches(key) for key in keys]
         grid_thw = torch.tensor([self._grids[key] for key in keys], dtype=torch.int64)
-        return torch.cat(patches), grid_thw
+        return patchify(self.load_images(keys), self.spec), grid_thw
 
-    def _load_patches(self, key: str) -> torch.Tensor:
-        spec = self.spec
-        image = torch.from_numpy(np.load(os.path.join(self.cache_dir, f"{key}.npy")))
-        patches, _ = vision_to_patches(
+    def load_images(self, keys: Sequence[str]) -> list[torch.Tensor]:
+        """Return the resized uint8 images ``(C, H, W)`` of ``keys``, unnormalized."""
+        return [
+            torch.from_numpy(np.load(os.path.join(self.cache_dir, f"{key}.npy")))
+            for key in keys
+        ]
+
+
+def patchify(images: Sequence[torch.Tensor], spec: ImageCacheSpec) -> torch.Tensor:
+    """Normalize resized uint8 images and cut them into concatenated block-order patches.
+
+    These are ``normalize_image`` and ``vision_to_patches``. They run on the images'
+    device and are elementwise float32 ops plus reshapes, so the CPU and the GPU
+    give bitwise-equal patches.
+    """
+    patches = []
+    for image in images:
+        image_patches, _ = vision_to_patches(
             normalize_image(image, spec.image_mean, spec.image_std),
             spec.patch_size,
             spec.temporal_patch_size,
             spec.merge_size,
         )
-        return patches
+        patches.append(image_patches)
+    return torch.cat(patches)
 
 
 def _content_key(data: bytes) -> str:

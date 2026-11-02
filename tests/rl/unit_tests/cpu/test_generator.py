@@ -62,6 +62,7 @@ from torchtitan.rl.generator.vllm.worker import (
     TorchTitanGPUWorker,
 )
 from torchtitan.rl.observability import metrics as m
+from torchtitan.rl.rollout.types import PromptImage
 from torchtitan.rl.routing.intra_generator import IntraGeneratorRouter
 from torchtitan.rl.routing.strategies import LeastLoadedRoutingStrategy
 from vllm import SamplingParams
@@ -144,6 +145,7 @@ def _vllm_engine(*, reset_kv_cache_on_model_state_dict_load=False, model=None):
     )
     engine._get_model = lambda: model
     engine._session_kv_holder = None
+    engine._load_image = None
     return engine
 
 
@@ -389,6 +391,42 @@ def test_admission_with_kv_reset_does_not_salt_prompt():
 
     _, kwargs = cast(_FakeLLMEngine, engine._engine).add_requests[0]
     assert kwargs["prompt"]["cache_salt"] is None
+
+
+def test_admission_submits_image_prompts_as_multimodal_inputs():
+    engine = _vllm_engine()
+    loaded = torch.zeros(3, 32, 32, dtype=torch.uint8)
+    engine._load_image = lambda key: loaded
+    request = _engine_request("r0", min_policy_version=6)
+    request.prompt_token_ids = [1, 7, 7, 7, 7, 2]
+    request.images = (PromptImage(key="k", grid_thw=(1, 4, 4), offset=1, length=4),)
+
+    assert (
+        engine.add_requests([request, _engine_request("r1", min_policy_version=6)])
+        == []
+    )
+
+    [(_, image_kwargs), (_, text_kwargs)] = cast(
+        _FakeLLMEngine, engine._engine
+    ).add_requests
+    prompt = image_kwargs["prompt"]
+    assert prompt["type"] == "multimodal"
+    assert prompt["prompt_token_ids"] == [1, 7, 7, 7, 7, 2]
+    assert prompt["cache_salt"] == "6"
+    assert prompt["mm_hashes"] == {"image": ["k"]}
+    assert prompt["mm_kwargs"]["image"][0]["images"].data is loaded
+    assert text_kwargs["prompt"]["type"] == "token"
+
+
+def test_admission_rejects_image_prompts_without_an_image_cache():
+    engine = _vllm_engine()
+    request = _engine_request("r0", min_policy_version=6)
+    request.images = (PromptImage(key="k", grid_thw=(1, 4, 4), offset=1, length=4),)
+
+    [(request_id, error)] = engine.add_requests([request])
+
+    assert request_id == "r0" and "image_cache_dir" in str(error)
+    assert cast(_FakeLLMEngine, engine._engine).add_requests == []
 
 
 def test_admission_rejects_only_the_invalid_request():
