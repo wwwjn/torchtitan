@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import json
+import os
 import shutil
 
 import numpy as np
@@ -13,11 +15,14 @@ from PIL import Image
 
 from torchtitan.components.data.multimodal.image_cache import (
     build_image_cache,
+    IMAGE_CACHE_SPECS,
+    ImageCache,
     ImageCacheSpec,
     patchify,
 )
 from torchtitan.components.data.multimodal.utils.image import (
     process_image,
+    resize_to_merged_patch_grid,
     vision_to_patches,
 )
 
@@ -61,6 +66,55 @@ def test_cached_patches_match_process_image(tmp_path, image_paths) -> None:
     for image, (patches, grid) in zip(images, expected):
         assert image.grid_thw == tuple(grid.tolist())
         assert cache.num_tokens(image) == patches.shape[0] // spec.merge_size**2
+
+
+def test_muse_spark_cache_matches_its_sft_preprocessing(tmp_path, image_paths) -> None:
+    # `_muse_spark_mm_dataloader`: 14-px patches, merged-patch-grid resize, raster order.
+    spec = IMAGE_CACHE_SPECS["muse_spark"]
+    cache = build_image_cache(image_paths, str(tmp_path / "cache"), spec, num_workers=1)
+
+    images = [cache.lookup(path) for path in image_paths]
+    pixel_values = patchify(cache.load_images([image.key for image in images]), spec)
+    grid_thw = torch.tensor([image.grid_thw for image in images])
+
+    expected = [
+        vision_to_patches(
+            process_image(
+                path,
+                patch_size=14,
+                merge_size=2,
+                resize_fn=resize_to_merged_patch_grid,
+                image_mean=(0.5, 0.5, 0.5),
+                image_std=(0.5, 0.5, 0.5),
+            ),
+            14,
+            2,
+            2,
+            patch_order="raster",
+        )
+        for path in image_paths
+    ]
+    assert torch.equal(pixel_values, torch.cat([patches for patches, _ in expected]))
+    assert torch.equal(grid_thw, torch.stack([grid for _, grid in expected]))
+    # 300x200 -> the closest merged grid (h, w) = (7, 11): 77 <|patch|> tokens.
+    assert cache.num_tokens(images[0]) == 77
+
+
+def test_cache_without_newer_spec_fields_loads_with_defaults(
+    tmp_path, image_paths
+) -> None:
+    cache_dir = str(tmp_path / "cache")
+    build_image_cache(image_paths[:1], cache_dir, num_workers=1)
+    index_path = os.path.join(cache_dir, "index.json")
+    with open(index_path) as f:
+        index = json.load(f)
+    for field in ("resize", "max_image_tokens", "patch_order"):
+        del index["spec"][field]
+    with open(index_path, "w") as f:
+        json.dump(index, f)
+
+    assert ImageCache(cache_dir).spec == ImageCacheSpec()
+    build_image_cache(image_paths[1:], cache_dir, num_workers=1)
 
 
 def test_identical_files_share_a_key_and_cache_extends(tmp_path, image_paths) -> None:

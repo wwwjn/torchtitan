@@ -17,8 +17,9 @@ GPU.
 
 The stored array is ``decode_and_resize_image``'s output (``process_image``
 before normalization), so ``patchify(cache.load_images(keys), cache.spec)``
-returns exactly the patches ``process_image`` + ``vision_to_patches`` produce,
-at ~8x fewer stored bytes than float32 patches (uint8, no temporal-patch
+returns exactly the patches ``process_image`` + ``vision_to_patches`` produce
+for the cache's `ImageCacheSpec` (e.g. Qwen3.5's pixel budget and block order,
+or Muse Spark's merged-patch grid and raster order), at ~8x fewer stored bytes than float32 patches (uint8, no temporal-patch
 duplication). Loading takes ~0.6 ms per image; normalizing and patchifying on
 the CPU ~20 ms on one thread, and on the GPU it gives the same values.
 
@@ -34,7 +35,7 @@ Build one with::
 
     python -m torchtitan.components.data.multimodal.image_cache \\
         --cache-dir /data/slake/image_cache --image-root /data/slake/imgs \\
-        --name-glob source.jpg
+        --name-glob source.jpg [--spec muse_spark]
 """
 
 from __future__ import annotations
@@ -42,6 +43,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import fnmatch
+import functools
 import hashlib
 import json
 import logging
@@ -50,6 +52,7 @@ import os
 from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 import torch
@@ -57,6 +60,8 @@ import torch
 from torchtitan.components.data.multimodal.utils.image import (
     decode_and_resize_image,
     normalize_image,
+    resize_to_merged_patch_grid,
+    resize_to_pixel_budget,
     vision_to_patches,
 )
 from torchtitan.observability.logging import init_logger
@@ -72,19 +77,44 @@ class ImageCacheSpec:
     """Preprocessing that produced a cache; defaults match Qwen3-VL / Qwen3.5.
 
     The arguments of ``process_image`` + ``vision_to_patches`` for the model's
-    vision encoder.
+    vision encoder. It must match the model's vision encoder and the SFT data
+    pipeline of the same model, so the generator and the trainer see the pixels
+    the model was trained on.
     """
 
     patch_size: int = 16
     temporal_patch_size: int = 2
     merge_size: int = 2
     """Patches merged per side into one placeholder token (``spatial_merge_size``)."""
+    resize: Literal["pixel_budget", "merged_patch_grid"] = "pixel_budget"
+    """``resize_to_pixel_budget`` (bounded by ``min_pixels``/``max_pixels``) or
+    ``resize_to_merged_patch_grid`` (bounded by ``max_image_tokens``)."""
     min_pixels: int = 65536
     """Lower bound on H * W after the resize."""
     max_pixels: int = 16777216
     """Upper bound on H * W after the resize."""
+    max_image_tokens: int = 4096
+    patch_order: Literal["block", "raster"] = "block"
+    """Patch sequence layout the vision encoder expects (see ``vision_to_patches``)."""
     image_mean: tuple[float, float, float] = (0.5, 0.5, 0.5)
     image_std: tuple[float, float, float] = (0.5, 0.5, 0.5)
+
+    @classmethod
+    def from_json(cls, spec: dict) -> ImageCacheSpec:
+        """Read a spec from ``index.json``; fields added later take their defaults."""
+        spec = dict(spec)
+        spec["image_mean"] = tuple(spec["image_mean"])
+        spec["image_std"] = tuple(spec["image_std"])
+        return cls(**spec)
+
+
+IMAGE_CACHE_SPECS = {
+    "qwen3_5": ImageCacheSpec(),
+    # Muse Spark's SFT pipeline: `torchtitan_recipes.models.muse_spark._muse_spark_mm_dataloader`.
+    "muse_spark": ImageCacheSpec(
+        patch_size=14, resize="merged_patch_grid", patch_order="raster"
+    ),
+}
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -110,10 +140,7 @@ class ImageCache:
         self.cache_dir = cache_dir
         with open(os.path.join(cache_dir, _INDEX)) as f:
             index = json.load(f)
-        spec = index["spec"]
-        spec["image_mean"] = tuple(spec["image_mean"])
-        spec["image_std"] = tuple(spec["image_std"])
-        self.spec = ImageCacheSpec(**spec)
+        self.spec = ImageCacheSpec.from_json(index["spec"])
         self._grids: dict[str, tuple[int, int, int]] = {
             key: (t, h, w) for key, (t, h, w) in index["images"].items()
         }
@@ -160,7 +187,7 @@ class ImageCache:
 
 
 def patchify(images: Sequence[torch.Tensor], spec: ImageCacheSpec) -> torch.Tensor:
-    """Normalize resized uint8 images and cut them into concatenated block-order patches.
+    """Normalize resized uint8 images and cut them into concatenated patches.
 
     These are ``normalize_image`` and ``vision_to_patches``. They run on the images'
     device and are elementwise float32 ops plus reshapes, so the CPU and the GPU
@@ -173,6 +200,7 @@ def patchify(images: Sequence[torch.Tensor], spec: ImageCacheSpec) -> torch.Tens
             spec.patch_size,
             spec.temporal_patch_size,
             spec.merge_size,
+            patch_order=spec.patch_order,
         )
         patches.append(image_patches)
     return torch.cat(patches)
@@ -205,12 +233,20 @@ def _process_one(
     with open(path, "rb") as f:
         data = f.read()
     key = _content_key(data)
+    resize_fn = (
+        resize_to_pixel_budget
+        if spec.resize == "pixel_budget"
+        else functools.partial(
+            resize_to_merged_patch_grid, max_image_tokens=spec.max_image_tokens
+        )
+    )
     image = decode_and_resize_image(
         data,
         patch_size=spec.patch_size,
         merge_size=spec.merge_size,
         min_pixels=spec.min_pixels,
         max_pixels=spec.max_pixels,
+        resize_fn=resize_fn,
     )
     _, height, width = image.shape
     # Always (re)write: a .npy left by a build with another spec must not survive.
@@ -239,7 +275,7 @@ def build_image_cache(
     if os.path.exists(index_path):
         with open(index_path) as f:
             existing = json.load(f)
-        if existing["spec"] != json.loads(json.dumps(index["spec"])):
+        if ImageCacheSpec.from_json(existing["spec"]) != spec:
             raise ValueError(
                 f"{cache_dir!r} was built with {existing['spec']}, not {index['spec']}; "
                 "use a new cache_dir for another spec."
@@ -271,9 +307,14 @@ def _main() -> None:
     parser.add_argument(
         "--image-root", required=True, help="Directory searched recursively for images."
     )
-    defaults = ImageCacheSpec()
-    parser.add_argument("--max-pixels", type=int, default=defaults.max_pixels)
-    parser.add_argument("--min-pixels", type=int, default=defaults.min_pixels)
+    parser.add_argument(
+        "--spec",
+        choices=sorted(IMAGE_CACHE_SPECS),
+        default="qwen3_5",
+        help="Preprocessing of the model the cache is for.",
+    )
+    parser.add_argument("--max-pixels", type=int, help="Override the spec's budget.")
+    parser.add_argument("--min-pixels", type=int, help="Override the spec's budget.")
     parser.add_argument(
         "--name-glob", default="*", help="Only cache files whose name matches."
     )
@@ -287,12 +328,12 @@ def _main() -> None:
         if name.lower().endswith(_IMAGE_SUFFIXES)
         and fnmatch.fnmatch(name, args.name_glob)
     ]
-    build_image_cache(
-        paths,
-        args.cache_dir,
-        ImageCacheSpec(min_pixels=args.min_pixels, max_pixels=args.max_pixels),
-        num_workers=args.num_workers,
+    spec = IMAGE_CACHE_SPECS[args.spec]
+    overrides = {"min_pixels": args.min_pixels, "max_pixels": args.max_pixels}
+    spec = dataclasses.replace(
+        spec, **{name: value for name, value in overrides.items() if value is not None}
     )
+    build_image_cache(paths, args.cache_dir, spec, num_workers=args.num_workers)
     logger.info(f"Cached {len(paths)} images in {args.cache_dir}")
 
 
