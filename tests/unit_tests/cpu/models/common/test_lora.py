@@ -273,6 +273,40 @@ def test_lora_targets_fused_grouped_projection():
     assert grouped.lora_b.weight.grad is not None
 
 
+def test_grouped_lora_merged_weight():
+    """Each expert's merged weight is W + (alpha / rank) * B @ A."""
+    grouped = (
+        LoRATransform(rank=8, alpha=16.0)
+        .transform(
+            GroupedLinear.Config(
+                group_size=2,
+                in_features=8,
+                out_features=4,
+                num_linears=2,
+                param_init={"weight": torch.nn.init.normal_},
+            )
+        )
+        .build()
+    )
+    grouped.init_states()
+    with torch.no_grad():
+        grouped.lora_b.weight.copy_(torch.randn_like(grouped.lora_b.weight))
+
+    merged = grouped.merged_weight(
+        grouped.weight, grouped.lora_a.weight, grouped.lora_b.weight
+    )
+
+    expected = torch.stack(
+        [
+            # [2, O, L] @ [L, I] for the stacked projection of each expert.
+            grouped.weight[expert]
+            + 2 * grouped.lora_b.weight[expert] @ grouped.lora_a.weight[expert]
+            for expert in range(2)
+        ]
+    )
+    torch.testing.assert_close(merged, expected)
+
+
 def test_grouped_lora_preserves_specialized_projection():
     config = LoRATransform(rank=8).transform(
         GptOssGroupedLinear.Config(
