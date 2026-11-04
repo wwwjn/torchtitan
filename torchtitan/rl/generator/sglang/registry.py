@@ -6,13 +6,13 @@
 
 """Registers TorchTitan models with SGLang.
 
-SGLang reads the checkpoint's ``config.json`` into an HF config, applies
-``ServerArgs.json_model_override_args`` on top, and resolves the model class from
-the config's ``architectures`` through its ``ModelRegistry``. The TorchTitan model
-config is the source of truth: ``model_config_to_sglang_overrides`` overrides the
-fields SGLang reads before it builds the model (KV pool sizing, context length,
-vocabulary), and ``register_to_sglang`` registers a model class that closes over
-the TorchTitan config.
+SGLang builds its model config from an HF ``config.json`` and resolves the model
+class from the config's ``architectures`` through its ``ModelRegistry``. The
+TorchTitan model config is the source of truth: ``model_config_to_sglang_hf_config``
+produces the HF-shaped config SGLang reads before it builds the model (KV pool
+sizing, context length, vocabulary), as vLLM's TorchTitan config parser does, and
+``register_to_sglang`` registers a model class that closes over the TorchTitan
+config.
 """
 
 from __future__ import annotations
@@ -28,12 +28,13 @@ from torchtitan.rl.generator.unified_model import get_attention_dimensions
 SGLANG_MODEL_NAME = "TorchTitanForCausalLM"
 
 
-def model_config_to_sglang_overrides(cfg: Decoder.Config) -> dict[str, Any]:
-    """Return the HF config fields SGLang must take from the TorchTitan config.
+def model_config_to_sglang_hf_config(cfg: Decoder.Config) -> dict[str, Any]:
+    """Return the HF config SGLang reads for ``cfg``, written to its ``config.json``.
 
-    SGLang sizes the KV pool from the layer count, KV heads and head dims, caps
-    the context at ``max_position_embeddings``, and resolves the model class from
-    ``architectures``.
+    SGLang sizes the KV pool from the layer count, KV heads and head dims, caps the
+    context at ``max_position_embeddings``, and resolves the model class from
+    ``architectures``. ``model_type`` only selects the HF config class that parses
+    these generic fields; the TorchTitan wrapper builds the model itself.
     """
     attention = cfg.first_full_attention
     if attention is None:
@@ -43,8 +44,9 @@ def model_config_to_sglang_overrides(cfg: Decoder.Config) -> dict[str, Any]:
     num_heads, num_kv_heads, head_dim, value_head_dim = get_attention_dimensions(
         attention, cfg.dim
     )
-    return {
+    hf_config: dict[str, Any] = {
         "architectures": [SGLANG_MODEL_NAME],
+        "model_type": "llama",
         "vocab_size": cfg.vocab_size,
         "hidden_size": cfg.dim,
         "num_attention_heads": num_heads,
@@ -54,7 +56,9 @@ def model_config_to_sglang_overrides(cfg: Decoder.Config) -> dict[str, Any]:
         "num_hidden_layers": len(cfg.layers),
         "max_position_embeddings": cfg.max_context_length,
         "tie_word_embeddings": getattr(cfg, "enable_weight_tying", False),
+        "torch_dtype": "bfloat16",
     }
+    return hf_config
 
 
 def register_to_sglang(

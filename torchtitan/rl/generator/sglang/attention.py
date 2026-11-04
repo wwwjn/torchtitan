@@ -205,6 +205,23 @@ class TorchTitanVarlenAttnBackend(AttentionBackend):
             block_table=self._graph_block_table[:batch_size],
         )
 
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch,
+        save_kv_cache: bool = True,
+        **kwargs,
+    ) -> torch.Tensor:
+        if forward_batch.forward_mode.is_idle():
+            # Padding rows of a rank without requests; keep them finite.
+            return q.new_zeros(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+        return super().forward(
+            q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs
+        )
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -238,9 +255,12 @@ class TorchTitanVarlenAttnBackend(AttentionBackend):
         forward_batch,
         save_kv_cache: bool,
     ) -> torch.Tensor:
+        # The step's real tokens have KV slots; rows past them are padding the model
+        # wrapper appended for expert parallelism.
+        num_tokens = forward_batch.out_cache_loc.shape[0]
         if save_kv_cache and k is not None:
             self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
+                layer, forward_batch.out_cache_loc, k[:num_tokens], v[:num_tokens]
             )
         metadata = self.forward_metadata
         assert metadata is not None, "init_forward_metadata must run first"
@@ -253,7 +273,10 @@ class TorchTitanVarlenAttnBackend(AttentionBackend):
         value_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
             -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
         )
-        out_THV = q_THK.new_empty(q_THK.shape[0], num_heads, layer.v_head_dim)
+        if q_THK.shape[0] > num_tokens:
+            out_THV = q_THK.new_zeros(q_THK.shape[0], num_heads, layer.v_head_dim)
+        else:
+            out_THV = q_THK.new_empty(q_THK.shape[0], num_heads, layer.v_head_dim)
 
         extra_kwargs: dict[str, Any] = {}
         # FA2's auto num_splits heuristic produces NaN intermittently with paged KV
@@ -269,8 +292,8 @@ class TorchTitanVarlenAttnBackend(AttentionBackend):
             window_size = (-1, 0)
 
         torch.nn.attention.varlen.varlen_attn_out(
-            out_THV,
-            q_THK,
+            out_THV[:num_tokens],
+            q_THK[:num_tokens],
             key_cache,
             value_cache,
             metadata.cu_seqlens_q,

@@ -79,21 +79,30 @@ class TorchTitanSampler(Sampler):
             )
         reqs = self._batch_reqs
         logits_BV = logits_output.next_token_logits.to(torch.float32)
+        # Data-parallel attention may pad a step with rows after the real requests'
+        # (SGLang drops their tokens); they sample greedily.
         assert (
-            reqs is not None and len(reqs) == logits_BV.shape[0]
+            reqs is not None and len(reqs) <= logits_BV.shape[0]
         ), "The engine must publish the step's requests before sampling"
         if sampling_info.has_custom_logit_processor:
             raise NotImplementedError("custom logit processors are not supported")
+        num_padding_rows = logits_BV.shape[0] - len(reqs)
 
         # SGLang represents a greedy request (temperature 0) as top_k == 1.
-        greedy_B = sampling_info.top_ks == 1
+        greedy_B = torch.nn.functional.pad(
+            sampling_info.top_ks == 1, (0, num_padding_rows), value=True
+        )
         if sampling_info.is_all_greedy:
             next_token_ids_B = logits_BV.argmax(dim=-1)
             logprobs_BV = logits_BV.log_softmax(dim=-1, dtype=torch.float32)
         else:
             greedy_ids_B = logits_BV.argmax(dim=-1)
             # SGLang already stores temperature 1.0 for greedy rows.
-            logits_BV.div_(sampling_info.temperatures)
+            logits_BV.div_(
+                torch.nn.functional.pad(
+                    sampling_info.temperatures, (0, 0, 0, num_padding_rows), value=1.0
+                )
+            )
             logprobs_BV = logits_BV.log_softmax(dim=-1, dtype=torch.float32)
             probs_BV = logits_BV.softmax(dim=-1, dtype=torch.float32)
             noise_BV = torch.empty_like(probs_BV)
@@ -104,7 +113,7 @@ class TorchTitanSampler(Sampler):
                 and req.sampling_params.sampling_seed is not None
                 and req.inflight_middle_chunks <= 0
             ]
-            if len(seeded_rows) != len(reqs):
+            if len(seeded_rows) != logits_BV.shape[0]:
                 noise_BV.exponential_()
             for i in seeded_rows:
                 noise_BV[i].exponential_(

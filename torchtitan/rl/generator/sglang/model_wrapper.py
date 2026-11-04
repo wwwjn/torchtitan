@@ -195,12 +195,14 @@ class SGLangModelWrapper(Module):
         Returns:
             ``LogitsProcessorOutput`` with ``next_token_logits`` of shape ``[B, V]``.
         """
-        if forward_batch.forward_mode.is_idle():
-            return LogitsProcessorOutput(
-                next_token_logits=input_ids.new_empty(
-                    0, self.config.vocab_size, dtype=torch.bfloat16
-                )
-            )
+        # An idle step still runs the model: with data parallelism, expert
+        # parallelism's all-to-alls span every DP rank, so a rank without requests
+        # runs its (possibly empty) padding rows through the MoE layers too.
+        num_tokens = input_ids.shape[0]
+        num_padding_tokens = self._num_padding_tokens(num_tokens)
+        if num_padding_tokens:
+            input_ids = torch.nn.functional.pad(input_ids, (0, num_padding_tokens))
+            positions = torch.nn.functional.pad(positions, (0, num_padding_tokens))
         with set_forward_batch(forward_batch), self.parallelism_context.activate_spmd():
             h_TD = self.model(input_ids, attention_metadata=None, positions=positions)
         # Inference disables sequence parallelism, so final hidden states are
@@ -208,6 +210,7 @@ class SGLangModelWrapper(Module):
         if isinstance(h_TD, DTensor):
             assert all(isinstance(p, Replicate) for p in h_TD.placements)
             h_TD = h_TD._local_tensor
+        h_TD = h_TD[:num_tokens]
 
         if forward_batch.forward_mode.is_extend():
             # One row per request: its last token predicts the next one.
@@ -218,7 +221,32 @@ class SGLangModelWrapper(Module):
             h_BD = h_TD[last_index_B]
         else:
             h_BD = h_TD
+        if h_BD.shape[0] == 0:
+            # An idle step samples nothing. Every rank of a TP group shares its DP
+            # rank's idle step, so skipping the logits all-gather is collective.
+            return LogitsProcessorOutput(
+                next_token_logits=h_BD.new_empty(
+                    0, self.config.vocab_size, dtype=torch.float32
+                )
+            )
         return LogitsProcessorOutput(next_token_logits=self.compute_logits(h_BD))
+
+    def _num_padding_tokens(self, num_tokens: int) -> int:
+        """Rows to append before the TorchTitan forward.
+
+        With EP and TP, the MoE block splits each step's tokens evenly across the
+        TP ranks of the expert group (as vLLM's TorchTitan runner pads for), and an
+        idle step still needs rows to run. The padding rows run through the model,
+        attention gives them zeros and writes no KV, and the forward drops them
+        before the logits.
+        """
+        tp = self.parallelism_context.tp
+        expert_sequence_parallel = self.parallelism_context.ep_enabled and tp > 1
+        if num_tokens == 0:
+            # An idle step (data parallelism) runs padding rows only: the model's
+            # reshapes need at least one row, and expert SP one per TP rank.
+            return tp if expert_sequence_parallel else 1
+        return -num_tokens % tp if expert_sequence_parallel else 0
 
     def compute_logits(self, h_BD: torch.Tensor) -> torch.Tensor:
         """Full-vocabulary logits of ``h_BD``, gathered over tensor parallelism."""

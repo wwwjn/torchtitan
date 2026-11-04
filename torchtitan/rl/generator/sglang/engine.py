@@ -27,7 +27,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import sys
+import tempfile
 from array import array
 from dataclasses import dataclass, field
 from typing import Any
@@ -61,13 +63,13 @@ _OWNED_SERVER_ARGS = frozenset(
         "dtype",
         "tp_size",
         "dp_size",
+        "enable_dp_attention",
         "attention_backend",
         "page_size",
         "mem_fraction_static",
         "max_running_requests",
         "chunked_prefill_size",
         "context_length",
-        "json_model_override_args",
         "disable_cuda_graph",
         "disable_overlap_schedule",
         "disable_custom_all_reduce",
@@ -182,13 +184,13 @@ class SGLangEngine(GenerationEngine):
         output_dir: str,
     ):
         del generator_name, output_dir
-        if parallelism.data_parallel_degree != 1:
-            raise NotImplementedError(
-                "SGLangEngine does not support data_parallel_degree > 1 yet"
-            )
-        if parallelism.expert_parallel_degree != 1:
-            raise NotImplementedError(
-                "SGLangEngine does not support expert parallelism yet"
+        if parallelism.expert_parallel_degree not in (
+            1,
+            parallelism.data_parallel_degree * parallelism.tensor_parallel_degree,
+        ):
+            raise ValueError(
+                "expert_parallel_degree must be 1 or data_parallel_degree * "
+                "tensor_parallel_degree"
             )
         if parallelism.enable_sequence_parallel:
             raise NotImplementedError(
@@ -225,10 +227,11 @@ class SGLangEngine(GenerationEngine):
         self._max_context_length = model.max_context_length
         self._vocab_size = model.vocab_size
         self._tp_degree = parallelism.tensor_parallel_degree
+        self._dp_degree = parallelism.data_parallel_degree
         self._rank = rank
 
         from torchtitan.rl.generator.sglang.registry import (
-            model_config_to_sglang_overrides,
+            model_config_to_sglang_hf_config,
             register_to_sglang,
         )
 
@@ -238,22 +241,33 @@ class SGLangEngine(GenerationEngine):
         page_size = config.page_size
         if page_size is None:
             page_size = 16 if has_cuda_capability(9, 0) else 256
+        # SGLang reads only the HF config from its model path: the wrapper loads
+        # weights from the checkpointer, and the engine loads no tokenizer. Give it
+        # a config derived from the TorchTitan model instead of the checkpoint's.
+        del model_path
+        self._sglang_model_dir = tempfile.mkdtemp(prefix="torchtitan_sglang_")
+        with open(os.path.join(self._sglang_model_dir, "config.json"), "w") as f:
+            json.dump(model_config_to_sglang_hf_config(model), f)
         server_args_kwargs: dict[str, Any] = dict(
-            model_path=model_path,
-            tokenizer_path=model_path,
+            model_path=self._sglang_model_dir,
+            tokenizer_path=self._sglang_model_dir,
             skip_tokenizer_init=True,
             trust_remote_code=True,
             dtype=model_dtype,
-            tp_size=parallelism.tensor_parallel_degree,
-            dp_size=1,
+            # Generator DP supplies ranks for expert parallelism, whose all-to-alls
+            # span every DP rank, so the DP ranks must step together. That is
+            # SGLang's data-parallel attention: one world of DP * TP ranks in which
+            # attention runs data-parallel over DP and tensor-parallel over TP, and a
+            # rank without requests runs an idle batch in a step any rank runs.
+            tp_size=parallelism.data_parallel_degree
+            * parallelism.tensor_parallel_degree,
+            dp_size=parallelism.data_parallel_degree,
+            enable_dp_attention=parallelism.data_parallel_degree > 1,
             attention_backend="torchtitan_varlen",
             page_size=page_size,
             mem_fraction_static=gpu_memory_limit,
             max_running_requests=max_num_seqs,
             context_length=model.max_context_length,
-            json_model_override_args=json.dumps(
-                model_config_to_sglang_overrides(model)
-            ),
             disable_cuda_graph=not config.enable_cuda_graph,
             # The generator steps the scheduler synchronously.
             disable_overlap_schedule=True,
@@ -280,7 +294,7 @@ class SGLangEngine(GenerationEngine):
         from sglang.srt.managers.scheduler import Scheduler
         from sglang.srt.plugins import load_plugins
         from sglang.srt.runtime_context import publish, spawn_world_rank, SpawnRanks
-        from sglang.srt.server_args import PortArgs, ServerArgs
+        from sglang.srt.server_args import ServerArgs
 
         # Registers the attention backend with SGLang.
         import torchtitan.rl.generator.sglang.attention  # noqa: F401
@@ -299,17 +313,22 @@ class SGLangEngine(GenerationEngine):
         server_args = ServerArgs(**server_args_kwargs)
         server_args.resolve_once()
         server_args.check_server_args()
-        tp_rank = rank % self._tp_degree
+        dp_rank = rank // self._tp_degree if self._dp_degree > 1 else None
         publish(
             server_args,
             role="scheduler",
             ranks=SpawnRanks(
-                world_rank=spawn_world_rank(server_args, tp_rank=tp_rank, pp_rank=0),
-                dp_rank=None,
+                world_rank=spawn_world_rank(server_args, tp_rank=rank, pp_rank=0),
+                dp_rank=dp_rank,
                 gpu_id=local_rank,
             ),
         )
-        port_args = PortArgs.init_new(server_args)
+        port_args = _in_process_port_args()
+        # Every rank's step runs collectives with every other DP rank, so the DP
+        # ranks agree on whether any of them has work (see has_unfinished_requests).
+        self._dp_cpu_group = (
+            dist.new_group(backend="gloo") if self._dp_degree > 1 else None
+        )
         logger.info("Initializing SGLang scheduler in-process (rank %d)", rank)
         return Scheduler(server_args, port_args)
 
@@ -347,11 +366,11 @@ class SGLangEngine(GenerationEngine):
 
     @property
     def data_parallel_size(self) -> int:
-        return 1
+        return self._dp_degree
 
     @property
     def data_parallel_rank(self) -> int:
-        return 0
+        return self._rank // self._tp_degree
 
     @property
     def prefetched_model_state_dict(self) -> dict[str, torch.Tensor]:
@@ -424,6 +443,19 @@ class SGLangEngine(GenerationEngine):
         return None
 
     def has_unfinished_requests(self) -> bool:
+        """Whether any admitted request is still running, on any DP rank.
+
+        With DP > 1, a rank whose own requests are done still steps while another DP
+        rank has work (SGLang gives it an idle batch), so this is a collective.
+        """
+        unfinished = self._has_local_unfinished_requests()
+        if self._dp_cpu_group is None:
+            return unfinished
+        flag = torch.tensor([int(unfinished)], dtype=torch.int32)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=self._dp_cpu_group)
+        return bool(flag.item())
+
+    def _has_local_unfinished_requests(self) -> bool:
         scheduler = self._scheduler
         # A prefill batch's requests join running_batch only when the next step
         # schedules, so a just-prefilled request is still in last_batch.
@@ -453,6 +485,10 @@ class SGLangEngine(GenerationEngine):
                 result = scheduler.run_batch(batch)
                 scheduler.process_batch_result(batch, result)
             scheduler.last_batch = batch
+            # SGLang's watchdog kills the process when a batch is current but makes
+            # no progress for watchdog_timeout. Between steps the generator may
+            # leave the engine idle for long (trainer steps, weight syncs).
+            scheduler.cur_batch_for_debug = None
         finished = self._output_collector.pop_finished()
         self._sampler.release(request.request_id for request in finished)
         return finished
@@ -480,8 +516,38 @@ class SGLangEngine(GenerationEngine):
             )
 
     def shutdown(self) -> None:
-        """Process teardown is the launcher's; release nothing beyond Python references."""
+        """Process teardown is the launcher's; release Python references and the config."""
         self._scheduler = None
+        shutil.rmtree(self._sglang_model_dir, ignore_errors=True)
+
+
+def _in_process_port_args():
+    """IPC endpoints for a scheduler that receives and returns no messages.
+
+    The in-process scheduler takes requests from ``add_requests`` and returns
+    outputs through ``_OutputCollector``, so its sockets carry nothing; private
+    ``ipc://`` names keep ranks from contending for the TCP ports SGLang derives
+    for data-parallel attention.
+    """
+    import uuid
+
+    from sglang.srt.server_args import PortArgs
+
+    def ipc_name() -> str:
+        return f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+
+    return PortArgs(
+        tokenizer_ipc_name=ipc_name(),
+        scheduler_input_ipc_name=ipc_name(),
+        detokenizer_ipc_name=ipc_name(),
+        # Unused: SGLang reuses the launcher's initialized process group.
+        nccl_port=0,
+        rpc_ipc_name=ipc_name(),
+        metrics_ipc_name=ipc_name(),
+        tokenizer_worker_ipc_name=None,
+        decoupled_spec_ipc_config=None,
+        instance_id=uuid.uuid4().hex[:12],
+    )
 
 
 def _build_sampling_params(sampling: SamplingConfig):

@@ -179,17 +179,26 @@ def save_debug_moe_checkpoint(path: str) -> None:
 
 @torch.no_grad()
 def _copy_live_weights_into_prefetched(engine) -> None:
-    """Fill the engine's prefetched model state dict with the weights it runs now."""
+    """Fill the engine's prefetched model state dict with the weights it runs now.
+
+    The prefetched buffers hold each rank's FSDP shard (generator DP shards dim 0);
+    the live parameters are the unsharded ones the forward reads.
+    """
     from torch.distributed.tensor import DTensor
 
     # Both engines expose the TorchTitan model wrapper they run through _get_model().
     model = engine._get_model().model
     live = dict(model.named_parameters())
     live.update(dict(model.named_buffers()))
+    dp_rank, dp_size = engine.data_parallel_rank, engine.data_parallel_size
     for key, dst in engine.prefetched_model_state_dict.items():
         src = live[key]
         src = src.to_local() if isinstance(src, DTensor) else src
         dst = dst.to_local() if isinstance(dst, DTensor) else dst
+        if dst.shape != src.shape:
+            # FSDP's dim-0 shard: torch.chunk rows of this DP rank.
+            rows_per_rank = -(-src.shape[0] // dp_size)
+            src = src[dp_rank * rows_per_rank :][: dst.shape[0]]
         dst.copy_(src)
 
 
@@ -276,26 +285,54 @@ def generate(args) -> None:
             }
         num_steps += 1
 
+    # As the generator does, each DP rank admits its own share of the requests;
+    # every loop below runs the same iterations on every rank, because each
+    # engine call is a collective across ranks.
+    dp_rank, dp_size = engine.data_parallel_rank, engine.data_parallel_size
+    if args.dp_imbalanced:
+        # DP rank r > 0 takes only request r - 1, so it runs idle (empty) steps
+        # while rank 0 works through the rest.
+        requests = (
+            requests[dp_size - 1 :] if dp_rank == 0 else requests[dp_rank - 1 : dp_rank]
+        )
+    else:
+        requests = requests[dp_rank::dp_size]
+
+    def any_rank(flag: bool) -> bool:
+        if not dist.is_initialized():
+            return flag
+        flag_tensor = torch.tensor([int(flag)], device="cuda")
+        dist.all_reduce(flag_tensor, op=dist.ReduceOp.MAX)
+        return bool(flag_tensor.item())
+
     if args.admission == "all":
         assert not engine.add_requests(requests)
         while engine.has_unfinished_requests():
             step()
     elif args.admission == "sequential":
-        for request in requests:
-            assert not engine.add_requests([request])
+        pending = list(requests)
+        while any_rank(bool(pending)):
+            if pending:
+                assert not engine.add_requests([pending.pop(0)])
             while engine.has_unfinished_requests():
                 step()
     else:  # staggered: admit one request per step
         pending = list(requests)
-        while pending or engine.has_unfinished_requests():
+        while any_rank(bool(pending)) or engine.has_unfinished_requests():
             if pending:
                 assert not engine.add_requests([pending.pop(0)])
             if engine.has_unfinished_requests():
                 step()
 
+    all_results = [None] * (dist.get_world_size() if dist.is_initialized() else 1)
+    if dist.is_initialized():
+        dist.all_gather_object(all_results, results)
+    else:
+        all_results = [results]
     if int(os.environ.get("RANK", "0")) == 0:
+        merged = {k: v for rank_results in all_results for k, v in rank_results.items()}
         with open(args.out, "w") as f:
-            json.dump({"engine": args.engine, "results": results}, f)
+            json.dump({"engine": args.engine, "results": merged}, f)
     engine.shutdown()
     if dist.is_initialized():
         dist.barrier()
@@ -338,6 +375,7 @@ def main() -> None:
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("--dp", type=int, default=1)
     parser.add_argument("--ep", type=int, default=1)
+    parser.add_argument("--dp-imbalanced", action="store_true")
     parser.add_argument("--num-prompts", type=int, default=8)
     parser.add_argument("--group-size", type=int, default=3)
     parser.add_argument("--max-tokens", type=int, default=160)
