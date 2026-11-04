@@ -209,11 +209,12 @@ def _patch_vllm_all_reduce() -> None:
     from vllm.distributed import get_tp_group
 
     c10d = torch.ops._c10d_functional
-    # Op schema: all_reduce(Tensor input, str reduce_op, Any group_name) -> Tensor.
+    # Op schema: all_reduce(Tensor input, str reduce_op, Any group_name,
+    # Dict(str, Any)? config=None) -> Tensor.
     original_all_reduce = c10d.all_reduce
 
-    def all_reduce(input, reduce_op, group_name):
-        if reduce_op == "sum":
+    def all_reduce(input, reduce_op, group_name, config=None):
+        if reduce_op == "sum" and not config:
             # Use vLLM's helper rather than the incoming group_name: the custom-AR
             # kernel is bound to vLLM's TP GroupCoordinator and the shared buffers
             # it registered, so the reduction must run on vLLM's TP group, not
@@ -221,7 +222,7 @@ def _patch_vllm_all_reduce() -> None:
             # rank equivalent). The helper resolves that group, guards
             # world_size==1, and on CUDA dispatches to torch.ops.vllm.all_reduce.
             return tensor_model_parallel_all_reduce(input)
-        return original_all_reduce(input, reduce_op, group_name)
+        return original_all_reduce(input, reduce_op, group_name, config=config)
 
     c10d.all_reduce = all_reduce
 
