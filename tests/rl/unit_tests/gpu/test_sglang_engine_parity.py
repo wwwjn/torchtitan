@@ -88,6 +88,20 @@ def tmp_dir(tmp_path_factory) -> str:
             ],
         ),
         ("weight_reload", 1, ["--weight-update-at-step", "20"]),
+        ("tp2_eager", 2, []),
+        (
+            "tp2_cuda_graph_staggered_chunked_reload",
+            2,
+            [
+                "--cuda-graph",
+                "--admission",
+                "staggered",
+                "--max-num-batched-tokens",
+                "512",
+                "--weight-update-at-step",
+                "40",
+            ],
+        ),
     ],
 )
 def test_sglang_matches_vllm(tmp_dir, name, tp, sglang_args):
