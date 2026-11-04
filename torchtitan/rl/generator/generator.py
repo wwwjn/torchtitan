@@ -32,7 +32,7 @@ from torchtitan.rl.generator.engine import GenerationEngine
 from torchtitan.rl.generator.engine_loop import EngineLoop, EngineLoopThread
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
 from torchtitan.rl.generator.types import EngineRequest, SamplingConfig
-from torchtitan.rl.rollout.types import Completion
+from torchtitan.rl.rollout.types import Completion, PromptImage
 from torchtitan.rl.routing.intra_generator import IntraGeneratorRouter
 
 logger = logging.getLogger(__name__)
@@ -347,6 +347,7 @@ class Generator(Configurable):
         routing_session_id: str,
         sampling_config: SamplingConfig | None = None,
         metrics_prefix: str = "generator",
+        images: tuple[PromptImage, ...] = (),
     ) -> Completion:
         """Generates one completion for one prompt.
 
@@ -370,6 +371,8 @@ class Generator(Configurable):
             metrics_prefix: Namespace prepended to every metric key on the returned
                 `Completion` (default ``"generator"``). Callers that need to keep streams
                 separate, e.g. ``"validation/generator"``, can override it.
+            images: Images whose placeholder tokens appear in `prompt_token_ids`, with their
+                files' bytes; the engine decodes the files.
 
         Example:
 
@@ -394,6 +397,7 @@ class Generator(Configurable):
                 group_id=group_id,
                 routing_session_id=routing_session_id,
                 arrival_time=time.time(),
+                images=images,
             ),
             metrics_prefix=metrics_prefix,
         )

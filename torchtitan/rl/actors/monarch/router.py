@@ -41,6 +41,7 @@ class _InterGeneratorRouterActorEndpoints:
         routing_session_id: str | None,
         sampling_config: Any | None,
         metrics_prefix: str,
+        images: tuple[Any, ...],
     ) -> Any:
         return await super().generate(
             prompt_token_ids,
@@ -49,6 +50,7 @@ class _InterGeneratorRouterActorEndpoints:
             routing_session_id=routing_session_id,
             sampling_config=sampling_config,
             metrics_prefix=metrics_prefix,
+            images=images,
         )
 
     @concurrent_endpoint

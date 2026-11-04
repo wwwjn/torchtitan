@@ -342,6 +342,11 @@ class VLLMEngine(GenerationEngine):
         vLLM rejected."""
         rejected_requests: list[tuple[str, Exception]] = []
         for request in requests:
+            if request.images:
+                raise NotImplementedError(
+                    f"{request.request_id}: image prompts are not supported by the vLLM "
+                    "engine yet."
+                )
             prompt = {"prompt_token_ids": request.prompt_token_ids}
             if not self._reset_kv_cache_on_model_state_dict_load:
                 # Salt by the pinned version so a request only reuses KV

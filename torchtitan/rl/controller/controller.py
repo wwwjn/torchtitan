@@ -122,7 +122,12 @@ from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout import RolloutGroup
 from torchtitan.rl.rollout.recorder import RolloutSampleRecorder
 from torchtitan.rl.rollout.rollouter import Rollouter
-from torchtitan.rl.rollout.types import Completion, GenerateFn, ReleaseSessionFn
+from torchtitan.rl.rollout.types import (
+    Completion,
+    GenerateFn,
+    PromptImage,
+    ReleaseSessionFn,
+)
 from torchtitan.rl.routing.inter_generator import InterGeneratorRouter
 from torchtitan.rl.trainer.batcher import Batcher, TrainerStepBatch
 from torchtitan.rl.trainer.trainer import Trainer
@@ -534,6 +539,7 @@ class Controller(Configurable):
             group_id: int,
             routing_session_id: str | None = None,
             sampling_config: SamplingConfig | None = None,
+            images: tuple[PromptImage, ...] = (),
         ) -> Completion | None:
             return await generator_router.generate.call_one(
                 prompt_token_ids,
@@ -542,6 +548,7 @@ class Controller(Configurable):
                 routing_session_id=routing_session_id,
                 sampling_config=sampling_config,
                 metrics_prefix=metrics_prefix,
+                images=images,
             )
 
         return generate
