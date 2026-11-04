@@ -77,6 +77,7 @@ _OWNED_SERVER_ARGS = frozenset(
         "enable_priority_scheduling",
         "schedule_low_priority_values_first",
         "load_format",
+        "enable_session_radix_cache",
     }
 )
 
@@ -158,6 +159,19 @@ class SGLangEngine(GenerationEngine):
         page_size: int | None = None
         """KV page size in tokens. None: 256 with FA2 (SM < 9.0), which requires a
         multiple of 256, else 16 (vLLM's default block size)."""
+
+        hold_session_kv: bool = False
+        """Keep each multi-turn session's history cached between its turns.
+
+        Requests carry their ``routing_session_id`` as SGLang's radix session id
+        (``enable_session_radix_cache``): when a turn finishes, the prompt and output
+        KV it caches is tagged with its session, and eviction takes untagged KV first.
+        ``release_sessions`` drops the tags when a rollout or its group ends.
+
+        Unlike ``VLLMSessionKVHolder``, which pins blocks, the tag only orders eviction,
+        so tagged KV is still evicted once no untagged KV is left. Works with either
+        ``reset_kv_cache_on_model_state_dict_load``: a reset drops the tags with the
+        cache. Not for GDN models, which run without a radix cache."""
 
         extra_server_args: dict[str, Any] = field(default_factory=dict)
         """Additional keyword arguments for SGLang's ``ServerArgs``, for options
@@ -292,6 +306,21 @@ class SGLangEngine(GenerationEngine):
             if not server_args_kwargs.get("disable_radix_cache", True):
                 raise ValueError("GDN models require disable_radix_cache=True")
             server_args_kwargs["disable_radix_cache"] = True
+        if config.hold_session_kv:
+            if server_args_kwargs.get("disable_radix_cache", False):
+                raise ValueError(
+                    "hold_session_kv needs SGLang's radix cache, which this model "
+                    "runs without"
+                )
+            server_args_kwargs["enable_session_radix_cache"] = True
+            # SGLang logs every session release at INFO.
+            logging.getLogger(
+                "sglang.srt.mem_cache.unified_cache.session_ref_tracker"
+            ).setLevel(logging.WARNING)
+        # Sessions admitted on this rank, by group, so a group's release closes its
+        # sessions (hold_session_kv).
+        self._session_groups: dict[str, int] = {}
+        self._group_sessions: dict[int, set[str]] = {}
         self._scheduler = self._build_scheduler(server_args_kwargs, rank=rank)
         self._install_hooks()
 
@@ -383,6 +412,10 @@ class SGLangEngine(GenerationEngine):
     def prefetched_model_state_dict(self) -> dict[str, torch.Tensor]:
         return self._get_model().prefetched_model_state_dict
 
+    @property
+    def holds_session_kv(self) -> bool:
+        return self.config.hold_session_kv
+
     def add_requests(
         self, requests: list[EngineRequest]
     ) -> list[tuple[str, Exception]]:
@@ -419,8 +452,18 @@ class SGLangEngine(GenerationEngine):
                         if self._reset_kv_cache_on_model_state_dict_load
                         else str(request.min_policy_version)
                     ),
+                    session_id=(
+                        request.routing_session_id
+                        if self.config.hold_session_kv
+                        else None
+                    ),
                 )
             )
+            if self.config.hold_session_kv:
+                self._session_groups[request.routing_session_id] = request.group_id
+                self._group_sessions.setdefault(request.group_id, set()).add(
+                    request.routing_session_id
+                )
         if tokenized_requests:
             self._scheduler.process_input_requests(tokenized_requests)
             # The generator returns output-token logprobs only. A request that returns
@@ -500,6 +543,36 @@ class SGLangEngine(GenerationEngine):
         self._sampler.release(request.request_id for request in finished)
         return finished
 
+    def release_sessions(self, session_ids: list[str], group_ids: list[int]) -> None:
+        """Drop the session tags of ``session_ids`` and of every session of
+        ``group_ids``; their KV stays cached, evicted like any untagged KV."""
+        if not self.config.hold_session_kv:
+            return
+        from sglang.srt.managers.io_struct import CloseSessionReqInput
+
+        # Every rank gets every release; close only sessions this rank admitted.
+        released = {s for s in session_ids if s in self._session_groups}
+        for group_id in group_ids:
+            released |= self._group_sessions.pop(group_id, set())
+        # Sorted, not set order: string hashes differ per process, and every TP rank
+        # must change its radix cache the same way.
+        for session_id in sorted(released):
+            group_sessions = self._group_sessions.get(
+                self._session_groups.pop(session_id)
+            )
+            if group_sessions is not None:
+                group_sessions.discard(session_id)
+            # A request of the session still running tags nothing when it finishes.
+            self._scheduler.close_session(CloseSessionReqInput(session_id=session_id))
+
+    def log_stats(self, step: int) -> None:
+        if self.config.hold_session_kv:
+            logger.info(
+                "Session KV at step %d: %d sessions open",
+                step,
+                len(self._session_groups),
+            )
+
     def load_prefetched_model_state_dict(self) -> None:
         """Copy the prefetched model state dict into the model, and reset the KV cache when
         configured."""
@@ -518,6 +591,17 @@ class SGLangEngine(GenerationEngine):
         if self._reset_kv_cache_on_model_state_dict_load:
             if not scheduler.flush_cache():
                 raise RuntimeError("SGLang did not flush its KV cache after retracting")
+            if self.config.hold_session_kv:
+                # The flush also reset the session tags and their generations; give
+                # the waiting requests (retracted or not yet started) current ones,
+                # or their turns would tag nothing when they finish.
+                for req in scheduler.waiting_queue:
+                    if req.session_id is not None:
+                        req.session_generation = (
+                            scheduler.tree_cache.ensure_session_generation(
+                                req.session_id
+                            )
+                        )
             scheduler.continue_generation(
                 ContinueGenerationReqInput(torch_empty_cache=False)
             )

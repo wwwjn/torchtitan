@@ -10,6 +10,8 @@ Each case launches ``engine_parity`` under torchrun once per engine and compares
 tokens and logprobs of every request bitwise. The vLLM reference runs once per
 parallel layout; the SGLang runs vary admission order, chunked prefill, CUDA graphs,
 KV memory pressure (SGLang retracts requests) and a weight reload mid-generation.
+The multi-turn cases check that holding session KV keeps later turns' histories cached
+while other sessions churn the KV pool, without changing any output.
 
 Requires SGLang, two or more GPUs, and the Qwen3-0.6B HF checkpoint
 (``ENGINE_PARITY_MODEL_PATH``, default: the recipe's ``./assets/hf/Qwen3-0.6B``).
@@ -18,6 +20,7 @@ default: ``./assets/hf/Qwen3.5-0.8B``).
 """
 
 import functools
+import json
 import os
 import subprocess
 import sys
@@ -123,6 +126,101 @@ def test_sglang_matches_vllm(tmp_dir, name, tp, sglang_args):
         ["--engine", "sglang", "--tp", str(tp), *sglang_args],
     )
     assert compare(reference, sglang) == []
+
+
+# Three-turn sessions on a 64-page KV pool. Between turns, 60 single-turn sessions churn
+# the pool, enough to evict every waiting session's history unless it is held.
+_SESSION_ARGS = [
+    "--turns",
+    "3",
+    "--filler-prompts",
+    "60",
+    "--max-num-seqs",
+    "8",
+    "--stop-token-ids",
+    "151645",
+    "--cuda-graph",
+]
+
+
+@functools.cache
+def _multi_turn_reference(tmp_dir: str, tp: int) -> str:
+    # vLLM's default KV pool keeps every history: the hits holding can reach.
+    return _run(
+        tmp_dir,
+        f"vllm_multi_turn_tp{tp}",
+        tp,
+        ["--engine", "vllm", "--tp", str(tp), *_SESSION_ARGS],
+    )
+
+
+def _cached_tokens(path: str, turn: int) -> int:
+    with open(path) as f:
+        results = json.load(f)["results"]
+    return sum(
+        result["num_cached_tokens"]
+        for request_id, result in results.items()
+        if request_id.endswith(f"/turn={turn}")
+    )
+
+
+@pytest.mark.skipif(
+    not os.path.isdir(_MODEL_PATH) or torch.cuda.device_count() < 2,
+    reason="needs the Qwen3-0.6B checkpoint and 2 GPUs",
+)
+@pytest.mark.parametrize(
+    "name, tp, sglang_args, held_turns",
+    [
+        ("no_hold", 1, [], ()),
+        ("hold", 1, ["--hold-session-kv"], (2, 3)),
+        # Without a KV reset, a reload keeps the KV and its session tags.
+        (
+            "hold_reload",
+            1,
+            ["--hold-session-kv", "--no-kv-reset", "--weight-update-during-turn", "2"],
+            (2, 3),
+        ),
+        # The reset flushes turn 1's histories; turn 2's requests, retracted or
+        # waiting at the reload, still tag theirs for turn 3.
+        (
+            "hold_reload_kv_reset",
+            1,
+            ["--hold-session-kv", "--weight-update-during-turn", "2"],
+            (3,),
+        ),
+        ("tp2_hold", 2, ["--hold-session-kv"], (2, 3)),
+    ],
+)
+def test_sglang_session_kv(tmp_dir, name, tp, sglang_args, held_turns):
+    """Holding session KV keeps the histories of later turns cached through the churn,
+    and changes no output."""
+    from tests.rl.unit_tests.gpu.engine_parity import compare
+
+    reference = _multi_turn_reference(tmp_dir, tp)
+    sglang = _run(
+        tmp_dir,
+        f"sglang_session_{name}",
+        tp,
+        [
+            "--engine",
+            "sglang",
+            "--tp",
+            str(tp),
+            *_SESSION_ARGS,
+            "--sglang-extra-server-args",
+            '{"max_total_tokens": 16384}',
+            *sglang_args,
+        ],
+    )
+    assert compare(reference, sglang) == []
+    for turn in (2, 3):
+        cached, reachable = _cached_tokens(sglang, turn), _cached_tokens(
+            reference, turn
+        )
+        if turn in held_turns:
+            assert cached >= 0.8 * reachable, (turn, cached, reachable)
+        else:
+            assert cached <= 0.1 * reachable, (turn, cached, reachable)
 
 
 @functools.cache
