@@ -7,6 +7,7 @@
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import timedelta
 from functools import partial
 from typing import Any, cast, NamedTuple, TYPE_CHECKING, TypeAlias
 
@@ -17,26 +18,26 @@ from torch.distributed.fsdp import FSDPModule
 
 from torchtitan.components.checkpointer import BaseCheckpointManager, CheckpointManager
 from torchtitan.components.data.types import TrainingMicrobatch
-from torchtitan.components.loss import BaseLoss, ChunkedLossWrapper
+from torchtitan.components.loss import ChunkedLossWrapper, Loss
 from torchtitan.components.optim import Optim
 from torchtitan.config import Configurable, TORCH_DTYPE_MAP
 from torchtitan.config.configs import CommConfig, DebugConfig, TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed import ParallelismContext, utils as dist_utils
+from torchtitan.distributed.accelerator_graph import (
+    accelerator_graph_teardown,
+    accelerator_graphs_supported,
+    NUM_ACCELERATOR_GRAPH_WARMUP_STEPS,
+    wrap_fwd_bwd_with_accelerator_graph,
+    wrap_with_accelerator_graph,
+)
 from torchtitan.distributed.activation_remat import (
     ActivationRematConfig,
     DefaultActivationRematConfig,
 )
 from torchtitan.distributed.batch_invariant import set_batch_invariance
-from torchtitan.distributed.cuda_graph import (
-    cuda_graph_teardown,
-    cuda_graphs_supported,
-    NUM_CUDA_GRAPH_WARMUP_STEPS,
-    wrap_fwd_bwd_with_cuda_graph,
-    wrap_with_cuda_graph,
-)
 from torchtitan.distributed.pipeline_parallel import (
-    prepare_pipeline_schedule_for_cuda_graph,
+    prepare_pipeline_schedule_for_accelerator_graph,
 )
 from torchtitan.models.base import BaseModel
 from torchtitan.observability import structured_logger as sl
@@ -92,7 +93,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             +-- _preprocess_microbatch_groups (unless lazy)
             |
             +-- _run_forward_backward =
-                _forward_backward_body (maybe_wrapped_with_cuda_graph)
+                _forward_backward_body (maybe_wrapped_with_accelerator_graph)
                 |
                 +-- _preprocess_microbatch_group (if lazy)
                 |
@@ -106,7 +107,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             |
             +-- Optim.step
                 |
-                +-- _update (maybe_wrapped_with_cuda_graph)
+                +-- _update (maybe_wrapped_with_accelerator_graph)
                 +-- lr_schedulers.step
                 +-- ema.step
     """
@@ -127,7 +128,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         sdc_replayer: SDCReplayer.Config | None = None
         comm: CommConfig = field(default_factory=CommConfig)
         debug: DebugConfig = field(default_factory=DebugConfig)
-        loss: BaseLoss.Config = field(default_factory=BaseLoss.Config)
+        loss: Loss.Config = field(default_factory=Loss.Config)
         dist_moe_runtime: Configurable.Config | None = None
         """Optional rank-wide Dist-MoE memory and pipeline-slot policy."""
 
@@ -162,28 +163,33 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                 raise ValueError(
                     "parallelism.num_pp_microbatches must be greater than 0."
                 )
-            if self.optim.enable_cuda_graph and self.training.disable_cuda_graphs:
+            if (
+                self.optim.enable_accelerator_graph
+                and self.training.disable_accelerator_graphs
+            ):
                 raise ValueError(
-                    "The optimization CUDA graph requires CUDA graphs to be enabled."
+                    "The optimization accelerator graph requires accelerator graphs to be enabled."
                 )
-            if self.training.cuda_graph_per_microbatch_group:
-                if self.training.disable_cuda_graphs:
+            if self.training.accelerator_graph_per_microbatch_group:
+                if self.training.disable_accelerator_graphs:
                     raise ValueError(
-                        "Per-group CUDA graphs require CUDA graphs to be enabled."
+                        "Per-group accelerator graphs require accelerator graphs to be enabled."
                     )
                 if self.sdc_replayer is not None:
-                    raise ValueError("Per-group CUDA graphs do not support SDC replay.")
+                    raise ValueError(
+                        "Per-group accelerator graphs do not support SDC replay."
+                    )
                 if self.parallelism.fsdp_defer_gradient_reduction:
                     raise ValueError(
-                        "Per-group CUDA graphs require "
+                        "Per-group accelerator graphs require "
                         "parallelism.fsdp_defer_gradient_reduction=False."
                     )
             if self.training.preprocess_microbatch_groups_lazily:
-                if not self.training.disable_cuda_graphs:
-                    # TODO: with several smaller CUDA graphs, preprocess each group between replays.
+                if not self.training.disable_accelerator_graphs:
+                    # TODO: with several smaller accelerator graphs, preprocess each group between replays.
                     raise ValueError(
                         "training.preprocess_microbatch_groups_lazily requires "
-                        "training.disable_cuda_graphs=True."
+                        "training.disable_accelerator_graphs=True."
                     )
                 if self.sdc_replayer is not None:
                     raise ValueError(
@@ -214,14 +220,14 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                         "SDC replay requires debug.deterministic_warn_only=False."
                     )
                 if (
-                    not self.training.disable_cuda_graphs
-                    and cuda_graphs_supported()
+                    not self.training.disable_accelerator_graphs
+                    and accelerator_graphs_supported()
                     and self.sdc_replayer.num_replays > 1
                 ):
                     raise ValueError(
-                        "SDC replay supports at most one replay when CUDA graphs "
+                        "SDC replay supports at most one replay when accelerator graphs "
                         "are enabled: set sdc_replayer.num_replays=1 or "
-                        "training.disable_cuda_graphs=True."
+                        "training.disable_accelerator_graphs=True."
                     )
 
     config: Config
@@ -230,7 +236,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
     model_parts: list[BaseModel]
     model_config: BaseModel.Config
     output_dir: str
-    loss_fn: BaseLoss
+    loss_fn: Loss[Any]
     optim: Optim
     checkpointer: BaseCheckpointManager
     pp_has_last_stage: bool
@@ -247,8 +253,8 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
     device_memory_monitor: DeviceMemoryMonitor
     model_device_mem_stats: DeviceMemStats
     _run_forward_backward: _ForwardBackwardFn
-    _forward_backward_cuda_graph_enabled: bool
-    _cuda_graph_per_microbatch_group_enabled: bool
+    _forward_backward_accelerator_graph_enabled: bool
+    _accelerator_graph_per_microbatch_group_enabled: bool
     _global_routing_token_counts: torch.Tensor
     _dist_moe_runtime: "DistMoeRuntime | None"
 
@@ -271,8 +277,8 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         self.num_completed_steps = 0
         self.ntokens_seen = 0
         self.sdc_replayer = None
-        self._forward_backward_cuda_graph_enabled = False
-        self._cuda_graph_per_microbatch_group_enabled = False
+        self._forward_backward_accelerator_graph_enabled = False
+        self._accelerator_graph_per_microbatch_group_enabled = False
         self._dist_moe_runtime = None
         self.preprocess_inputs_kwargs: dict[str, Any] = {}
         self.loss_metrics = {}
@@ -303,6 +309,11 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             )
         self.parallelism_context = ParallelismContext.from_config(
             config.parallelism, topology, dump_folder=self.output_dir
+        )
+        # DeviceMesh subgroups do not inherit the world group's timeout.
+        dist_utils.set_pg_timeouts(
+            timeout=timedelta(seconds=config.comm.init_timeout_seconds),
+            parallelism_context=self.parallelism_context,
         )
         self.garbage_collector = config.garbage_collector.build()
         dist_utils.set_determinism(
@@ -439,13 +450,13 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
     def _parallelize_compile_kwargs(self) -> dict[str, Any]:
         """Return the compile kwargs ``model.parallelize``/``model.pipeline`` expect for this engine's models.
 
-        Regular models expect ``local_compile_regions`` (compiled regions); GraphTrainer overrides this to
+        Regular models expect ``local_compile`` (compiled regions); GraphTrainer overrides this to
         return ``compile_config`` (whole-step compile).
         """
         # TODO: apply local compile outside parallelize/pipeline (#5026 review). That needs
         # GraphTrainer to stop reading its compile config there first (apply_compile,
         # EP-overlap chunking, enable_autoparallel, GraphPP runtime); then delete this hook.
-        return {"local_compile_regions": self.model_config.local_compile_regions}
+        return {"local_compile": self.model_config.local_compile}
 
     def _initialize_optim(self) -> None:
         """Construct the parameter update and its state."""
@@ -517,10 +528,11 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             ),
         )
         self._run_forward_backward = eager_forward_backward_fn
-        self._forward_backward_cuda_graph_enabled = (
-            not self.config.training.disable_cuda_graphs and cuda_graphs_supported()
+        self._forward_backward_accelerator_graph_enabled = (
+            not self.config.training.disable_accelerator_graphs
+            and accelerator_graphs_supported()
         )
-        if not self._forward_backward_cuda_graph_enabled:
+        if not self._forward_backward_accelerator_graph_enabled:
             self._run_forward_backward = partial(
                 eager_forward_backward_fn,
                 preprocess_microbatch_groups_lazily=(
@@ -541,7 +553,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             ):
                 # Initialization calls the loss on the first microbatch, so it
                 # needs that microbatch's loss arguments, as in the real step.
-                prepare_pipeline_schedule_for_cuda_graph(
+                prepare_pipeline_schedule_for_accelerator_graph(
                     self.pp_schedule,
                     args=arg_mbs[0] if arg_mbs is not None else (),
                     kwargs=kwarg_mbs[0],
@@ -552,10 +564,10 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                     },
                 )
 
-        if self.config.training.cuda_graph_per_microbatch_group:
-            graph_group_runner = wrap_with_cuda_graph(
+        if self.config.training.accelerator_graph_per_microbatch_group:
+            graph_group_runner = wrap_with_accelerator_graph(
                 eager_forward_backward_fn,
-                num_warmup_iterations=NUM_CUDA_GRAPH_WARMUP_STEPS,
+                num_warmup_iterations=NUM_ACCELERATOR_GRAPH_WARMUP_STEPS,
                 prepare_for_capture=prepare_for_capture
                 if self.parallelism_context.pp_enabled
                 else None,
@@ -563,7 +575,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                 annotation_config=self.config.profiler.maybe_cuda_graph_annotation_config(),
             )
 
-            # TODO: Use multiple CUDA graphs to support variable group counts
+            # TODO: Use multiple accelerator graphs to support variable group counts
             # without duplicating the gradient accumulation logic.
             def run_forward_backward_groups(
                 microbatch_groups: list[tuple[Any, ...]],
@@ -591,18 +603,18 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                 assert accumulated_loss is not None
                 return ForwardBackwardResult(accumulated_loss, loss_metrics)
 
-            self._cuda_graph_per_microbatch_group_enabled = True
+            self._accelerator_graph_per_microbatch_group_enabled = True
             self._run_forward_backward = run_forward_backward_groups
             return
 
-        self._run_forward_backward = wrap_fwd_bwd_with_cuda_graph(
+        self._run_forward_backward = wrap_fwd_bwd_with_accelerator_graph(
             eager_forward_backward_fn,
             parameters=(
                 parameter
                 for model_part in self.model_parts
                 for parameter in model_part.parameters()
             ),
-            num_warmup_iterations=NUM_CUDA_GRAPH_WARMUP_STEPS,
+            num_warmup_iterations=NUM_ACCELERATOR_GRAPH_WARMUP_STEPS,
             prepare_for_capture=prepare_for_capture
             if self.parallelism_context.pp_enabled
             else None,
@@ -624,7 +636,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         self.num_accumulation_steps = len(microbatch_groups)
         self.garbage_collector.run(self.num_completed_steps + 1)
         self.optim.zero_grad(
-            set_to_none=not self._cuda_graph_per_microbatch_group_enabled
+            set_to_none=not self._accelerator_graph_per_microbatch_group_enabled
         )
         global_loss_token_counts = torch.as_tensor(
             global_loss_token_counts, device=self.device
@@ -818,7 +830,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             pred = self.model_parts[0](inputs, **model_kwargs)
             loss, self.loss_metrics = self.loss_fn(
                 pred,
-                labels,  # pyrefly: ignore[bad-argument-type]
+                labels,
                 **loss_kwargs,
             )
             del pred
@@ -922,11 +934,11 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             del self.profiler
 
     def close(self) -> None:
-        """Finish pending work and release CUDA graph resources."""
+        """Finish pending work and release accelerator graph resources."""
         self.close_profiler()
         if self._dist_moe_runtime is not None:
             self._dist_moe_runtime.close()
             self._dist_moe_runtime = None
         if hasattr(self, "checkpointer"):
             self.checkpointer.close()
-        cuda_graph_teardown()
+        accelerator_graph_teardown()

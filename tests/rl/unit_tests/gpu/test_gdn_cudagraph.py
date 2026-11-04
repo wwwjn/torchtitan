@@ -23,13 +23,14 @@ from torchtitan.distributed.batch_invariant import (
     set_batch_invariance,
 )
 from torchtitan.models.qwen3_5 import build_model_config
-from torchtitan.rl.generator.vllm import gdn, registry
-from torchtitan.rl.generator.vllm.batch_invariance import (
-    force_logprobs_fn_for_batch_invariance,
-)
-from torchtitan.rl.generator.vllm.linear_attention import (
+from torchtitan.rl.generator.vllm import registry
+from torchtitan.rl.generator.vllm.attention import gdn
+from torchtitan.rl.generator.vllm.attention.linear_attention import (
     LinearAttentionExecutionPath,
     TorchTitanLinearAttentionMetadata,
+)
+from torchtitan.rl.generator.vllm.batch_invariance import (
+    force_logprobs_fn_for_batch_invariance,
 )
 from vllm import EngineArgs, LLMEngine, SamplingParams
 from vllm.forward_context import (
@@ -127,6 +128,8 @@ def test_gdn_full_runner_matches_eager(tmp_path: Path, batch_invariant: bool) ->
     assert eager["states"] == full["states"]
     assert all(step["mode"] == "NONE" for step in eager["dispatch"])
     replayed = [step for step in full["dispatch"] if step["mode"] == "FULL"]
+    # The builder follows the graph the runner picked.
+    assert all((step["path"] == "PACKED") == (not step["uniform"]) for step in replayed)
     kinds = {step["kind"] for step in replayed}
     if kinds != {"prefill", "mixed", "decode"}:
         dispatch_summary = [
@@ -171,6 +174,7 @@ def test_single_token_reused_state_capture(monkeypatch, batch_invariant: bool) -
         non_spec_query_start_loc=torch.arange(5, device=device, dtype=torch.int32),
         non_spec_state_indices_tensor=state_indices,
         has_initial_state=has_initial_state,
+        state_block_column=torch.zeros(4, 1, device=device, dtype=torch.long),
     )
     context = ForwardContext(
         no_compile_layers={}, attn_metadata={"gdn": metadata}, slot_mapping={}
@@ -197,10 +201,9 @@ def test_single_token_reused_state_capture(monkeypatch, batch_invariant: bool) -
     weight = torch.randn(6144, 4, device=device, dtype=torch.bfloat16)
     a, b = torch.randn(2, 4, 16, device=device)
     A_log, bias = torch.randn(2, 16, device=device)
-    output = torch.zeros(4, 16, 128, device=device, dtype=torch.bfloat16)
 
     def forward():
-        layer._forward(inputs, a, b, weight, None, A_log, bias, output)
+        return layer._forward(inputs, a, b, weight, None, A_log, bias)
 
     def without_mask(kernel):
         def resumed(*args, has_initial_state=None, **kwargs):
@@ -216,7 +219,7 @@ def test_single_token_reused_state_capture(monkeypatch, batch_invariant: bool) -
         stream.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            forward()
+            output = forward()
         # The first replay occupies both slots. Later requests reuse dirty slots,
         # alone and beside a continuing request, without changing the graph key.
         for slots, initial in (
@@ -247,14 +250,15 @@ def test_single_token_reused_state_capture(monkeypatch, batch_invariant: bool) -
                     "recurrent_gdn",
                 ):
                     unmasked.setattr(gdn, name, without_mask(getattr(gdn, name)))
-                forward()
-            expected = output.clone()
+                expected = forward()
             layer.kv_cache = cache_views(pools)
             has_initial_state.copy_(
                 torch.tensor(initial + [False] * (4 - len(slots)), device=device)
             )
             # Both repeated null slots and a negative sentinel must skip writes.
             state_indices[3] = -1
+            # NaN catches a null row the decode kernel leaves unwritten.
+            output.fill_(float("nan"))
             graph.replay()
             torch.testing.assert_close(output, expected, rtol=0, atol=0)
             assert not output[len(slots) :].count_nonzero()
@@ -301,7 +305,7 @@ def run_engine(mode: str, output: Path, batch_invariant: bool) -> None:
     model_config = build_model_config(
         "0.8B", seq_len=256, attn_backend="varlen", parallelism=ParallelismConfig()
     )
-    model_config.local_compile_regions = []
+    model_config.local_compile.regions = []
     registry.register_to_vllm(
         model_config,
         parallelism=registry.InferenceParallelismConfig(tensor_parallel_degree=1),

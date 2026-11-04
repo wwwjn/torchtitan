@@ -15,10 +15,10 @@ import torch
 from torchtitan.components.data.types import TrainingMicrobatch
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed import maybe_apply_numa_binding
-from torchtitan.distributed.cuda_graph import (
-    cuda_graphs_supported,
-    NUM_CUDA_GRAPH_WARMUP_STEPS,
-    wrap_fwd_bwd_with_cuda_graph,
+from torchtitan.distributed.accelerator_graph import (
+    accelerator_graphs_supported,
+    NUM_ACCELERATOR_GRAPH_WARMUP_STEPS,
+    wrap_fwd_bwd_with_accelerator_graph,
 )
 from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
 from torchtitan.experiments.graph_trainer.graph_pp.pipeline import (
@@ -63,13 +63,13 @@ class GraphTrainingEngine(TrainingEngine):
         max_num_documents: int | None,
         output_dir: str,
     ) -> None:
-        if config.optim.enable_cuda_graph:
+        if config.optim.enable_accelerator_graph:
             raise ValueError("Optim CUDA graphs are not supported with GraphTrainer.")
-        if model_config.local_compile_regions:
+        if model_config.local_compile.regions:
             raise ValueError(
                 "GraphTrainer traces the whole step into one graph; set "
-                "model.local_compile_regions = [] "
-                f"(got {model_config.local_compile_regions})."
+                "model.local_compile.regions = [] "
+                f"(got {model_config.local_compile.regions})."
             )
         if config.parallelism.fsdp_symm_mem_scope is not None:
             raise ValueError(
@@ -88,7 +88,7 @@ class GraphTrainingEngine(TrainingEngine):
     def _parallelize_compile_kwargs(self) -> dict[str, Any]:
         """Return the compile kwargs ``model.parallelize``/``model.pipeline`` expect for this engine's models.
 
-        Regular models expect ``local_compile_regions`` (compiled regions); GraphTrainer overrides this to
+        Regular models expect ``local_compile`` (compiled regions); GraphTrainer overrides this to
         return ``compile_config`` (whole-step compile).
         """
         # TODO: apply local compile outside parallelize/pipeline (#5026 review). That needs
@@ -193,15 +193,18 @@ class GraphTrainingEngine(TrainingEngine):
                 defer_fsdp_gradient_reduction=False,
             )
 
-        if not self.config.training.disable_cuda_graphs and cuda_graphs_supported():
-            self._run_forward_backward = wrap_fwd_bwd_with_cuda_graph(
+        if (
+            not self.config.training.disable_accelerator_graphs
+            and accelerator_graphs_supported()
+        ):
+            self._run_forward_backward = wrap_fwd_bwd_with_accelerator_graph(
                 self._run_forward_backward,
                 parameters=(
                     parameter
                     for model_part in self.model_parts
                     for parameter in model_part.parameters()
                 ),
-                num_warmup_iterations=NUM_CUDA_GRAPH_WARMUP_STEPS,
+                num_warmup_iterations=NUM_ACCELERATOR_GRAPH_WARMUP_STEPS,
                 annotation_config=self.config.profiler.maybe_cuda_graph_annotation_config(),
             )
 
@@ -232,8 +235,7 @@ class GraphTrainingEngine(TrainingEngine):
             for microbatch in microbatch_group
         ):
             raise ValueError(
-                "Per-microbatch loss arguments are not supported with "
-                "GraphRuntime yet."
+                "Per-microbatch loss arguments are not supported with GraphRuntime yet."
             )
         if self.parallelism_context.pp_enabled:
             pp_microbatch_groups = super()._preprocess_microbatch_groups(
@@ -409,11 +411,14 @@ class GraphTrainer(Trainer):
         compile: GraphTrainerCompileConfig = field(
             default_factory=GraphTrainerCompileConfig
         )
-        """Whole-step compile. GraphTrainer requires ``model.local_compile_regions`` to be empty."""
+        """Whole-step compile.
+
+        GraphTrainer requires ``model.local_compile.regions`` to be empty.
+        """
 
         def __post_init__(self) -> None:
             Trainer.Config.__post_init__(self)
-            if self.training.cuda_graph_per_microbatch_group:
+            if self.training.accelerator_graph_per_microbatch_group:
                 raise ValueError(
                     "Per-group CUDA graphs are not supported with GraphTrainer."
                 )
@@ -442,7 +447,10 @@ class GraphTrainer(Trainer):
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
-        if config.validator is not None and not config.training.disable_cuda_graphs:
+        if (
+            config.validator is not None
+            and not config.training.disable_accelerator_graphs
+        ):
             logger.warning("GraphTrainer validation runs without CUDA graphs.")
         if (
             not self.engine.parallelism_context.pp_enabled

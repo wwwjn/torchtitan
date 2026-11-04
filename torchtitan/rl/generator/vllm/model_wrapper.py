@@ -32,7 +32,7 @@ from vllm.logger import init_logger
 from vllm.utils import torch_utils as _torch_utils
 
 # Registers the "loss" local-compile region. The generator shares the trainer's
-# model config, whose local_compile_regions may name it, but never builds a loss.
+# model config, whose local_compile.regions may name it, but never builds a loss.
 from torchtitan.components import loss as _loss  # noqa: F401
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.config import TrainingConfig
@@ -41,13 +41,19 @@ from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
 from torchtitan.distributed.parallelism_context import ParallelismContext
 from torchtitan.distributed.spmd_types import current_spmd_mesh
 from torchtitan.models.base.module import Module
-from torchtitan.models.common.attention import Attention, LinearAttention, MLAAttention
+from torchtitan.models.common.attention import (
+    Attention,
+    FlexInnerAttention,
+    LinearAttention,
+    MLAAttention,
+)
 from torchtitan.models.common.attention.gdn import GDN
 from torchtitan.models.common.attention.kda import KDA
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.dist_moe import DistMoeRoutedExperts, DistMoeRuntime
 from torchtitan.quantization._fsdp_tensor import _ShardedFSDPTensor
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
+from torchtitan.rl.generator.vllm.registry import uses_compressed_mla_cache
 
 
 logger = init_logger(__name__)
@@ -59,9 +65,13 @@ def _replace_vllm_layer_configs(model_config):
     # Defer imports until vLLM constructs the model, after the generator has set
     # that environment. Import the GDN adapter only for hybrid models so other
     # models do not acquire its vLLM-specific dependencies.
-    from torchtitan.rl.generator.vllm.attention import (
+    from torchtitan.rl.generator.vllm.attention.attention import (
         get_attention_dimensions,
         VLLMInnerAttention,
+    )
+    from torchtitan.rl.generator.vllm.attention.mla import (
+        VLLMMLAAttention,
+        VLLMMLAInnerAttention,
     )
 
     new_layers = []
@@ -72,27 +82,56 @@ def _replace_vllm_layer_configs(model_config):
         if isinstance(attention_cfg, Attention.Config) and not isinstance(
             attention_cfg, LinearAttention.Config
         ):
-            if isinstance(attention_cfg.inner_attention, MLAAttention.Config):
-                raise ValueError(
-                    f"layers[{layer_idx}]: MLA attention is not supported by the "
-                    "TorchTitan vLLM wrapper yet."
-                )
             (
                 num_heads,
                 num_kv_heads,
                 head_dim,
                 value_head_dim,
             ) = get_attention_dimensions(attention_cfg, model_config.dim)
-            vllm_attention_cfg = VLLMInnerAttention.Config(
-                hidden_size=model_config.dim,
-                num_heads=num_heads,
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim,
-                value_head_dim=value_head_dim,
-                scale=attention_cfg.softmax_scale,
-                sliding_window_size=getattr(attention_cfg, "sliding_window_size", None),
-                sharding_config=attention_cfg.inner_attention.sharding_config,
-            )
+            backend_cfg = attention_cfg.inner_attention
+            is_mla = isinstance(backend_cfg, MLAAttention.Config)
+            if uses_compressed_mla_cache(backend_cfg):
+                vllm_attention_cfg = VLLMMLAAttention.Config(
+                    wkv_b=backend_cfg.wkv_b,
+                    packed_kv_head_dim=backend_cfg.packed_kv_head_dim,
+                    inner_attention=VLLMMLAInnerAttention.Config(
+                        num_heads=num_heads,
+                        kv_lora_rank=attention_cfg.kv_lora_rank,
+                        qk_nope_head_dim=attention_cfg.qk_nope_head_dim,
+                        qk_rope_head_dim=attention_cfg.qk_rope_head_dim,
+                        v_head_dim=attention_cfg.v_head_dim,
+                        scale=attention_cfg.softmax_scale,
+                        sharding_config=backend_cfg.inner_attention.sharding_config,
+                    ),
+                    sharding_config=backend_cfg.sharding_config,
+                )
+            else:
+                kernel_cfg = backend_cfg.inner_attention if is_mla else backend_cfg
+                if is_mla and isinstance(kernel_cfg, FlexInnerAttention.Config):
+                    raise ValueError(
+                        f"layers[{layer_idx}]: MLA with a materialized K/V cache "
+                        "does not support the flex attention backend in the "
+                        "TorchTitan vLLM wrapper yet; use varlen."
+                    )
+                vllm_attention_cfg = VLLMInnerAttention.Config(
+                    hidden_size=model_config.dim,
+                    num_heads=num_heads,
+                    num_kv_heads=num_kv_heads,
+                    head_dim=head_dim,
+                    value_head_dim=value_head_dim,
+                    scale=attention_cfg.softmax_scale,
+                    sliding_window_size=getattr(
+                        attention_cfg, "sliding_window_size", None
+                    ),
+                    sharding_config=kernel_cfg.sharding_config,
+                )
+                if is_mla:
+                    vllm_attention_cfg = MLAAttention.Config(
+                        wkv_b=backend_cfg.wkv_b,
+                        packed_kv_head_dim=backend_cfg.packed_kv_head_dim,
+                        inner_attention=vllm_attention_cfg,
+                        sharding_config=backend_cfg.sharding_config,
+                    )
             attention_cfg = dataclasses.replace(
                 attention_cfg,
                 inner_attention=vllm_attention_cfg,
@@ -104,16 +143,12 @@ def _replace_vllm_layer_configs(model_config):
 
         elif isinstance(attention_cfg, GDN.Config):
             delta_net_cfg = attention_cfg
-            from torchtitan.rl.generator.vllm.gdn import VLLMInnerGDN
+            from torchtitan.rl.generator.vllm.attention.gdn import VLLMInnerGDN
 
             vllm_inner_gdn_cfg = VLLMInnerGDN.Config(
                 layer_idx=layer_idx,
-                num_k_heads=(
-                    delta_net_cfg.in_proj_q.out_features // delta_net_cfg.key_head_dim
-                ),
-                num_v_heads=(
-                    delta_net_cfg.in_proj_v.out_features // delta_net_cfg.value_head_dim
-                ),
+                num_k_heads=delta_net_cfg.n_key_heads,
+                num_v_heads=delta_net_cfg.n_heads,
                 head_k_dim=delta_net_cfg.key_head_dim,
                 head_v_dim=delta_net_cfg.value_head_dim,
                 conv_kernel_size=delta_net_cfg.conv_kernel_size,
@@ -129,7 +164,7 @@ def _replace_vllm_layer_configs(model_config):
 
         elif isinstance(attention_cfg, KDA.Config):
             kda_cfg = attention_cfg
-            from torchtitan.rl.generator.vllm.kda import VLLMInnerKDA
+            from torchtitan.rl.generator.vllm.attention.kda import VLLMInnerKDA
 
             vllm_inner_kda_cfg = VLLMInnerKDA.Config(
                 num_heads=kda_cfg.n_heads,
@@ -365,6 +400,16 @@ class VLLMModelWrapper(Module):
         # Build model on meta device to avoid allocating full model on every GPU
         with self.parallelism_context.activate_spmd(), torch.device("meta"):
             self.model = self.config.build()
+        # The GDN kernels read A_log and dt_bias in float32. Keeping them in float32
+        # casts them once per weight load instead of in every step. Frozen: FSDP needs
+        # one dtype among parameters with grad.
+        for module in self.model.modules():
+            if isinstance(module, GDN):
+                for param in (module.A_log, module.dt_bias):
+                    param.data = param.data.float()
+                    param.requires_grad_(False)
+        # FSDP keeps each parameter in its own dtype: the rest are already the model dtype.
+        self.model._fsdp_param_dtype_override_fn = lambda param: param.dtype
         self.model._skip_lm_head = True
         if getattr(self.model, "vision_encoder", None) is not None:
             self.model.vision_encoder = None
@@ -373,7 +418,7 @@ class VLLMModelWrapper(Module):
             parallelism_context=self.parallelism_context,
             training=TrainingConfig(),
             parallelism=training_parallelism,
-            local_compile_regions=self.config.local_compile_regions,
+            local_compile=self.config.local_compile,
             activation_remat=None,
             dump_folder="",
         )
@@ -420,9 +465,21 @@ class VLLMModelWrapper(Module):
         # is still sharded. Bind first so first-touch places them on the
         # NUMA node local to this rank's GPU.
         maybe_apply_numa_binding(torch.cuda.current_device(), "cuda")
+        # Receive what the trainer sends: parameters in the model dtype, buffers in their own.
+        # torchstore's RDMA transport copies bytes and asserts matching dtypes;
+        # load_state_dict casts the float32 GDN parameters.
+        buffer_names = {name for name, _ in self.model.named_buffers()}
+        model_state_dict = {
+            name: (
+                tensor
+                if name in buffer_names
+                else tensor.to(vllm_config.model_config.dtype)
+            )
+            for name, tensor in self.model.state_dict().items()
+        }
         with torch.device("cpu"):
             self._prefetched_model_state_dict = _create_cpu_state_dict(
-                self.model.state_dict(), pin_memory=True
+                model_state_dict, pin_memory=True
             )
 
         # Unshard the model here so vLLM performs its GPU memory profiling

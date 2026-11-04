@@ -29,8 +29,8 @@ RolloutGroupWorkBuffer
 |                                                                                                                     |
 | caller            group_buffer call                                            state / active slot                  |
 | _data_input_loop  add_work(RolloutGroupWork)                                   WAITING; slot acquired               |
-| _rollout_loop[N]  claim_next()                                                 WAITING -> INFLIGHT                  |
-| _rollout_loop[N]  finalize_work(RolloutGroup)                                  INFLIGHT -> FINALIZED                |
+| _rollout_loop[N]  claim_next()                                                 WAITING -> CLAIMED                   |
+| _rollout_loop[N]  finalize_work(RolloutGroup)                                  CLAIMED -> FINALIZED                 |
 | _batcher_loop     RolloutGroup = take_finalized()                              FINALIZED -> taken (slot still held) |
 | _batcher_loop     release_active_groups(1, "untrainable_group")                slot released                        |
 | _trainer_loop     release_active_groups(num_prompts_per_train_step, "trained")  slots released after state dict pull |
@@ -125,7 +125,6 @@ from torchtitan.rl.rollout.rollouter import Rollouter
 from torchtitan.rl.rollout.types import Completion, GenerateFn, ReleaseSessionFn
 from torchtitan.rl.routing.inter_generator import InterGeneratorRouter
 from torchtitan.rl.trainer.batcher import Batcher, TrainerStepBatch
-from torchtitan.rl.trainer.controller_state import DATALOADER_STATE_KEY
 from torchtitan.rl.trainer.trainer import Trainer
 from torchtitan.tools.garbage_collector import GarbageCollector
 
@@ -592,21 +591,18 @@ class Controller(Configurable):
             trainer_parallelism.data_parallel_replicate_degree * dp_shard
         )
 
-        generator_dp_degree = max(config.generator.parallelism.data_parallel_degree, 1)
-        num_generator_dp_shards = config.num_generators * generator_dp_degree
-
-        # Ceiling (not target) for the generator's max_num_seqs: the per-generator
-        # upper bound on concurrently scheduled sequences. vLLM may admit fewer if KV
-        # is tight; this also sets CUDA-graph capture sizes.
-        max_num_seqs = min(
-            math.ceil(rollout_concurrency / num_generator_dp_shards), 512
-        )
+        # Ceiling (not target) for each generator DP rank's max_num_seqs, vLLM's cap on
+        # concurrently running sequences: vLLM queues requests above it even when KV has
+        # room. Sticky routing can send a rank more than an even share, so size it for
+        # every rollout sequence and let the KV budget limit admission. Capped at 512,
+        # vLLM's default largest CUDA graph capture size, to bound per-request buffers;
+        # this also sets CUDA-graph capture sizes.
+        max_num_seqs = min(rollout_concurrency, 512)
 
         logger.info(
-            "max_num_seqs=%d per generator (rollout_concurrency=%d / generator_dp_shards=%d)",
+            "max_num_seqs=%d per generator DP rank (rollout_concurrency=%d)",
             max_num_seqs,
             rollout_concurrency,
-            num_generator_dp_shards,
         )
 
         with sl.log_trace_span("mesh_spawn"):
@@ -665,14 +661,13 @@ class Controller(Configurable):
             await actor_system.initialize_torchstore()
 
         # Resume: __init__ ran CheckpointManager.load(); read back the restored
-        # policy version and controller-owned data state.
-        self.start_step, controller_state = await asyncio.gather(
+        # policy version and rollouter state.
+        self.start_step, resume_state = await asyncio.gather(
             self.trainer.rank0.get_policy_version.call_one(),
-            self.trainer.rank0.get_controller_state.call_one(),
+            self.trainer.rank0.get_resume_state.call_one(),
         )
-        if controller_state is not None:
-            dataloader_state = controller_state[DATALOADER_STATE_KEY]
-            self._rollouter.load_state_dict(dataloader_state)
+        if resume_state is not None:
+            self._rollouter.load_state_dict(resume_state)
             logger.info("Restored RL dataloader state")
             # TODO: Replay cached finished rollouts instead of regenerating all
             # pending prompts after resume.
@@ -1185,18 +1180,15 @@ class Controller(Configurable):
                     sl.log_trace_span("optim_step"),
                     step_timer.record("timing/step/optimizer"),
                 ):
-                    # Acknowledge only at the checkpoint transaction boundary:
+                    # Commit only at the checkpoint transaction boundary:
                     # doing it earlier could lose prompts if the process exits
                     # before the corresponding optimizer step is durable. The
                     # batcher includes every consumed group ID here, including
                     # metric-only zero-std groups excluded from model inputs.
-                    self._rollouter.acknowledge_training_sample_ids(packed.group_ids)
-                    controller_state = {
-                        DATALOADER_STATE_KEY: self._rollouter.state_dict()
-                    }
+                    self._rollouter.commit_training_sample_ids(packed.group_ids)
                     optimizer_result = self._get_rank_0_value(
                         await self.trainer.all_ranks.optim_step.call(
-                            controller_state=controller_state,
+                            resume_state=self._rollouter.state_dict(),
                             last_step=(step == num_training_steps),
                         )
                     )

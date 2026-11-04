@@ -142,7 +142,7 @@ def build_trainer_model(
         parallelism_context=parallelism_context,
         training=trainer_config.training,
         parallelism=parallelism,
-        local_compile_regions=model_config.local_compile_regions,
+        local_compile=model_config.local_compile,
         activation_remat=trainer_config.activation_remat,
         dump_folder=config.dump_folder,
     )
@@ -278,6 +278,7 @@ def _sync_trainer_weights_to_vllm(trainer_model, engine) -> None:
     # As a model state dict load: fill the pinned CPU copy, then load it with load_state_dict.
     vllm_sd = wrapper._prefetched_model_state_dict
 
+    trainer_buffers = {name for name, _ in trainer_model.named_buffers()}
     missing = []
     for name, vparam in vllm_sd.items():
         tparam = trainer_sd.get(name)
@@ -285,6 +286,12 @@ def _sync_trainer_weights_to_vllm(trainer_model, engine) -> None:
             missing.append(name)
             continue
         full = tparam.full_tensor() if isinstance(tparam, DTensor) else tparam
+        # Weight sync over RDMA copies bytes, so the receive dtype is what the trainer sends:
+        # parameters in the generator dtype, buffers in their own.
+        sent_dtype = (
+            full.dtype if name in trainer_buffers else engine.model_config.dtype
+        )
+        assert vparam.dtype == sent_dtype, (name, vparam.dtype, sent_dtype)
         with torch.inference_mode():
             if isinstance(vparam, DTensor):
                 vparam.copy_(
@@ -934,7 +941,6 @@ def _kimi_k3_debug_bitwise_config() -> Controller.Config:
     return config
 
 
-@unittest.skip("MLA attention is not supported by the TorchTitan vLLM wrapper yet.")
 class TestBitwiseParityKimiK3DebugVarlen(KimiK3BitwiseParityTestBase):
     """Kimi K3 KDA/MLA parity with random weights and matched TP=1."""
 

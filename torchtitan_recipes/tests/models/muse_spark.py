@@ -134,7 +134,7 @@ def muse_spark_debugmodel(
             dtype="float32",
             mixed_precision_param="bfloat16",
             mixed_precision_reduce="float32",
-            disable_cuda_graphs=True,
+            disable_accelerator_graphs=True,
         ),
         parallelism=parallelism,
         checkpointer=None,
@@ -291,7 +291,7 @@ def muse_spark_debugmodel_ultradata_lora_sft() -> Trainer.Config:
         dtype="bfloat16",
         mixed_precision_param="bfloat16",
         mixed_precision_reduce="float32",
-        disable_cuda_graphs=True,
+        disable_accelerator_graphs=True,
     )
     config.parallelism = ParallelismConfig(
         data_parallel_replicate_degree=1,
@@ -305,6 +305,6 @@ def muse_spark_debugmodel_ultradata_lora_sft() -> Trainer.Config:
     )
     config.comm.train_timeout_seconds = 1800
     config.activation_remat = FullActivationRematConfig()
-    config.model.local_compile_regions = ["loss"]
+    config.model.local_compile.regions = ["loss"]
     config.debug.seed = 42
     return apply_transforms(config, [_ultradata_lora_sft_transform()])
