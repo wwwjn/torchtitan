@@ -12,7 +12,6 @@ import torch
 pytest.importorskip("sglang")
 
 from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.models.common.attention import LinearAttention
 from torchtitan.models.qwen3 import build_model_config as build_qwen3_config
 from torchtitan.models.qwen3_5 import build_model_config as build_qwen3_5_config
 from torchtitan.rl.generator.sglang.registry import (
@@ -52,17 +51,60 @@ def test_replacement_keeps_layer_index_and_scale():
         assert inner.sharding_config == layer.attention.inner_attention.sharding_config
 
 
-def test_replacement_rejects_linear_attention():
+def test_replacement_maps_gdn_layers():
+    from torchtitan.models.common.attention.gdn import GDN
+    from torchtitan.rl.generator.sglang.gdn import SGLangInnerGDN
     from torchtitan.rl.generator.sglang.model_wrapper import (
         _replace_sglang_layer_configs,
     )
 
     config = build_qwen3_5_config("debugmodel", parallelism=ParallelismConfig())
-    assert any(
-        isinstance(layer.attention, LinearAttention.Config) for layer in config.layers
+    replaced = _replace_sglang_layer_configs(config)
+    gdn_layers = 0
+    for layer_idx, (layer, new_layer) in enumerate(
+        zip(config.layers, replaced.layers, strict=True)
+    ):
+        if not isinstance(layer.attention, GDN.Config):
+            continue
+        gdn_layers += 1
+        inner = new_layer.attention.inner_attention
+        assert isinstance(inner, SGLangInnerGDN.Config)
+        assert inner.layer_idx == layer_idx
+        assert inner.head_k_dim == layer.attention.key_head_dim
+        assert inner.conv_kernel_size == layer.attention.conv_kernel_size
+    assert gdn_layers > 0
+
+
+def test_replacement_rejects_kda():
+    from torchtitan.models.kimi_k3 import build_model_config as build_kimi_config
+    from torchtitan.rl.generator.sglang.model_wrapper import (
+        _replace_sglang_layer_configs,
     )
-    with pytest.raises(NotImplementedError, match="linear attention"):
+
+    config = build_kimi_config("debugmodel", parallelism=ParallelismConfig())
+    with pytest.raises(NotImplementedError, match="GDN linear attention only"):
         _replace_sglang_layer_configs(config)
+
+
+def test_hf_config_lists_gdn_layers():
+    from torchtitan.models.common.attention.gdn import GDN
+
+    config = build_qwen3_5_config("debugmodel", parallelism=ParallelismConfig())
+    hf_config = model_config_to_sglang_hf_config(config)
+    assert hf_config["model_type"] == "torchtitan_hybrid"
+    assert hf_config["layer_types"] == [
+        "linear_attention"
+        if isinstance(layer.attention, GDN.Config)
+        else "full_attention"
+        for layer in config.layers
+    ]
+    gdn = next(
+        layer.attention
+        for layer in config.layers
+        if isinstance(layer.attention, GDN.Config)
+    )
+    assert hf_config["linear_key_head_dim"] == gdn.key_head_dim
+    assert hf_config["linear_conv_kernel_dim"] == gdn.conv_kernel_size
 
 
 def _sampler():

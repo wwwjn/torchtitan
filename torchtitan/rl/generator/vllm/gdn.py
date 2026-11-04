@@ -7,14 +7,8 @@
 """vLLM paged-cache adapter for TorchTitan's Gated DeltaNet.
 
 The enclosing Qwen3.5 module owns all parameters. This adapter runs Attention
-Gym's paging-aware convolution and GDN kernels.
-
-Batch-invariant execution has two additional requirements:
-
-* The accumulated SSM cache state uses float32. Decode otherwise rounds the state
-  through bfloat16 after every token, unlike a single prefill call. The convolution
-  cache stays in model dtype because it only stores trailing input columns.
-* Batch-invariant recurrence uses the same Attention Gym scan as the trainer.
+Gym's paging-aware convolution and GDN kernels through ``paged_gdn_forward``
+(shared with the SGLang engine; it documents the batch-invariant requirements).
 
 Decode and prefill update the paged convolution and SSM state pools directly.
 """
@@ -34,20 +28,10 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
-from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
 from torchtitan.models.common.attention import InnerAttention, LinearAttentionMetadata
 from torchtitan.models.common.attention.gdn import GDN
-from torchtitan.models.common.attention.linear_attention import chunk_kernel_options
-from torchtitan.models.common.attn_gym import (
-    causal_conv1d_decode,
-    gate_transform,
-    l2norm,
-    paged_causal_conv1d,
-    paged_chunk_gdn,
-    recurrent_gdn,
-    recurrent_gdn_decode,
-)
 from torchtitan.models.common.decoder import Decoder
+from torchtitan.rl.generator.paged_gdn import paged_gdn_forward
 from torchtitan.rl.generator.vllm.linear_attention import (
     configure_hybrid_state,
     LinearAttentionExecutionPath,
@@ -111,7 +95,6 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             )
         self.local_num_k_heads = self.num_k_heads // self.tensor_parallel_size
         self.local_num_v_heads = self.num_v_heads // self.tensor_parallel_size
-        self.local_key_dim = self.local_num_k_heads * self.head_k_dim
 
         if is_conv_state_dim_first():
             raise ValueError(
@@ -172,29 +155,6 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             self.num_speculative_tokens,
         )
 
-    def _split_qkv(
-        self, mixed_qkv: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Split local fused channels and add a singleton batch dim."""
-        num_tokens = mixed_qkv.shape[0]
-        local_key_dim = self.local_key_dim
-        query = (
-            mixed_qkv[:, :local_key_dim]
-            .contiguous()
-            .view(1, num_tokens, self.local_num_k_heads, self.head_k_dim)
-        )
-        key = (
-            mixed_qkv[:, local_key_dim : 2 * local_key_dim]
-            .contiguous()
-            .view(1, num_tokens, self.local_num_k_heads, self.head_k_dim)
-        )
-        value = (
-            mixed_qkv[:, 2 * local_key_dim :]
-            .contiguous()
-            .view(1, num_tokens, self.local_num_v_heads, self.head_v_dim)
-        )
-        return query, key, value
-
     def _forward(
         self,
         mixed_qkv: torch.Tensor,
@@ -236,123 +196,28 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         # SP/model-input rounding need not pad attention metadata. FULL bucket
         # padding does: its prepared rows and captured slices stay fixed while
         # the builder restages slots and freshness, including null padding.
-        if gdn_metadata.execution_path is LinearAttentionExecutionPath.SINGLE_TOKEN:
-            num_decode_rows = state_indices.numel()
-            conv_output = causal_conv1d_decode(
-                mixed_qkv[:num_decode_rows],
-                conv_weight,
-                self.kv_cache[0],
-                activation="silu",
-                state_indices=state_indices,
-                has_initial_state=has_initial_state,
-            )
-            if not is_in_batch_invariant_mode():
-                recurrent_gdn_decode(
-                    conv_output,
-                    a[:num_decode_rows].unsqueeze(0),
-                    b[:num_decode_rows].unsqueeze(0),
-                    A_log.float(),
-                    dt_bias.float(),
-                    self.kv_cache[1],
-                    state_indices,
-                    has_initial_state=has_initial_state,
-                    scale=self.head_k_dim**-0.5,
-                    out=output[:num_decode_rows].unsqueeze(0),
-                )
-            else:
-                self._forward_gdn(
-                    conv_output,
-                    a[:num_decode_rows],
-                    b[:num_decode_rows],
-                    A_log,
-                    dt_bias,
-                    output[:num_decode_rows],
-                    cu_seqlens,
-                    state_indices,
-                    has_initial_state,
-                )
-            return
-
-        conv_output = paged_causal_conv1d(
-            mixed_qkv[:num_actual_tokens].unsqueeze(0),
+        paged_gdn_forward(
+            mixed_qkv,
+            a,
+            b,
             conv_weight,
-            self.kv_cache[0],
-            state_indices,
-            activation="silu",
-            cu_seqlens=cu_seqlens,
-            has_initial_state=has_initial_state,
-        ).squeeze(0)
-        self._forward_gdn(
-            conv_output,
-            a[:num_actual_tokens],
-            b[:num_actual_tokens],
             A_log,
             dt_bias,
-            output[:num_actual_tokens],
-            cu_seqlens,
-            state_indices,
-            has_initial_state,
+            output,
+            conv_state_SWC=self.kv_cache[0],
+            ssm_state_SHVK=self.kv_cache[1],
+            state_indices_N=state_indices,
+            cu_seqlens=cu_seqlens,
+            has_initial_state_N=has_initial_state,
+            single_token=(
+                gdn_metadata.execution_path is LinearAttentionExecutionPath.SINGLE_TOKEN
+            ),
+            num_tokens=num_actual_tokens,
+            num_k_heads=self.local_num_k_heads,
+            num_v_heads=self.local_num_v_heads,
+            head_k_dim=self.head_k_dim,
+            head_v_dim=self.head_v_dim,
         )
-
-    def _forward_gdn(
-        self,
-        conv_output: torch.Tensor,
-        a: torch.Tensor,
-        b: torch.Tensor,
-        A_log: torch.Tensor,
-        dt_bias: torch.Tensor,
-        output: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        all_slots: torch.Tensor,
-        has_initial_state: torch.Tensor,
-    ) -> None:
-        """Map each cu_seqlens interval to its paged SSM slot in all_slots.
-
-        Null slots skip state writes and produce zero output for padding.
-        """
-        query, key, value = self._split_qkv(conv_output)
-        # Keep the existing FP32 arithmetic while reusing the GDN gate contract.
-        decay = gate_transform(
-            a.unsqueeze(0),
-            A_log.float(),
-            dt_bias.float(),
-            kind="softplus",
-            impl="reference",
-        )
-        update_gate = torch.sigmoid(b).unsqueeze(0)
-        query = l2norm(query, cu_seqlens=cu_seqlens)
-        key = l2norm(key, cu_seqlens=cu_seqlens)
-
-        if is_in_batch_invariant_mode():
-            recurrent_output, _ = recurrent_gdn(
-                query,
-                key,
-                value,
-                decay,
-                update_gate,
-                self.kv_cache[1],
-                cu_seqlens=cu_seqlens,
-                scale=self.head_k_dim**-0.5,
-                state_indices=all_slots,
-                has_initial_state=has_initial_state,
-                # Triton autotuning breaks batch invariance.
-                autotune=False,
-            )
-        else:
-            recurrent_output = paged_chunk_gdn(
-                query,
-                key,
-                value,
-                decay,
-                update_gate,
-                self.kv_cache[1],
-                all_slots,
-                cu_seqlens=cu_seqlens,
-                has_initial_state=has_initial_state,
-                scale=self.head_k_dim**-0.5,
-                kernel_options=chunk_kernel_options(query),
-            )
-        output.copy_(recurrent_output[0].to(output.dtype))
 
     def forward(
         self,

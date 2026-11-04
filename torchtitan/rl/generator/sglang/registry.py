@@ -20,6 +20,7 @@ from __future__ import annotations
 from typing import Any
 
 from torchtitan.components.checkpointer import CheckpointManager
+from torchtitan.models.common.attention.gdn import GDN
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
 from torchtitan.rl.generator.unified_model import get_attention_dimensions
@@ -58,7 +59,53 @@ def model_config_to_sglang_hf_config(cfg: Decoder.Config) -> dict[str, Any]:
         "tie_word_embeddings": getattr(cfg, "enable_weight_tying", False),
         "torch_dtype": "bfloat16",
     }
+    gdn_configs = [
+        layer.attention
+        for layer in cfg.layers
+        if isinstance(layer.attention, GDN.Config)
+    ]
+    if not gdn_configs:
+        return hf_config
+    # SGLang allocates one recurrent-state shape for every GDN layer.
+    linear_dims = {
+        (
+            gdn.in_proj_q.out_features // gdn.key_head_dim,
+            gdn.in_proj_v.out_features // gdn.value_head_dim,
+            gdn.key_head_dim,
+            gdn.value_head_dim,
+            gdn.conv_kernel_size,
+        )
+        for gdn in gdn_configs
+    }
+    if len(linear_dims) != 1:
+        raise ValueError(f"GDN layers must share one state shape, got {linear_dims}")
+    ((num_k_heads, num_v_heads, head_k_dim, head_v_dim, conv_kernel),) = linear_dims
+    from torchtitan.rl.generator.sglang.gdn import (
+        FULL_ATTENTION,
+        LINEAR_ATTENTION,
+        TorchTitanHybridConfig,
+    )
+
+    hf_config.update(
+        model_type=TorchTitanHybridConfig.model_type,
+        layer_types=[
+            LINEAR_ATTENTION
+            if isinstance(layer.attention, GDN.Config)
+            else FULL_ATTENTION
+            for layer in cfg.layers
+        ],
+        linear_num_key_heads=num_k_heads,
+        linear_num_value_heads=num_v_heads,
+        linear_key_head_dim=head_k_dim,
+        linear_value_head_dim=head_v_dim,
+        linear_conv_kernel_dim=conv_kernel,
+    )
     return hf_config
+
+
+def is_hybrid_linear_attention(cfg: Decoder.Config) -> bool:
+    """Whether ``cfg`` mixes full attention with GDN layers."""
+    return any(isinstance(layer.attention, GDN.Config) for layer in cfg.layers)
 
 
 def register_to_sglang(
@@ -97,3 +144,7 @@ def register_to_sglang(
     SGLangModelFromSpec.__name__ = SGLANG_MODEL_NAME
     SGLangModelFromSpec.__qualname__ = SGLANG_MODEL_NAME
     ModelRegistry.models[SGLANG_MODEL_NAME] = SGLangModelFromSpec
+    if is_hybrid_linear_attention(model_config):
+        from torchtitan.rl.generator.sglang.gdn import register_hybrid_config
+
+        register_hybrid_config()

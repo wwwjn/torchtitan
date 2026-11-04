@@ -9,6 +9,7 @@ from dataclasses import replace
 import pytest
 import torch
 
+from torchtitan.rl.generator import paged_gdn
 from torchtitan.rl.generator.vllm import gdn
 from torchtitan.rl.generator.vllm.linear_attention import (
     LinearAttentionExecutionPath,
@@ -213,6 +214,8 @@ def test_forward_respects_prepared_extent_and_decode_padding(monkeypatch, decode
     layer = gdn.VLLMInnerGDN.__new__(gdn.VLLMInnerGDN)
     torch.nn.Module.__init__(layer)
     layer.prefix, layer.kv_cache = "gdn", (torch.empty(0), torch.empty(0))
+    layer.local_num_k_heads = layer.local_num_v_heads = 1
+    layer.head_k_dim = layer.head_v_dim = 1
     extent = 4 if decode else 3
     metadata = TorchTitanLinearAttentionMetadata(
         execution_path=(
@@ -236,22 +239,28 @@ def test_forward_respects_prepared_extent_and_decode_padding(monkeypatch, decode
         ),
         has_initial_state=torch.tensor([False, True, False, False]),
     )
-    monkeypatch.setattr(gdn, "is_in_batch_invariant_mode", lambda: True)
+    monkeypatch.setattr(paged_gdn, "is_in_batch_invariant_mode", lambda: True)
 
     def convolution(x, *args, has_initial_state=None, **kwargs):
         assert has_initial_state is metadata.has_initial_state
         return x
 
-    monkeypatch.setattr(gdn, "causal_conv1d_decode", convolution)
-    monkeypatch.setattr(gdn, "paged_causal_conv1d", convolution)
+    def packed_convolution(x, weight, state, slots, cu_seqlens, has_initial_state):
+        assert has_initial_state is metadata.has_initial_state
+        return x
 
-    def recurrent(conv, a, b, A_log, bias, out, offsets, slots, initial):
+    monkeypatch.setattr(paged_gdn, "causal_conv1d_decode", convolution)
+    monkeypatch.setattr(paged_gdn, "_conv_with_inline_history", packed_convolution)
+
+    def recurrent(
+        conv, a, b, A_log, bias, out, *, cu_seqlens, has_initial_state_N, **kwargs
+    ):
         assert conv.shape[0] == out.shape[0] == extent
-        assert offsets[-1] == extent
-        assert initial is metadata.has_initial_state
+        assert cu_seqlens[-1] == extent
+        assert has_initial_state_N is metadata.has_initial_state
         out.fill_(1)
 
-    monkeypatch.setattr(layer, "_forward_gdn", recurrent)
+    monkeypatch.setattr(paged_gdn, "_recurrence", recurrent)
     context = ForwardContext(
         no_compile_layers={}, attn_metadata={"gdn": metadata}, slot_mapping={}
     )

@@ -30,6 +30,7 @@ how either engine batches, chunks, retracts or preempts the requests.
 | Model | `model_wrapper.py`, `registry.py` | `SGLangModelWrapper` builds the TorchTitan model on the meta device, parallelizes it, and loads weights through TorchTitan's checkpointer, as the vLLM wrapper does. It is registered in SGLang's `ModelRegistry`. SGLang reads only an HF `config.json` from its model path, so the engine writes one derived from the TorchTitan model config into a private directory, as vLLM's TorchTitan config parser does. |
 | Attention | `attention.py` | The `torchtitan_varlen` attention backend runs `torch.nn.attention.varlen.varlen_attn_out` on SGLang's paged KV pool. That is the kernel, with the same arguments, used by the trainer and by vLLM's `CUSTOM` backend. `SGLangInnerAttention` adapts TorchTitan's attention layout to SGLang's `RadixAttention`. Supports decode CUDA graphs. |
 | Expert and data parallelism | `engine.py`, `model_wrapper.py` | With EP and TP, the wrapper pads each step's tokens to a TP multiple, as the vLLM runner does. Generator DP exists to supply EP ranks, whose all-to-alls span every DP rank, so DP > 1 runs SGLang's data-parallel attention: one world of DP x TP ranks, attention data-parallel over DP and tensor-parallel over TP, and a rank without requests runs an idle batch through the model whenever another rank has work. `has_unfinished_requests` is collective across ranks. |
+| GDN linear attention | `gdn.py`, `../paged_gdn.py` | Hybrid models (GDN layers with full-attention layers) use SGLang's linear-attention model registry: the engine's HF config lists the layer types and the per-slot state shapes, SGLang keeps the GDN states in its mamba pool next to the KV pool, and `TorchTitanGDNAttnBackend` builds each step's slot indices and sequence boundaries. `SGLangInnerGDN` runs `paged_gdn_forward`, the function the vLLM engine's GDN layer runs. The SSM state is float32. The radix cache is disabled: reusing a prefix would need the recurrent state at the prefix boundary. Supports decode CUDA graphs. |
 | Sampler | `sampler.py` | Reproduces vLLM's v1 sampler for the RL generator's sampling (fp32 logits, temperature, processed logprobs, exponential-race sampling with per-request seeded generators), so both engines sample identically. |
 
 Shared, engine-agnostic helpers live in `torchtitan/rl/generator/unified_model.py`.
@@ -69,15 +70,16 @@ The `sglang-kernel` wheel uses the stable ABI and loads with the nightly torch.
 | Dense, full attention, TP > 1 | Supported; bitwise parity with `VLLMEngine` at the same TP degree (tested at TP=2 and TP=4) |
 | MoE, no expert parallelism (TP=1) | Supported; bitwise parity with `VLLMEngine`. Below SM90, decode CUDA graphs are rejected: the expert GEMM reads group sizes on the host |
 | MoE, expert parallelism with EP = DP x TP | Supported; bitwise parity with `VLLMEngine` (tested at TP=2/EP=2, DP=2/TP=1/EP=2, DP=2/TP=2/EP=4). DP > 1 runs SGLang's data-parallel attention |
+| Hybrid GDN + full attention (Qwen3.5) | Supported; bitwise parity with `VLLMEngine` (tested at TP=1 and TP=2, with chunked prefill, mixed prefill/decode steps and CUDA graphs on both engines). No radix cache |
 
-Not supported yet: linear attention (GDN, KDA), Dist-MoE, sequence parallelism, prefill CUDA graphs, multi-turn session KV
+Not supported yet: KDA linear attention, Dist-MoE, sequence parallelism, prefill CUDA graphs, multi-turn session KV
 holding (`VLLMSessionKVHolder`), and per-step engine metrics.
 
 ## Tests
 
 - `tests/rl/unit_tests/cpu/test_sglang_engine.py`: config translation, and the sampler
   against vLLM's sampling ops.
-- `tests/rl/unit_tests/gpu/test_sglang_engine_parity.py`: runs both engines on Qwen3-0.6B
-  and compares every token and logprob bitwise, across admission orders, chunked
-  prefill, CUDA graphs, KV-pool pressure (SGLang retractions) and a weight reload
-  during generation.
+- `tests/rl/unit_tests/gpu/test_sglang_engine_parity.py`: runs both engines on Qwen3-0.6B,
+  a random-weight Qwen3 MoE and Qwen3.5-0.8B (GDN), and compares every token and
+  logprob bitwise, across parallel layouts, admission orders, chunked prefill, CUDA
+  graphs, KV-pool pressure (SGLang retractions) and a weight reload during generation.
