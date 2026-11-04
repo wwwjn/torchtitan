@@ -52,6 +52,12 @@ MODELS = {
         "30B-A3B",
         "./assets/hf/Qwen3-30B-A3B",
     ),
+    # Random weights saved in HF format; no tokenizer, so prompts are synthetic.
+    "qwen3_moe_debug": (
+        "torchtitan.models.qwen3",
+        "debugmodel_moe",
+        "./assets/hf/Qwen3-MoE-debug",
+    ),
 }
 
 
@@ -62,15 +68,25 @@ _WORDS = (
 ).split()
 
 
-def _build_prompts(model_path: str, num_prompts: int) -> list[list[int]]:
+def _build_prompts(
+    model_path: str, num_prompts: int, vocab_size: int
+) -> list[list[int]]:
+    """Chat prompts from the checkpoint's tokenizer, or random token ids without one."""
+    rng = random.Random(1234)
+    # Lengths from a few tokens to more than one 256-token KV page.
+    lengths = [8, 40, 120, 300, 16, 600, 64, 200]
+    if not os.path.exists(os.path.join(model_path, "tokenizer_config.json")):
+        return [
+            [rng.randrange(vocab_size) for _ in range(2 * lengths[i % 8] + i)]
+            for i in range(num_prompts)
+        ]
+
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    rng = random.Random(1234)
     prompts = []
     for i in range(num_prompts):
-        # Lengths from a few tokens to more than one 256-token KV page.
-        num_words = [8, 40, 120, 300, 16, 600, 64, 200][i % 8] + rng.randint(0, 7)
+        num_words = lengths[i % 8] + rng.randint(0, 7)
         text = " ".join(rng.choice(_WORDS) for _ in range(num_words))
         rendered = tokenizer.apply_chat_template(
             [{"role": "user", "content": text}],
@@ -106,6 +122,59 @@ def _build_requests(args, prompts: list[list[int]]) -> list[EngineRequest]:
             request.min_policy_version = 0
             requests.append(request)
     return requests
+
+
+def save_debug_moe_checkpoint(path: str) -> None:
+    """Save Qwen3's ``debugmodel_moe`` with seeded random weights as an HF checkpoint."""
+    from safetensors.torch import save_file
+
+    from torchtitan.config import ParallelismConfig
+    from torchtitan.models.qwen3 import build_model_config
+    from torchtitan.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
+
+    torch.manual_seed(1234)
+    config = build_model_config(
+        "debugmodel_moe",
+        seq_len=2048,
+        attn_backend="varlen",
+        parallelism=ParallelismConfig(),
+    )
+    with torch.device("cpu"):
+        model = config.build()
+    with torch.no_grad():
+        model.init_weights(buffer_device=None)
+    state_dict = {
+        k: v.detach().to(torch.bfloat16).contiguous()
+        for k, v in model.state_dict().items()
+    }
+    hf_state_dict = Qwen3StateDictAdapter(config, hf_assets_path=None).to_hf(state_dict)
+    os.makedirs(path, exist_ok=True)
+    save_file(
+        {k: v.contiguous() for k, v in hf_state_dict.items()},
+        os.path.join(path, "model.safetensors"),
+    )
+    attention, moe = config.first_full_attention, config.first_moe
+    hf_config = {
+        "architectures": ["Qwen3MoeForCausalLM"],
+        "model_type": "qwen3_moe",
+        "hidden_size": config.dim,
+        "num_hidden_layers": len(config.layers),
+        "vocab_size": config.vocab_size,
+        "num_attention_heads": attention.n_heads,
+        "num_key_value_heads": attention.n_kv_heads,
+        "head_dim": attention.head_dim,
+        "num_experts": moe.router.num_experts,
+        "num_experts_per_tok": moe.router.top_k,
+        "moe_intermediate_size": moe.routed_experts.w2.in_features,
+        "intermediate_size": 4 * config.dim,
+        "max_position_embeddings": config.max_context_length,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 1000000.0,
+        "tie_word_embeddings": False,
+        "torch_dtype": "bfloat16",
+    }
+    with open(os.path.join(path, "config.json"), "w") as f:
+        json.dump(hf_config, f)
 
 
 @torch.no_grad()
@@ -183,12 +252,14 @@ def _build_engine(args):
         generator_name="engine_parity",
         output_dir="/tmp/engine_parity",
     )
-    return engine, model_path
+    return engine, model_path, model_config.vocab_size
 
 
 def generate(args) -> None:
-    engine, model_path = _build_engine(args)
-    requests = _build_requests(args, _build_prompts(model_path, args.num_prompts))
+    engine, model_path, vocab_size = _build_engine(args)
+    requests = _build_requests(
+        args, _build_prompts(model_path, args.num_prompts, vocab_size)
+    )
     results: dict[str, dict] = {}
     num_steps = 0
 
@@ -254,6 +325,9 @@ def compare(path_a: str, path_b: str) -> list[str]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--compare", nargs=2, metavar=("A", "B"))
+    parser.add_argument(
+        "--save-debug-moe-checkpoint", metavar="DIR", help="write it and exit"
+    )
     parser.add_argument("--engine", choices=["vllm", "sglang"])
     parser.add_argument("--out")
     parser.add_argument("--model", default="qwen3_0_6b", choices=sorted(MODELS))
@@ -278,6 +352,9 @@ def main() -> None:
     parser.add_argument("--cuda-graph", action="store_true")
     parser.add_argument("--sglang-extra-server-args", default="{}")
     args = parser.parse_args()
+    if args.save_debug_moe_checkpoint:
+        save_debug_moe_checkpoint(args.save_debug_moe_checkpoint)
+        return
     if args.compare:
         mismatches = compare(*args.compare)
         print(f"{len(mismatches)} mismatching requests: {sorted(mismatches)}")

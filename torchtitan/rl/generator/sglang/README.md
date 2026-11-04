@@ -66,6 +66,7 @@ The `sglang-kernel` wheel uses the stable ABI and loads with the nightly torch.
 |---|---|
 | Dense, full attention, TP=1 | Supported; bitwise parity with `VLLMEngine` |
 | Dense, full attention, TP > 1 | Supported; bitwise parity with `VLLMEngine` at the same TP degree (tested at TP=2 and TP=4) |
+| MoE, no expert parallelism (TP=1) | Supported; bitwise parity with `VLLMEngine`. Below SM90, decode CUDA graphs are rejected: the expert GEMM reads group sizes on the host |
 
 Not supported yet: expert parallelism, generator data parallelism, linear attention
 (GDN, KDA), Dist-MoE, sequence parallelism, prefill CUDA graphs, multi-turn session KV
