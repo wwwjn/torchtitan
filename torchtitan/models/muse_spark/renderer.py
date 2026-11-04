@@ -168,23 +168,104 @@ def _escape_attribute(value: Any) -> str:
     return html.escape(_escape_header(value), quote=True).replace("&#x27;", "&#39;")
 
 
-def _image_parts(content: Any) -> list[dict[str, Any]]:
-    if content is None or isinstance(content, str):
-        return []
-    return [part for part in content if part.get("type") == "image"]
+class MuseImagePlaceholders:
+    """Muse image spans from an `ImageLoader`, shared by the Muse Spark and Glimmer
+    renderers.
 
+    An image part ``{"type": "image", "path": ...}`` becomes ``<|image_start|>`` + N x
+    ``<|patch|>`` + ``<|image_end|>``, what the Muse processors (and Muse Spark's SFT
+    data) expand an image into, with N from the header's patch grid. After encoding,
+    `multi_modal_data` finds each image's ``<|patch|>`` run.
+    """
 
-def _image_path(part: dict[str, Any]) -> str:
-    path = part.get("path")
-    if path is None:
-        raise ValueError(
-            "Muse Spark image parts need a 'path' to an image file, got keys "
-            f"{sorted(part)}."
+    def __init__(self, images: ImageLoader, tokenizer: Any) -> None:
+        self._images = images
+        self.image_start_id, self.patch_id, image_end_id = (
+            tokenizer.convert_tokens_to_ids(token)
+            for token in (IMAGE_START_STR, PATCH_STR, IMAGE_END_STR)
         )
-    return path
+        if None in (self.image_start_id, self.patch_id, image_end_id):
+            raise ValueError(
+                f"Image rendering needs {IMAGE_START_STR}, {PATCH_STR} and "
+                f"{IMAGE_END_STR} in the tokenizer."
+            )
+
+    def span(self, part: dict[str, Any]) -> str:
+        image = self._images.lookup(self._path(part))
+        return (
+            IMAGE_START_STR + PATCH_STR * self._images.num_tokens(image) + IMAGE_END_STR
+        )
+
+    @staticmethod
+    def _path(part: dict[str, Any]) -> str:
+        path = part.get("path")
+        if path is None:
+            raise ValueError(
+                "Muse image parts need a 'path' to an image file, got keys "
+                f"{sorted(part)}."
+            )
+        return path
+
+    def multi_modal_data(
+        self,
+        messages: list[dict[str, Any]],
+        token_ids: list[int],
+        *,
+        start: int = 0,
+        previous: MultiModalData | None = None,
+    ) -> MultiModalData | None:
+        """Place the images of ``messages`` on the ``<|patch|>`` runs of ``token_ids[start:]``.
+
+        Messages render in order and each image part becomes one run, so the n-th
+        image part owns the n-th run. ``previous`` holds the images before ``start``.
+        """
+        images = [
+            self._images.lookup(self._path(part))
+            for message in messages
+            if not isinstance(message.get("content"), (str, type(None)))
+            for part in message["content"]
+            if part.get("type") == "image"
+        ]
+        runs: list[PlaceholderRange] = []
+        index = start
+        while True:
+            try:
+                index = token_ids.index(self.image_start_id, index) + 1
+            except ValueError:
+                break
+            end = index
+            while end < len(token_ids) and token_ids[end] == self.patch_id:
+                end += 1
+            runs.append(PlaceholderRange(offset=index, length=end - index))
+            index = end
+        if [run.length for run in runs] != [
+            self._images.num_tokens(image) for image in images
+        ]:
+            raise ValueError(
+                f"Rendered image runs {[run.length for run in runs]} do not match the "
+                f"messages' images {[image.key for image in images]}."
+            )
+        hashes = [*(previous.mm_hashes.get("image", []) if previous else [])]
+        placeholders = [
+            *(previous.mm_placeholders.get("image", []) if previous else [])
+        ]
+        items = [*(previous.mm_items.get("image", []) if previous else [])]
+        for image, run in zip(images, runs):
+            hashes.append(image.key)
+            placeholders.append(run)
+            items.append(
+                {"pixel_values": None, "image_grid_thw": np.array([image.grid_thw])}
+            )
+        if not hashes:
+            return None
+        return MultiModalData(
+            mm_hashes={"image": hashes},
+            mm_placeholders={"image": placeholders},
+            mm_items={"image": items},
+        )
 
 
-def _render_content(content: Any, images: ImageLoader | None = None) -> str:
+def _render_content(content: Any, images: MuseImagePlaceholders | None = None) -> str:
     if content is None:
         return ""
     if isinstance(content, str):
@@ -194,8 +275,7 @@ def _render_content(content: Any, images: ImageLoader | None = None) -> str:
         kind = part.get("type", "")
         if kind == "image" and images is not None:
             # Added after escaping, so these are the only image tokens in the body.
-            num_tokens = images.num_tokens(images.lookup(_image_path(part)))
-            rendered.append(IMAGE_START_STR + PATCH_STR * num_tokens + IMAGE_END_STR)
+            rendered.append(images.span(part))
             continue
         if kind in {
             "image",
@@ -355,10 +435,14 @@ class MuseSparkRenderer:
         self._current_date = config.current_date
         self._reasoning_effort = config.reasoning_effort
         self._bos = tokenizer.bos_token or ""
-        self._images = None if config.images is None else config.images.build()
+        self._verify_special_ids()
+        self._images = (
+            None
+            if config.images is None
+            else MuseImagePlaceholders(config.images.build(), tokenizer)
+        )
         # Read by `renderers.is_multimodal`: rollouts then carry `multi_modal_data`.
         self.is_multimodal = self._images is not None
-        self._verify_special_ids()
 
     def _verify_special_ids(self) -> None:
         for token, expected in (
@@ -373,82 +457,14 @@ class MuseSparkRenderer:
                     f"Tokenizer maps {token} to id {actual}, but Muse Spark expects "
                     f"{expected}."
                 )
-        if self._images is not None:
-            self._image_start_id, self._patch_id, self._image_end_id = (
-                self._tokenizer.convert_tokens_to_ids(token)
-                for token in (IMAGE_START_STR, PATCH_STR, IMAGE_END_STR)
-            )
-            if None in (self._image_start_id, self._patch_id, self._image_end_id):
-                raise ValueError(
-                    f"Image rendering needs {IMAGE_START_STR}, {PATCH_STR} and "
-                    f"{IMAGE_END_STR} in the tokenizer."
-                )
 
     @property
     def mm_token_type_id_map(self) -> dict[int, int]:
         """``renderers.MultimodalRenderer``: ``<|patch|>`` marks image tokens."""
-        return {} if self._images is None else {self._patch_id: 1}
+        return {} if self._images is None else {self._images.patch_id: 1}
 
     def _content(self, content: Any) -> str:
         return _render_content(content, self._images)
-
-    def _multi_modal_data(
-        self,
-        messages: list[dict[str, Any]],
-        token_ids: list[int],
-        *,
-        start: int = 0,
-        previous: MultiModalData | None = None,
-    ) -> MultiModalData | None:
-        """Place the images of ``messages`` on the ``<|patch|>`` runs of ``token_ids[start:]``.
-
-        Messages render in order and each image part becomes one run, so the n-th
-        image part owns the n-th run. ``previous`` holds the images before ``start``.
-        """
-        if self._images is None:
-            return None
-        images = [
-            self._images.lookup(_image_path(part))
-            for message in messages
-            for part in _image_parts(message.get("content"))
-        ]
-        runs: list[PlaceholderRange] = []
-        index = start
-        while True:
-            try:
-                index = token_ids.index(self._image_start_id, index) + 1
-            except ValueError:
-                break
-            end = index
-            while end < len(token_ids) and token_ids[end] == self._patch_id:
-                end += 1
-            runs.append(PlaceholderRange(offset=index, length=end - index))
-            index = end
-        if [run.length for run in runs] != [
-            self._images.num_tokens(image) for image in images
-        ]:
-            raise ValueError(
-                f"Rendered image runs {[run.length for run in runs]} do not match the "
-                f"messages' images {[image.key for image in images]}."
-            )
-        hashes = [*(previous.mm_hashes.get("image", []) if previous else [])]
-        placeholders = [
-            *(previous.mm_placeholders.get("image", []) if previous else [])
-        ]
-        items = [*(previous.mm_items.get("image", []) if previous else [])]
-        for image, run in zip(images, runs):
-            hashes.append(image.key)
-            placeholders.append(run)
-            items.append(
-                {"pixel_values": None, "image_grid_thw": np.array([image.grid_thw])}
-            )
-        if not hashes:
-            return None
-        return MultiModalData(
-            mm_hashes={"image": hashes},
-            mm_placeholders={"image": placeholders},
-            mm_items={"image": items},
-        )
 
     def _system_body(
         self,
@@ -803,8 +819,12 @@ class MuseSparkRenderer:
             is_content=is_content,
             message_roles=[cast(str, message.get("role")) for message in messages],
             message_tool_names=[message.get("name") for message in messages],
-            multi_modal_data=self._multi_modal_data(
-                cast(list[dict[str, Any]], messages), token_ids
+            multi_modal_data=(
+                None
+                if self._images is None
+                else self._images.multi_modal_data(
+                    cast(list[dict[str, Any]], messages), token_ids
+                )
             ),
         )
 
@@ -850,7 +870,7 @@ class MuseSparkRenderer:
         if (
             self._images is not None
             and previous_multi_modal_data is None
-            and self._image_start_id in previous_prompt_ids
+            and self._images.image_start_id in previous_prompt_ids
         ):
             return None
 
@@ -918,11 +938,15 @@ class MuseSparkRenderer:
             is_content=is_content,
             message_roles=[m.get("role") or "" for m in new_messages],
             message_tool_names=extract_message_tool_names(new_messages),
-            multi_modal_data=self._multi_modal_data(
-                cast(list[dict[str, Any]], new_messages),
-                token_ids,
-                start=len(previous_ids),
-                previous=previous_multi_modal_data,
+            multi_modal_data=(
+                None
+                if self._images is None
+                else self._images.multi_modal_data(
+                    cast(list[dict[str, Any]], new_messages),
+                    token_ids,
+                    start=len(previous_ids),
+                    previous=previous_multi_modal_data,
+                )
             ),
         )
 

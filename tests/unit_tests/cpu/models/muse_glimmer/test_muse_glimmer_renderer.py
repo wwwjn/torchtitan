@@ -21,10 +21,13 @@ from __future__ import annotations
 
 import os
 
+import numpy as np
 import pytest
+from PIL import Image
 from pydantic import ValidationError
 from renderers import CustomRendererConfig
 
+from torchtitan.components.data.multimodal.image_loader import IMAGE_SPECS, ImageLoader
 from torchtitan.components.renderer import from_renderers
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.models.muse_glimmer.renderer import (
@@ -560,3 +563,114 @@ def test_rejects_incompatible_tokenizer(tokenizer):
 
     with pytest.raises(ValueError, match="not compatible"):
         MuseGlimmerRenderer(Shifted(tokenizer), MuseGlimmerRendererConfig())
+
+
+@pytest.fixture
+def image_paths(tmp_path):
+    paths = []
+    for name, (width, height) in (("a.png", (300, 200)), ("b.png", (90, 150))):
+        path = tmp_path / "imgs" / name
+        path.parent.mkdir(exist_ok=True)
+        pixels = np.random.default_rng(len(paths)).integers(
+            0, 256, size=(height, width, 3), dtype=np.uint8
+        )
+        Image.fromarray(pixels).save(path)
+        paths.append(str(path))
+    return paths
+
+
+@pytest.fixture
+def images():
+    return ImageLoader.Config(spec=IMAGE_SPECS["muse_spark"])
+
+
+def _image_message(*parts):
+    return {
+        "role": "user",
+        "content": [
+            {"type": "image", "path": part}
+            if part.endswith(".png")
+            else {"type": "text", "text": part}
+            for part in parts
+        ],
+    }
+
+
+def test_images_render_the_processor_expansion(tokenizer, image_paths, images):
+    """Token ids equal the chat template + MuseGlimmerProcessor, which expands the
+    template's <|patch|> into <|image_start|> + N x <|patch|> + <|image_end|>."""
+    processing = pytest.importorskip(
+        "transformers.models.muse_glimmer.processing_muse_glimmer"
+    )
+    from transformers.models.muse_glimmer.image_processing_muse_glimmer import (
+        MuseGlimmerImageProcessor,
+    )
+    from transformers.models.muse_glimmer.video_processing_muse_glimmer import (
+        MuseGlimmerVideoProcessor,
+    )
+
+    paths = image_paths
+    loader = images.build()
+    processor = processing.MuseGlimmerProcessor(
+        image_processor=MuseGlimmerImageProcessor(),
+        video_processor=MuseGlimmerVideoProcessor(),
+        tokenizer=tokenizer,
+        chat_template=tokenizer.chat_template,
+    )
+    renderer = _renderer(tokenizer, current_date="2026-02-03", images=images)
+    messages = [_image_message("Compare", paths[0], paths[1], "Same scene?")]
+
+    text = processor.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=False, current_date="2026-02-03"
+    )
+    expected = processor(
+        text=[text],
+        images=[Image.open(path).convert("RGB") for path in paths],
+        add_special_tokens=False,  # the template starts with <|begin_of_text|>
+    )
+    rendered = renderer.render(messages, add_generation_prompt=True)
+
+    assert renderer.is_multimodal
+    assert rendered.token_ids == expected["input_ids"][0]
+    data = rendered.multi_modal_data
+    assert data.mm_hashes["image"] == [loader.lookup(path).key for path in paths]
+    grids = [item["image_grid_thw"].tolist()[0] for item in data.mm_items["image"]]
+    assert grids == [list(grid) for grid in expected["image_grid_thw"]]
+    for placeholder, grid in zip(data.mm_placeholders["image"], grids):
+        patches = rendered.token_ids[
+            placeholder.offset - 1 : placeholder.offset + placeholder.length + 1
+        ]
+        assert patches == [200080] + [200092] * (grid[1] * grid[2] // 4) + [200081]
+
+
+def test_bridge_places_new_images_after_previous_ones(tokenizer, image_paths, images):
+    paths = image_paths
+    renderer = _renderer(tokenizer, current_date="2026-02-03", images=images)
+    history = [_image_message(paths[0], "What is this?")]
+    first = renderer.render(history, add_generation_prompt=True)
+    completion = tokenizer.encode(
+        " to=user<|message|>A street.<|eot|>", add_special_tokens=False
+    )
+    follow_up = _image_message("And this?", paths[1])
+
+    bridged = renderer.bridge_to_next_turn(
+        first.token_ids,
+        completion,
+        [follow_up],
+        previous_multi_modal_data=first.multi_modal_data,
+    )
+
+    full = renderer.render(
+        [*history, {"role": "assistant", "content": "A street."}, follow_up],
+        add_generation_prompt=True,
+    )
+    assert bridged is not None and bridged.token_ids == full.token_ids
+    for field in ("mm_hashes", "mm_placeholders"):
+        assert getattr(bridged.multi_modal_data, field) == getattr(
+            full.multi_modal_data, field
+        )
+    assert len(full.multi_modal_data.mm_hashes["image"]) == 2
+    # Without the previous images the bridge cannot place them: re-render.
+    assert (
+        renderer.bridge_to_next_turn(first.token_ids, completion, [follow_up]) is None
+    )
