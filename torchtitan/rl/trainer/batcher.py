@@ -21,13 +21,15 @@ from typing import Any
 import numpy as np
 import torch
 
+from torchtitan.components.data.multimodal.image_loader import ImageLoader
+from torchtitan.components.data.multimodal.mrope import get_mrope_positions
 from torchtitan.components.data.types import TokenizedTrainingMicrobatch
 
 from torchtitan.config import Configurable
 from torchtitan.models.deepseek_v3.mtp import get_mtp_token_counts
 from torchtitan.observability import structured_logger as sl
 from torchtitan.rl.observability import metrics as m
-from torchtitan.rl.rollout.types import RolloutGroup
+from torchtitan.rl.rollout.types import PromptImage, RolloutGroup
 from torchtitan.rl.trainer.rdma_microbatch import RDMAMicrobatch, RegisterRDMAMicrobatch
 from torchtitan.rl.trainer.training_sample_builder import (
     TrainingSample,
@@ -219,6 +221,11 @@ class Batcher(Configurable):
         training_sample_builder: TrainingSampleBuilder.Config = field(
             default_factory=TrainingSampleBuilder.Config
         )
+        images: ImageLoader.Config | None = None
+        """Decodes the samples' image files, with the spec of the renderer's loader and
+        `VLLMEngine.Config.images`. Set it to train on image prompts (Qwen3.5-family
+        models: M-RoPE positions and bank-gather vision inputs). None: text only;
+        samples with images raise."""
 
         def __post_init__(self) -> None:
             if self.num_mtp_layers < 0:
@@ -283,6 +290,7 @@ class Batcher(Configurable):
         # Batches that trainer ranks may still read, oldest first; each buffer keeps its tensor alive until drop().
         self._batches_being_read: deque[list[list[list[RDMAMicrobatch]]]] = deque()
         self._num_batches_registered = 0
+        self._images = config.images.build() if config.images is not None else None
 
     def _record_untrainable_groups(self, *, group_is_trainable: bool) -> None:
         """Fail when consecutive groups cannot contribute one training sample.
@@ -820,7 +828,8 @@ class Batcher(Configurable):
         return num_tokens
 
     # TODO(async-rl): make packing pluggable -- a `Packer` protocol on `Batcher.Config` (e.g. `TextPacker`)
-    #   so callers swap logic per modality (images, ...).
+    #   so callers swap logic per modality, and move the image path (`_image_model_kwargs`, the
+    #   `images` branches) into an image packer.
     def _pack_training_samples(
         self, training_samples: list[TrainingSample]
     ) -> TrainingMicrobatch:
@@ -869,7 +878,8 @@ class Batcher(Configurable):
             padding_mask.append(np.arange(sample_len) >= unpadded_len)
 
         num_tokens_per_rank = self._num_rows_per_microbatch * self.seq_len
-        pad_len = num_tokens_per_rank - sum(map(len, positions))
+        sample_lens = [len(sample_positions) for sample_positions in positions]
+        pad_len = num_tokens_per_rank - sum(sample_lens)
         assert pad_len >= 0
         if pad_len > 0:
             for key in keys:
@@ -893,6 +903,16 @@ class Batcher(Configurable):
             padding_mask=padding_mask_tensor,
             num_mtp_layers=self._num_mtp_layers,
         )
+        model_kwargs = {}
+        if self._images is not None:
+            model_kwargs = self._image_model_kwargs(
+                training_samples, sample_lens=sample_lens, positions=positions_tensor
+            )
+        elif any(sample.images for sample in training_samples):
+            raise ValueError(
+                "Training samples have images, but Batcher.Config.images is None; set it "
+                "to the image loader the renderer and the generator use."
+            )
         return TrainingMicrobatch(
             input=packed["input_ids"],
             labels=packed["labels"],
@@ -906,7 +926,97 @@ class Batcher(Configurable):
             padding_mask=padding_mask_tensor,
             loss_token_counts=loss_token_counts,
             routing_token_counts=routing_token_counts,
+            model_kwargs=model_kwargs,
         )
+
+    def _image_model_kwargs(
+        self,
+        training_samples: list[TrainingSample],
+        *,
+        sample_lens: list[int],
+        positions: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Return a packed microbatch's image inputs: each distinct image once, the bank row of
+        every placeholder token, and 3D M-RoPE positions. Empty when no sample has images.
+
+        The samples of a GRPO group show the same images, so the microbatch's vision bank holds
+        each distinct image once and every placeholder token names its bank row
+        (``image_vision_bank_indices_T``, -1 for text); the model gathers from the bank instead
+        of encoding the image once per sample. ``mrope_positions`` restart per sample, like
+        ``positions``; text and padding repeat the 1D position on all three axes. Without
+        images the model uses ``positions`` (the same values) and runs its dummy vision
+        forward, so every DP rank still runs the encoder.
+
+        Example: two samples of one group, 6 input tokens each, image k (3 tokens) at offset 1:
+
+            input tokens                 t  k  k  k  t  t | t  k  k  k  t  t
+            image_vision_bank_indices_T -1  0  1  2 -1 -1 |-1  0  1  2 -1 -1
+            pixel_values                 patches of k, once
+
+        Args:
+            training_samples: The packed samples, in packing order.
+            sample_lens: Packed length of each sample (input tokens + alignment padding).
+            positions: The microbatch's packed 1D positions, padding included.
+        """
+        assert self._images is not None
+        if not any(sample.images for sample in training_samples):
+            return {}
+        bank_rows = np.full(len(positions), -1, dtype=np.int64)
+        bank_start_by_key: dict[str, int] = {}
+        bank_images: list[PromptImage] = []
+        num_bank_rows = 0
+        mrope_positions = positions.unsqueeze(1).repeat(1, 3)
+        start = 0
+        for training_sample, sample_len in zip(
+            training_samples, sample_lens, strict=True
+        ):
+            for image in training_sample.images:
+                if image.key not in bank_start_by_key:
+                    bank_start_by_key[image.key] = num_bank_rows
+                    bank_images.append(image)
+                    num_bank_rows += image.length
+                bank_start = bank_start_by_key[image.key]
+                token = start + image.offset
+                bank_rows[token : token + image.length] = np.arange(
+                    bank_start, bank_start + image.length
+                )
+            if training_sample.images:
+                mrope_positions[start : start + sample_len] = get_mrope_positions(
+                    sample_len,
+                    [
+                        (image.offset, image.grid_thw)
+                        for image in training_sample.images
+                    ],
+                    spatial_merge_size=self._images.spec.merge_size,
+                )
+            start += sample_len
+        pixel_values, grid_thw = self._images.load_pixel_values(
+            [image.data for image in bank_images]
+        )
+        self._check_grids(bank_images, grid_thw)
+        return {
+            "mrope_positions": mrope_positions,
+            "pixel_values": pixel_values,
+            "grid_thw": grid_thw,
+            "image_vision_bank_indices_T": torch.from_numpy(bank_rows),
+        }
+
+    def _check_grids(self, images: list[PromptImage], grid_thw: torch.Tensor) -> None:
+        """Raise unless the pixels loaded for ``images`` have the grids the renderer saw.
+
+        Bank rows follow ``image.length`` and M-RoPE positions ``image.grid_thw`` (the
+        renderer's source), pixels this batcher's source; the bank gather does not check them.
+        """
+        assert self._images is not None
+        merge = self._images.spec.merge_size
+        for image, (t, h, w) in zip(images, grid_thw.tolist(), strict=True):
+            if (t, h, w) != image.grid_thw or t * h * w // merge**2 != image.length:
+                raise ValueError(
+                    f"Image {image.key} ({image.path}): the prompt has grid "
+                    f"{image.grid_thw} ({image.length} tokens), the batcher loaded "
+                    f"{(t, h, w)}; the renderer and the batcher must use image loaders "
+                    "with the same spec."
+                )
 
     def _padding_fraction(
         self,
@@ -931,7 +1041,28 @@ class Batcher(Configurable):
             num_microbatches=len(assignments),
             training_samples=training_samples,
         )
+        image_metrics = []
+        if self._images is not None:
+            # Images the trainer encodes (once per microbatch) vs images the samples show.
+            num_encoded_images = sum(
+                len({image.key for sample in bin_ for image in sample.images})
+                for row in assignments
+                for bin_ in row
+            )
+            image_metrics = [
+                m.Metric(
+                    "train_batch/num_sample_images",
+                    m.NoReduce(
+                        float(sum(len(sample.images) for sample in training_samples))
+                    ),
+                ),
+                m.Metric(
+                    "train_batch/num_encoded_images",
+                    m.NoReduce(float(num_encoded_images)),
+                ),
+            ]
         return [
+            *image_metrics,
             m.Metric(
                 "train_batch/padding_frac",
                 m.NoReduce(padding_frac),
