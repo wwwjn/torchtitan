@@ -10,6 +10,7 @@ Handles image decoding, resizing, normalization, and patch extraction for the
 vision encoder.
 """
 
+import itertools
 import logging
 import math
 from collections.abc import Callable
@@ -197,6 +198,61 @@ def resize_to_navit_patch_grid(
     pad_h = (factor - h % factor) % factor
     pad_w = (factor - w % factor) % factor
     return h, w, pad_h, pad_w
+
+
+def resize_to_merged_patch_grid(
+    height: int,
+    width: int,
+    *,
+    patch_size: int,
+    merge_size: int,
+    max_image_tokens: int = 4096,
+    **_: object,
+) -> tuple[int, int, int, int]:
+    """Select the merged-patch grid closest in aspect ratio, within ``max_image_tokens``
+    merged tokens, and resize to it (Muse Spark / Glimmer convention). Small images are
+    upscaled to at least one merged patch per side; no padding is needed.
+
+    A resize strategy (``resize_fn``) for ``process_image`` -- extra budget kwargs
+    (e.g. ``min_pixels``) are accepted and ignored via ``**_``.
+
+    Returns:
+        ``(resize_h, resize_w, 0, 0)``, both multiples of ``patch_size * merge_size``.
+    """
+    merged_patch_size = patch_size * merge_size
+    ideal_grid_h = height / merged_patch_size
+    ideal_grid_w = width / merged_patch_size
+    aspect_ratio = ideal_grid_w / ideal_grid_h if ideal_grid_h > 0 else 1.0
+    if ideal_grid_h * ideal_grid_w > max_image_tokens:
+        ideal_grid_h = math.sqrt(max_image_tokens / aspect_ratio)
+        ideal_grid_w = ideal_grid_h * aspect_ratio
+
+    candidates = list(
+        set(
+            itertools.product(
+                [math.floor(ideal_grid_h), math.ceil(ideal_grid_h)],
+                [math.floor(ideal_grid_w), math.ceil(ideal_grid_w)],
+            )
+        )
+    )
+    candidates = [
+        (grid_h, grid_w)
+        for grid_h, grid_w in candidates
+        if grid_h >= 1 and grid_w >= 1 and grid_h * grid_w <= max_image_tokens
+    ]
+    if not candidates:
+        candidates = [(max(1, round(ideal_grid_h)), max(1, round(ideal_grid_w)))]
+
+    grid_h, grid_w = min(
+        candidates,
+        key=lambda grid: abs(grid[0] / grid[1] - height / width),
+    )
+    return (
+        grid_h * merged_patch_size,
+        grid_w * merged_patch_size,
+        0,
+        0,
+    )
 
 
 def decode_and_resize_image(
