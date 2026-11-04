@@ -12,8 +12,10 @@ import torch
 from PIL import Image
 
 from torchtitan.components.data.multimodal.image_loader import (
+    decode_flat,
     ImageLoader,
     ImageSpec,
+    patchify,
     read_image_file,
 )
 from torchtitan.components.data.multimodal.utils.image import (
@@ -44,7 +46,8 @@ def test_patches_and_header_grids_match_process_image(image_paths) -> None:
     loader = ImageLoader.Config(spec=spec).build()
 
     images = [loader.lookup(path) for path in image_paths]
-    pixel_values, grid_thw = loader.load_pixel_values([image.data for image in images])
+    pixel_values = patchify(loader.load_images([image.data for image in images]), spec)
+    grid_thw = torch.tensor([image.grid_thw for image in images])
 
     expected = [
         vision_to_patches(
@@ -89,6 +92,26 @@ def test_read_image_file_shares_the_bytes_and_rejects_a_changed_file(
     shutil.copy(image_paths[1], image_paths[2])
     with pytest.raises(ValueError, match="changed after it was rendered"):
         read_image_file(rendered.path, rendered.key)
+
+
+def test_decode_flat_matches_load_images_and_checks_grids(image_paths) -> None:
+    loader = ImageLoader.Config().build()
+    images = [loader.lookup(path) for path in image_paths]
+    files = torch.frombuffer(
+        bytearray(b"".join(image.data for image in images)), dtype=torch.uint8
+    )
+    sizes = [len(image.data) for image in images]
+    grids = [list(image.grid_thw) for image in images]
+    expected = torch.cat(
+        [
+            image.flatten()
+            for image in loader.load_images([image.data for image in images])
+        ]
+    )
+    assert torch.equal(decode_flat(files, sizes, grids, loader.spec), expected)
+    grids[1][1] += 1
+    with pytest.raises(ValueError, match="decodes to grid"):
+        decode_flat(files, sizes, grids, loader.spec)
 
 
 def test_largest_grid() -> None:

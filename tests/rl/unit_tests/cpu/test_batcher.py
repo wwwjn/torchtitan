@@ -13,7 +13,11 @@ import numpy as np
 import pytest
 import torch
 from PIL import Image
-from torchtitan.components.data.multimodal.image_loader import ImageLoader, ImageSpec
+from torchtitan.components.data.multimodal.image_loader import (
+    ImageLoader,
+    ImageSpec,
+    patchify,
+)
 from torchtitan.components.data.multimodal.mrope import get_mrope_positions
 from torchtitan.rl.rollout.types import PromptImage, RolloutTurnID
 
@@ -329,8 +333,20 @@ def test_microbatch_encodes_each_distinct_image_once(loader, image_paths) -> Non
     microbatch = batcher._pack_training_samples(samples)
     kwargs = microbatch.model_kwargs
 
-    pixel_values, grid_thw = loader.load_pixel_values([image_a.data, image_b.data])
-    assert torch.equal(kwargs["pixel_values"], pixel_values)
+    # The batcher ships the image files once each; moving the inputs to the trainer's
+    # device decodes and patchifies them into the model's pixel_values.
+    pixel_values = patchify(
+        loader.load_images([image_a.data, image_b.data]), loader.spec
+    )
+    grid_thw = torch.tensor([image_a.grid_thw, image_b.grid_thw])
+    assert bytes(kwargs["image_files"].numpy()) == image_a.data + image_b.data
+    assert kwargs["image_file_sizes"].tolist() == [
+        len(image_a.data),
+        len(image_b.data),
+    ]
+    input_dict = microbatch.to_input_dict("cpu")
+    assert "image_files" not in input_dict and "image_file_sizes" not in input_dict
+    assert torch.equal(input_dict["pixel_values"], pixel_values)
     assert torch.equal(kwargs["grid_thw"], grid_thw)
     rows = kwargs["image_vision_bank_indices_T"].tolist()
     a_rows = list(range(image_a.length))
@@ -377,7 +393,7 @@ def test_text_microbatch_in_image_mode_has_no_image_inputs(loader) -> None:
     assert microbatch.model_kwargs == {}
 
 
-def test_image_samples_need_an_image_source(loader, image_paths) -> None:
+def test_image_samples_need_an_image_loader(loader, image_paths) -> None:
     image = _prompt_image(loader, image_paths[0], offset=1)
     batcher = _image_batcher(None, num_tokens=64)
 
@@ -385,12 +401,54 @@ def test_image_samples_need_an_image_source(loader, image_paths) -> None:
         batcher._pack_training_samples([_image_sample(0, [image], 12)])
 
 
-def test_image_grid_must_match_the_batcher_source(loader, image_paths) -> None:
+def test_image_grid_must_match_the_batcher_loader(loader, image_paths) -> None:
     image = _prompt_image(loader, image_paths[0], offset=1)
     t, h, w = image.grid_thw
-    # The renderer's source had another spec: another grid for the same image.
-    image = dataclasses.replace(image, grid_thw=(t, h + 2, w))
+    # The renderer's loader had another spec: another grid (and its placeholder count) for
+    # the same image.
+    image = dataclasses.replace(
+        image, grid_thw=(t, h + 2, w), length=t * (h + 2) * w // 4
+    )
+    batcher = _image_batcher(ImageLoader.Config(spec=_IMAGE_SPEC), num_tokens=64)
+    microbatch = batcher._pack_training_samples([_image_sample(0, [image], 12)])
+
+    # The trainer decodes the file and finds the batcher spec's grid.
+    with pytest.raises(ValueError, match="same spec"):
+        microbatch.to_input_dict("cpu")
+
+
+def test_placeholder_count_must_match_the_grid(loader, image_paths) -> None:
+    image = _prompt_image(loader, image_paths[0], offset=1)
+    # Bank rows follow the placeholder count, the vision encoder's outputs the grid.
+    image = dataclasses.replace(image, length=image.length - 1)
     batcher = _image_batcher(ImageLoader.Config(spec=_IMAGE_SPEC), num_tokens=64)
 
-    with pytest.raises(ValueError, match="same spec"):
+    with pytest.raises(ValueError, match="placeholders"):
         batcher._pack_training_samples([_image_sample(0, [image], 12)])
+
+
+def test_packing_keeps_samples_of_an_image_together(loader, image_paths) -> None:
+    # Two groups of three samples, one image per group: each group fits one microbatch.
+    batcher = Batcher.Config(images=ImageLoader.Config(spec=_IMAGE_SPEC)).build(
+        num_tokens_per_microbatch_per_dp_rank=64,
+        max_context_length=64,
+        num_prompts_per_train_step=1,
+        dp_degree=2,
+        pad_id=0,
+        temperature=1.0,
+    )
+    images = [_prompt_image(loader, path, offset=1) for path in image_paths]
+    samples = []
+    for group, image in enumerate(images):
+        samples += [
+            _image_sample(3 * group + index, [image], 18 + index * 2 - group)
+            for index in range(3)
+        ]
+
+    [row] = batcher._assign_training_samples_to_microbatches(samples)
+
+    keys_per_microbatch = sorted(
+        sorted({image.key for sample in bin_ for image in sample.images})
+        for bin_ in row
+    )
+    assert keys_per_microbatch == sorted([[image.key] for image in images])
