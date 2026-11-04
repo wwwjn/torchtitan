@@ -89,3 +89,14 @@ def test_read_image_file_shares_the_bytes_and_rejects_a_changed_file(
     shutil.copy(image_paths[1], image_paths[2])
     with pytest.raises(ValueError, match="changed after it was rendered"):
         read_image_file(rendered.path, rendered.key)
+
+
+def test_largest_grid() -> None:
+    loader = ImageLoader.Config(
+        spec=ImageSpec(min_pixels=32 * 32, max_pixels=256 * 256)
+    ).build()
+    # 256 x 256 pixels in 32-pixel merged tokens: at most 8 x 8 = 64 tokens.
+    assert loader.largest_grid(10_000) == (1, 16, 16)
+    assert loader.largest_grid(20) == (1, 8, 8)
+    with pytest.raises(ValueError, match="fits"):
+        loader.largest_grid(0)

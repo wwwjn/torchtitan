@@ -117,6 +117,7 @@ from torchtitan.rl.controller.work_buffer import (
     RolloutGroupWorkBuffer,
 )
 from torchtitan.rl.generator.generator import Generator
+from torchtitan.rl.generator.rdma_prompt_image import RDMAPromptImage
 from torchtitan.rl.generator.types import SamplingConfig
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout import RolloutGroup
@@ -307,6 +308,15 @@ class Controller(Configurable):
         )
         """Generator routing strategy configuration."""
 
+        rdma_min_image_bytes: int | None = None
+        """Send prompt image files of at least this many bytes from the rollout workers to
+        generator rank 0 as RDMA buffers (the actor system's `RDMAPromptImage`), not in the
+        `generate` RPC:
+            None (default): every file in the RPC.
+            e.g. 1024: files >= 1 KiB stay in the rollout worker until `generate` returns.
+        Like `Batcher.Config.rdma_min_tensor_bytes` for trainer microbatches, on the same
+        transport."""
+
         actor_system: ActorSystem.Config = field(
             default_factory=_default_actor_system_config
         )
@@ -339,6 +349,11 @@ class Controller(Configurable):
                 logger.info(f"Saved job configs to {config_file}")
 
         def __post_init__(self):
+            if self.rdma_min_image_bytes is not None and self.rdma_min_image_bytes < 1:
+                raise ValueError(
+                    "rdma_min_image_bytes must be None or >= 1 (RDMABuffer rejects empty "
+                    f"buffers), got {self.rdma_min_image_bytes}"
+                )
             # Compare built model classes, not config types: a trainer-only
             # transform such as LoRA may swap in a config subclass.
             trainer_model_cls = self.trainer.model._owner
@@ -530,6 +545,11 @@ class Controller(Configurable):
         # `self`. A GenerateFn may be shipped to another process, where an actor
         # handle serializes cheaply and the whole controller does not.
         generator_router = self.generator_router
+        rdma_min_image_bytes = self.config.rdma_min_image_bytes
+        register_rdma_image = None
+        if rdma_min_image_bytes is not None:
+            assert self.actor_system is not None
+            register_rdma_image = self.actor_system.register_rdma_prompt_image
 
         @sl.log_trace_span("generate")
         async def generate(
@@ -541,15 +561,37 @@ class Controller(Configurable):
             sampling_config: SamplingConfig | None = None,
             images: tuple[PromptImage, ...] = (),
         ) -> Completion | None:
-            return await generator_router.generate.call_one(
-                prompt_token_ids,
-                request_id=request_id,
-                group_id=group_id,
-                routing_session_id=routing_session_id,
-                sampling_config=sampling_config,
-                metrics_prefix=metrics_prefix,
-                images=images,
-            )
+            sent: list[PromptImage | RDMAPromptImage] = []
+            try:
+                for image in images:
+                    if (
+                        register_rdma_image is not None
+                        and len(image.data) >= rdma_min_image_bytes
+                    ):
+                        # On the loop thread, which holds the CUDA context registration
+                        # makes; it blocks ~0.65 ms per file (TCP).
+                        sent.append(register_rdma_image(image))
+                    else:
+                        sent.append(image)
+                return await generator_router.generate.call_one(
+                    prompt_token_ids,
+                    request_id=request_id,
+                    group_id=group_id,
+                    routing_session_id=routing_session_id,
+                    sampling_config=sampling_config,
+                    metrics_prefix=metrics_prefix,
+                    images=tuple(sent),
+                )
+            finally:
+                # Rank 0 has read every buffer once `generate` returns or raises. A cancelled
+                # call drops them too; a read rank 0 is still doing then fails, for no caller.
+                await asyncio.gather(
+                    *(
+                        image.drop()
+                        for image in sent
+                        if isinstance(image, RDMAPromptImage)
+                    )
+                )
 
         return generate
 

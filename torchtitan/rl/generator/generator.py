@@ -8,9 +8,11 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -31,11 +33,18 @@ from torchtitan.rl.generator.dispatcher import RequestDispatcher
 from torchtitan.rl.generator.engine import GenerationEngine
 from torchtitan.rl.generator.engine_loop import EngineLoop, EngineLoopThread
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
+from torchtitan.rl.generator.rdma_prompt_image import (
+    RDMAPromptImage,
+    read_prompt_images,
+)
 from torchtitan.rl.generator.types import EngineRequest, SamplingConfig
 from torchtitan.rl.rollout.types import Completion, PromptImage
 from torchtitan.rl.routing.intra_generator import IntraGeneratorRouter
 
 logger = logging.getLogger(__name__)
+
+# Image files `Generator.generate` keeps one bytes object of, newest first.
+_NUM_SHARED_IMAGE_FILES = 64
 
 
 def _default_engine_config() -> GenerationEngine.Config:
@@ -206,6 +215,8 @@ class Generator(Configurable):
         sl.log_trace_instant("structured_logger_started")
 
         self.config = config
+        # Content key -> one bytes object for the file, so a decision's requests share it.
+        self._image_files: OrderedDict[str, bytes] = OrderedDict()
 
         self._rank = rank if rank is not None else int(os.environ.get("RANK", "0"))
         dp_degree = config.parallelism.data_parallel_degree
@@ -347,7 +358,7 @@ class Generator(Configurable):
         routing_session_id: str,
         sampling_config: SamplingConfig | None = None,
         metrics_prefix: str = "generator",
-        images: tuple[PromptImage, ...] = (),
+        images: tuple[PromptImage | RDMAPromptImage, ...] = (),
     ) -> Completion:
         """Generates one completion for one prompt.
 
@@ -372,7 +383,9 @@ class Generator(Configurable):
                 `Completion` (default ``"generator"``). Callers that need to keep streams
                 separate, e.g. ``"validation/generator"``, can override it.
             images: Images whose placeholder tokens appear in `prompt_token_ids`, with their
-                files' bytes; the engine decodes the files.
+                files' bytes, or as `RDMAPromptImage`s
+                (``Controller.Config.rdma_min_image_bytes``), read here; the engine decodes
+                the files.
 
         Example:
 
@@ -397,10 +410,27 @@ class Generator(Configurable):
                 group_id=group_id,
                 routing_session_id=routing_session_id,
                 arrival_time=time.time(),
-                images=images,
+                images=self._share_image_files(await read_prompt_images(images)),
             ),
             metrics_prefix=metrics_prefix,
         )
+
+    def _share_image_files(
+        self, images: tuple[PromptImage, ...]
+    ) -> tuple[PromptImage, ...]:
+        """Return ``images`` with one bytes object per image file across requests.
+
+        The samples of a group arrive as separate calls with copies of the same files; sharing
+        one object lets the engine loop's decision broadcast to TP ranks pickle each file once.
+        """
+        shared = []
+        for image in images:
+            data = self._image_files.pop(image.key, image.data)
+            self._image_files[image.key] = data
+            if len(self._image_files) > _NUM_SHARED_IMAGE_FILES:
+                self._image_files.popitem(last=False)
+            shared.append(dataclasses.replace(image, data=data))
+        return tuple(shared)
 
     async def release_groups(self, group_ids: list[int]) -> None:
         """Drop the pinned cache salts and the held KV of finished rollout groups.
