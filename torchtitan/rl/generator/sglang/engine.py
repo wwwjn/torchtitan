@@ -24,14 +24,17 @@ SGLang's own TP schedulers do after rank 0 broadcasts the inputs.
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import os
 import shutil
 import sys
 import tempfile
+import time
 from array import array
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -78,8 +81,16 @@ _OWNED_SERVER_ARGS = frozenset(
         "schedule_low_priority_values_first",
         "load_format",
         "enable_session_radix_cache",
+        "cuda_graph_config",
+        "disable_chunked_prefix_cache",
+        "bf16_gemm_backend",
+        "enable_mixed_chunk",
     }
 )
+
+# Most tokens a step runs when the generator sets no max_num_batched_tokens: vLLM's
+# default, which also bounds its FULL CUDA graphs.
+_DEFAULT_MAX_NUM_BATCHED_TOKENS = 2048
 
 
 @dataclass(kw_only=True, slots=True)
@@ -103,11 +114,25 @@ class _OutputCollector:
     def __init__(self) -> None:
         self._outputs: dict[str, _OutputAccumulator] = {}
         self._finished: list[FinishedRequest] = []
+        self._arrival_ts: dict[str, float] = {}
+
+    def set_arrival_time(self, request_id: str, arrival_time: float) -> None:
+        """Record a request's ``EngineRequest.arrival_time`` (wall clock) on the
+        scheduler's ``time.perf_counter`` clock, so its TTFT counts the time it waited
+        in the generator before admission, as vLLM's does."""
+        self._arrival_ts[request_id] = time.perf_counter() - (
+            time.time() - arrival_time
+        )
 
     def send_output(self, payload, *args, **kwargs) -> None:
         rids = getattr(payload, "rids", None)
         if rids is None:
             return
+        # In-process, SGLang's pickle IPC (its default) hands over the requests' live
+        # SchedulerReqTimeStats; over msgpack IPC they arrive empty.
+        time_stats = getattr(payload, "time_stats", None)
+        if not isinstance(time_stats, list):
+            time_stats = None
         for i, rid in enumerate(rids):
             output = self._outputs.setdefault(rid, _OutputAccumulator())
             output.token_ids.extend(payload.output_ids[i])
@@ -118,14 +143,21 @@ class _OutputCollector:
             if finished_reason is None:
                 continue
             del self._outputs[rid]
+            arrival_ts = self._arrival_ts.pop(rid, None)
             self._finished.append(
                 FinishedRequest(
                     request_id=rid,
                     token_ids=output.token_ids,
                     token_logprobs=output.token_logprobs,
                     finish_reason=_finish_reason(finished_reason),
-                    metrics_inputs=RequestMetricsInputs(
-                        num_cached_tokens=output.num_cached_tokens, has_stats=False
+                    metrics_inputs=_request_metrics_inputs(
+                        output,
+                        time_stats[i] if time_stats is not None else None,
+                        arrival_ts,
+                        (
+                            getattr(payload, "retraction_counts", None)
+                            or [0] * len(rids)
+                        )[i],
                     ),
                 )
             )
@@ -133,6 +165,32 @@ class _OutputCollector:
     def pop_finished(self) -> list[FinishedRequest]:
         finished, self._finished = self._finished, []
         return finished
+
+
+def _request_metrics_inputs(
+    output: _OutputAccumulator,
+    stats: Any,
+    arrival_ts: float | None,
+    num_retractions: int,
+) -> RequestMetricsInputs:
+    """The vLLM ``RequestStateStats`` fields the generator's metrics read, from SGLang's
+    scheduler timestamps: waiting-queue entry, first forward, end of prefill (the
+    first token) and completion."""
+    if stats is None or arrival_ts is None or not stats.prefill_finished_time:
+        return RequestMetricsInputs(
+            num_cached_tokens=output.num_cached_tokens, has_stats=False
+        )
+    return RequestMetricsInputs(
+        num_cached_tokens=output.num_cached_tokens,
+        has_stats=True,
+        queued_ts=stats.wait_queue_entry_time,
+        scheduled_ts=stats.forward_entry_time,
+        first_token_ts=stats.prefill_finished_time,
+        last_token_ts=stats.completion_time or stats.prefill_finished_time,
+        first_token_latency=stats.prefill_finished_time - arrival_ts,
+        num_generation_tokens=len(output.token_ids),
+        num_preemptions=num_retractions,
+    )
 
 
 def _finish_reason(finished_reason: dict[str, Any]) -> str:
@@ -154,7 +212,25 @@ class SGLangEngine(GenerationEngine):
     @dataclass(kw_only=True, slots=True)
     class Config(GenerationEngine.Config):
         enable_cuda_graph: bool = False
-        """Capture SGLang's decode CUDA graphs. Off: every step runs eager."""
+        """Capture full CUDA graphs of decode and prefill steps, as vLLM's FULL CUDA
+        graph mode does. Decode graphs cover up to ``max_num_seqs`` requests. Prefill
+        graphs cover token buckets (powers of two) up to ``max_num_batched_tokens``
+        with ``max_num_seqs`` request slots. Off: every step runs eager."""
+
+        overlap_schedule: bool = True
+        """Overlap the scheduler's CPU work with the GPU, as SGLang's server does by
+        default: a step launches its batch's forward, then processes the previous
+        batch's results while the forward runs, so ``step()`` returns the requests
+        that finished one step earlier. Off: a step runs its batch and processes its
+        results before it returns, leaving the GPU idle during that CPU work."""
+
+        share_group_prefill: bool = True
+        """Prefill a group's shared prompt once. Requests of one group with the same
+        prompt (GRPO samples) wait until the first one's prefill is done, then read
+        the prompt's KV from the radix cache and prefill only their last token. A
+        prefill batch otherwise computes the prompt once per sample: SGLang adds a
+        prompt to its radix cache after the batch that computes it. Needs the radix
+        cache (not GDN models)."""
 
         page_size: int | None = None
         """KV page size in tokens. None: 256 with FA2 (SM < 9.0), which requires a
@@ -210,8 +286,6 @@ class SGLangEngine(GenerationEngine):
             raise NotImplementedError(
                 "SGLangEngine does not support sequence parallelism"
             )
-        if dist_moe_runtime is not None:
-            raise NotImplementedError("SGLangEngine does not support Dist-MoE yet")
         attention = model.first_full_attention
         if attention is None or not isinstance(
             attention.inner_attention, VarlenInnerAttention.Config
@@ -251,7 +325,10 @@ class SGLangEngine(GenerationEngine):
         )
 
         register_to_sglang(
-            model, parallelism=parallelism, checkpointer_config=checkpointer
+            model,
+            parallelism=parallelism,
+            checkpointer_config=checkpointer,
+            dist_moe_runtime=dist_moe_runtime,
         )
         page_size = config.page_size
         if page_size is None:
@@ -283,20 +360,38 @@ class SGLangEngine(GenerationEngine):
             mem_fraction_static=gpu_memory_limit,
             max_running_requests=max_num_seqs,
             context_length=model.max_context_length,
-            disable_cuda_graph=not config.enable_cuda_graph,
-            # The generator steps the scheduler synchronously.
-            disable_overlap_schedule=True,
+            disable_overlap_schedule=not config.overlap_schedule,
             # The TorchTitan model's collectives run on its own process groups; SGLang's
             # custom all-reduce would only cost its startup (a kernel JIT build).
             disable_custom_all_reduce=True,
+            # The TorchTitan model runs its own linears. On SM100 SGLang's default
+            # ("cutedsl") imports FlashInfer GEMM kernels newer than the FlashInfer
+            # the vLLM nightly pins.
+            bf16_gemm_backend="torch",
+            # Run the running requests' decode tokens in the same step as a prefill
+            # chunk, as vLLM's scheduler does, instead of pausing them for a
+            # prefill-only step. With steady arrivals (multi-turn rollouts),
+            # prefill-only steps would stall every running request.
+            enable_mixed_chunk=True,
             # Smaller priority runs first, as in the vLLM engine; EngineRequest.group_id
             # explains the order.
             enable_priority_scheduling=True,
             schedule_low_priority_values_first=True,
             log_level="warning",
         )
-        if max_num_batched_tokens is not None:
-            server_args_kwargs["chunked_prefill_size"] = max_num_batched_tokens
+        max_num_batched_tokens = (
+            max_num_batched_tokens or _DEFAULT_MAX_NUM_BATCHED_TOKENS
+        )
+        server_args_kwargs["chunked_prefill_size"] = max_num_batched_tokens
+        if config.enable_cuda_graph:
+            server_args_kwargs.update(
+                _full_cuda_graph_server_args(
+                    max_num_seqs=max_num_seqs,
+                    max_prefill_tokens=max_num_batched_tokens,
+                )
+            )
+        else:
+            server_args_kwargs["disable_cuda_graph"] = True
         if debug.seed is not None:
             server_args_kwargs["random_seed"] = debug.seed
         server_args_kwargs.update(config.extra_server_args)
@@ -320,15 +415,30 @@ class SGLangEngine(GenerationEngine):
         # Sessions admitted on this rank, by group, so a group's release closes its
         # sessions (hold_session_kv).
         self._session_groups: dict[str, int] = {}
+        # share_group_prefill: the first request of each (group, prompt, cache salt)
+        # whose prefill is not done yet, and the requests waiting behind it.
+        self._share_group_prefill = config.share_group_prefill and not (
+            server_args_kwargs.get("disable_radix_cache", False)
+        )
+        self._prefill_heads: dict[tuple, str] = {}
+        self._waiting_siblings: dict[str, list] = {}
+        self._head_reqs: dict[str, Any] = {}
         self._group_sessions: dict[int, set[str]] = {}
         self._scheduler = self._build_scheduler(server_args_kwargs, rank=rank)
         self._install_hooks()
+        # Keep SGLang's ~1.2M startup objects out of later collections, as vLLM's
+        # engine does after its startup (freeze_gc_heap): the engine loop runs a full
+        # gc.collect() after every weight load, which took ~0.9 s per load otherwise.
+        gc.collect()
+        gc.freeze()
 
     def _build_scheduler(self, server_args_kwargs: dict[str, Any], *, rank: int):
         """Build SGLang's scheduler in this process: what ``run_scheduler_process``
         does in SGLang's scheduler child, minus the process setup the launcher owns."""
         from sglang.srt.managers.scheduler import Scheduler
         from sglang.srt.plugins import load_plugins
+
+        _restore_triton_next_power_of_2()
         from sglang.srt.runtime_context import publish, spawn_world_rank, SpawnRanks
         from sglang.srt.server_args import ServerArgs
 
@@ -366,7 +476,24 @@ class SGLangEngine(GenerationEngine):
             dist.new_group(backend="gloo") if self._dp_degree > 1 else None
         )
         logger.info("Initializing SGLang scheduler in-process (rank %d)", rank)
-        return Scheduler(server_args, port_args)
+        scheduler = Scheduler(server_args, port_args)
+        # The scheduler has captured its CUDA graphs.
+        scheduler.tp_worker.model_runner.model.register_cuda_graph_buffers()
+        if scheduler.enable_overlap:
+            # What Scheduler.run_event_loop and event_loop_overlap set up before
+            # their first iteration; step() runs one iteration at a time instead.
+            from sglang.srt.managers.utils import allocate_distinct_stream
+
+            if (
+                scheduler.schedule_stream.cuda_stream
+                == scheduler.forward_stream.cuda_stream
+            ):
+                scheduler.schedule_stream = allocate_distinct_stream(
+                    torch.cuda, (scheduler.forward_stream,)
+                )
+            scheduler._war_barrier_enabled = True
+            scheduler.enable_skip_finishing_decode = True
+        return scheduler
 
     def _install_hooks(self) -> None:
         """Swap in the parity sampler and collect outputs in-process."""
@@ -382,14 +509,17 @@ class SGLangEngine(GenerationEngine):
         model_runner.sampler = self._sampler
 
         # The sampler needs each row's request (for its seeded generator); a
-        # ForwardBatch keeps no reference to the ScheduleBatch it came from.
+        # ForwardBatch keeps no reference to the ScheduleBatch it came from. A batch
+        # that does not finish a request's prefill launches while that request is the
+        # scheduler's chunked_req. Its inflight_middle_chunks count would lag: with
+        # overlap, the previous chunk's result is processed after the next launches.
         tp_worker = scheduler.tp_worker
         forward_batch_generation = tp_worker.forward_batch_generation
         sampler = self._sampler
 
         def forward_batch_generation_with_reqs(batch, *args, **kwargs):
             if batch is not None:
-                sampler.set_batch_reqs(batch.reqs)
+                sampler.set_batch_reqs(batch.reqs, partial_req=scheduler.chunked_req)
             return forward_batch_generation(batch, *args, **kwargs)
 
         tp_worker.forward_batch_generation = forward_batch_generation_with_reqs
@@ -424,59 +554,111 @@ class SGLangEngine(GenerationEngine):
 
         rejected_requests: list[tuple[str, Exception]] = []
         tokenized_requests = []
+        new_heads = []
         for request in requests:
             error = self._validate(request)
             if error is not None:
                 rejected_requests.append((request.request_id, error))
                 continue
+            self._output_collector.set_arrival_time(
+                request.request_id, request.arrival_time
+            )
             sampling_params = _build_sampling_params(request.sampling)
             sampling_params.normalize(None)
             sampling_params.verify(self._vocab_size)
-            tokenized_requests.append(
-                TokenizedGenerateReqInput(
-                    rid=request.request_id,
-                    input_text=None,
-                    input_ids=array("q", request.prompt_token_ids),
-                    input_embeds=None,
-                    mm_inputs=None,
-                    token_type_ids=None,
-                    sampling_params=sampling_params,
-                    return_logprob=True,
-                    logprob_start_len=-1,
-                    top_logprobs_num=0,
-                    token_ids_logprob=None,
-                    stream=False,
-                    priority=max(request.group_id, -1),
-                    cache_salt=(
-                        None
-                        if self._reset_kv_cache_on_model_state_dict_load
-                        else str(request.min_policy_version)
-                    ),
-                    session_id=(
-                        request.routing_session_id
-                        if self.config.hold_session_kv
-                        else None
-                    ),
-                )
+            tokenized_request = TokenizedGenerateReqInput(
+                rid=request.request_id,
+                input_text=None,
+                input_ids=array("q", request.prompt_token_ids),
+                input_embeds=None,
+                mm_inputs=None,
+                token_type_ids=None,
+                sampling_params=sampling_params,
+                return_logprob=True,
+                logprob_start_len=-1,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                stream=False,
+                priority=max(request.group_id, -1),
+                cache_salt=(
+                    None
+                    if self._reset_kv_cache_on_model_state_dict_load
+                    else str(request.min_policy_version)
+                ),
+                session_id=(
+                    request.routing_session_id if self.config.hold_session_kv else None
+                ),
             )
+            if self._share_group_prefill:
+                key = (
+                    request.group_id,
+                    tuple(request.prompt_token_ids),
+                    tokenized_request.cache_salt,
+                )
+                head = self._prefill_heads.get(key)
+                if head is not None:
+                    self._waiting_siblings[head].append(tokenized_request)
+                else:
+                    self._prefill_heads[key] = request.request_id
+                    self._waiting_siblings[request.request_id] = []
+                    new_heads.append(request.request_id)
+                    tokenized_requests.append(tokenized_request)
+            else:
+                tokenized_requests.append(tokenized_request)
             if self.config.hold_session_kv:
                 self._session_groups[request.routing_session_id] = request.group_id
                 self._group_sessions.setdefault(request.group_id, set()).add(
                     request.routing_session_id
                 )
-        if tokenized_requests:
-            self._scheduler.process_input_requests(tokenized_requests)
-            # The generator returns output-token logprobs only. A request that returns
-            # logprobs starts SGLang's input logprobs at its prompt length, so a
-            # retracted request re-prefilling its generated tokens would need input
-            # logprobs for them, which the wrapper does not compute; start them past
-            # any fill. This also lifts the cap SGLang puts on prefix-cache matches
-            # at the logprob start.
-            admitted = {request.rid for request in tokenized_requests}
-            for req in self._scheduler.waiting_queue:
-                if req.rid in admitted:
-                    req.logprob_start_len = sys.maxsize
+        admitted = self._admit(tokenized_requests)
+        for rid in new_heads:
+            # A request the scheduler did not queue (it aborted it) caches nothing.
+            self._head_reqs[rid] = admitted.get(rid) or SimpleNamespace(
+                finished=lambda: True
+            )
+        if new_heads:
+            self._admit_waiting_siblings()
         return rejected_requests
+
+    def _admit(self, tokenized_requests: list) -> dict[str, Any]:
+        """Hand ``tokenized_requests`` to the scheduler; return their ``Req``s by id."""
+        if not tokenized_requests:
+            return {}
+        with self._schedule_stream():
+            self._scheduler.process_input_requests(tokenized_requests)
+        # The generator returns output-token logprobs only. A request that returns
+        # logprobs starts SGLang's input logprobs at its prompt length, so a
+        # retracted request re-prefilling its generated tokens would need input
+        # logprobs for them, which the wrapper does not compute; start them past
+        # any fill. This also lifts the cap SGLang puts on prefix-cache matches
+        # at the logprob start.
+        rids = {request.rid for request in tokenized_requests}
+        admitted = {}
+        for req in self._scheduler.waiting_queue:
+            if req.rid in rids:
+                req.logprob_start_len = sys.maxsize
+                admitted[req.rid] = req
+        return admitted
+
+    def _admit_waiting_siblings(self) -> None:
+        """Admit the siblings of every group request whose prefill is done: the
+        scheduler has cached its prompt once it has an output token."""
+        done = [
+            rid
+            for rid, req in self._head_reqs.items()
+            if req.finished() or len(req.output_ids) > 0
+        ]
+        if not done:
+            return
+        siblings = []
+        for rid in done:
+            del self._head_reqs[rid]
+            siblings += self._waiting_siblings.pop(rid)
+        done_set = set(done)
+        self._prefill_heads = {
+            key: rid for key, rid in self._prefill_heads.items() if rid not in done_set
+        }
+        self._admit(siblings)
 
     def _validate(self, request: EngineRequest) -> Exception | None:
         """Reject what SGLang would abort after admission, so it never enters the engine."""
@@ -512,6 +694,9 @@ class SGLangEngine(GenerationEngine):
         last_batch = scheduler.last_batch
         return (
             len(scheduler.waiting_queue) > 0
+            or any(self._waiting_siblings.values())
+            # With overlap, a launched batch's results wait for the next step.
+            or len(scheduler.result_queue) > 0
             or scheduler.chunked_req is not None
             or any(not req.finished() for req in scheduler.running_batch.reqs)
             or (
@@ -523,7 +708,7 @@ class SGLangEngine(GenerationEngine):
     def step(self) -> list[FinishedRequest]:
         """Run one scheduler iteration, a TP collective, and return the requests it finished."""
         scheduler = self._scheduler
-        with torch.no_grad():
+        with torch.no_grad(), self._schedule_stream():
             plan = scheduler.get_next_batch_to_run(
                 running_batch=scheduler.running_batch,
                 last_batch=scheduler.last_batch,
@@ -531,7 +716,9 @@ class SGLangEngine(GenerationEngine):
             scheduler.running_batch = plan.running_batch
             batch = plan.batch_to_run
             scheduler.cur_batch_for_debug = batch
-            if batch:
+            if scheduler.enable_overlap:
+                self._run_overlapped(batch)
+            elif batch:
                 result = scheduler.run_batch(batch)
                 scheduler.process_batch_result(batch, result)
             scheduler.last_batch = batch
@@ -539,9 +726,35 @@ class SGLangEngine(GenerationEngine):
             # no progress for watchdog_timeout. Between steps the generator may
             # leave the engine idle for long (trainer steps, weight syncs).
             scheduler.cur_batch_for_debug = None
+        if self._head_reqs:
+            self._admit_waiting_siblings()
         finished = self._output_collector.pop_finished()
         self._sampler.release(request.request_id for request in finished)
         return finished
+
+    def _run_overlapped(self, batch) -> None:
+        """Launch ``batch`` and process the previous batch's results meanwhile: one
+        iteration of SGLang's ``Scheduler.event_loop_overlap``."""
+        scheduler = self._scheduler
+        # Consecutive prefill batches run without overlap (SGLang's TTFT policy).
+        disable_overlap = scheduler.is_disable_overlap_for_batch(
+            batch, last_batch=scheduler.last_batch
+        )
+        if disable_overlap and scheduler.result_queue:
+            scheduler.process_batch_result(*scheduler.result_queue.popleft())
+        batch_result = None
+        if batch:
+            batch_result = scheduler.run_batch(batch)
+            scheduler._apply_war_barrier()
+            scheduler.result_queue.append((batch.copy(), batch_result))
+        if scheduler.last_batch and not disable_overlap:
+            scheduler.process_batch_result(*scheduler.result_queue.popleft())
+        if scheduler.is_generation:
+            scheduler.launch_batch_sample_if_needed(batch_result, batch)
+
+    def _schedule_stream(self):
+        """The stream SGLang's event loop runs the scheduler's work on."""
+        return torch.cuda.stream(self._scheduler.schedule_stream)
 
     def release_sessions(self, session_ids: list[str], group_ids: list[int]) -> None:
         """Drop the session tags of ``session_ids`` and of every session of
@@ -585,9 +798,14 @@ class SGLangEngine(GenerationEngine):
         if self._reset_kv_cache_on_model_state_dict_load:
             # Retract running requests to the waiting queue (their KV is freed and
             # recomputed under the new weights when they resume), then drop the cache.
-            scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+            with self._schedule_stream():
+                scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
         model = self._get_model()
+        # With overlap, the last step's forward may still be running, and the next
+        # step's must read the new weights.
+        torch.cuda.synchronize()
         model.load_state_dict(model.prefetched_model_state_dict)
+        torch.cuda.synchronize()
         if self._reset_kv_cache_on_model_state_dict_load:
             if not scheduler.flush_cache():
                 raise RuntimeError("SGLang did not flush its KV cache after retracting")
@@ -610,6 +828,21 @@ class SGLangEngine(GenerationEngine):
         """Process teardown is the launcher's; release Python references and the config."""
         self._scheduler = None
         shutil.rmtree(self._sglang_model_dir, ignore_errors=True)
+
+
+def _restore_triton_next_power_of_2() -> None:
+    """Let Triton kernels call ``triton.next_power_of_2`` again after SGLang's import.
+
+    SGLang replaces it with a plain Python function (``sglang.srt.utils.common``),
+    which Triton refuses inside a ``@triton.jit`` function (Triton's own is a
+    ``constexpr_function``): Dist-MoE's routing kernel then fails to compile. Wrap
+    SGLang's version, which host callers keep using, as a ``constexpr_function``.
+    """
+    import triton
+    from triton.runtime.jit import ConstexprFunction
+
+    if not isinstance(triton.next_power_of_2, ConstexprFunction):
+        triton.next_power_of_2 = triton.constexpr_function(triton.next_power_of_2)
 
 
 def _in_process_port_args():
@@ -638,6 +871,35 @@ def _in_process_port_args():
         tokenizer_worker_ipc_name=None,
         decoupled_spec_ipc_config=None,
         instance_id=uuid.uuid4().hex[:12],
+    )
+
+
+def _full_cuda_graph_server_args(
+    *, max_num_seqs: int, max_prefill_tokens: int
+) -> dict[str, Any]:
+    """ServerArgs for full CUDA graphs of decode and prefill steps."""
+    from sglang.srt.model_executor.cuda_graph_config import (
+        Backend,
+        CudaGraphConfig,
+        PhaseConfig,
+    )
+
+    prefill_buckets = [1 << i for i in range(max_prefill_tokens.bit_length())]
+    if max_prefill_tokens not in prefill_buckets:
+        prefill_buckets.append(max_prefill_tokens)
+    return dict(
+        cuda_graph_config=CudaGraphConfig(
+            decode=PhaseConfig(backend=Backend.FULL),
+            prefill=PhaseConfig(
+                backend=Backend.FULL,
+                bs=prefill_buckets,
+                full_prefill_max_req=max_num_seqs,
+            ),
+        ),
+        # Full prefill graphs otherwise capture a separate cached-prefix topology,
+        # which only MLA backends implement; this backend reads cached prefixes
+        # through its block table like any other KV.
+        disable_chunked_prefix_cache=True,
     )
 
 

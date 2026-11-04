@@ -47,9 +47,13 @@ class TorchTitanSampler(Sampler):
         super().__init__()
         self._generators: dict[str, torch.Generator] = {}
         self._batch_reqs: list | None = None
+        self._partial_req = None
 
-    def set_batch_reqs(self, reqs: list) -> None:
+    def set_batch_reqs(self, reqs: list, partial_req=None) -> None:
+        """Publish the step's requests, and the one whose prefill the step does not
+        finish (SGLang's ``chunked_req`` when the step launches), if any."""
         self._batch_reqs = reqs
+        self._partial_req = partial_req
 
     def release(self, request_ids: Iterable[str]) -> None:
         for request_id in request_ids:
@@ -106,12 +110,15 @@ class TorchTitanSampler(Sampler):
             logprobs_BV = logits_BV.log_softmax(dim=-1, dtype=torch.float32)
             probs_BV = logits_BV.softmax(dim=-1, dtype=torch.float32)
             noise_BV = torch.empty_like(probs_BV)
+            # From the requests' host-side params (greedy is top_k == 1 there too):
+            # reading greedy_B would wait for the forward, which an overlapped step
+            # runs while the scheduler works on the CPU.
             seeded_rows = [
                 i
-                for i, (req, greedy) in enumerate(zip(reqs, greedy_B.tolist()))
-                if not greedy
+                for i, req in enumerate(reqs)
+                if req.sampling_params.top_k != 1
                 and req.sampling_params.sampling_seed is not None
-                and req.inflight_middle_chunks <= 0
+                and req is not self._partial_req
             ]
             if len(seeded_rows) != logits_BV.shape[0]:
                 noise_BV.exponential_()

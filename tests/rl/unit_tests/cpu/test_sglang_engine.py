@@ -133,10 +133,11 @@ def test_sampler_matches_vllm_sampling():
     reqs = [
         SimpleNamespace(
             rid=f"r{i}",
-            sampling_params=SimpleNamespace(sampling_seed=seed),
-            inflight_middle_chunks=0,
+            sampling_params=SimpleNamespace(
+                sampling_seed=seed, top_k=1 if temperature == 0.0 else -1
+            ),
         )
-        for i, (_, seed) in enumerate(rows)
+        for i, (temperature, seed) in enumerate(rows)
     ]
     # SGLang stores a greedy request as temperature 1.0 and top_k 1.
     sampling_info = SimpleNamespace(
@@ -190,9 +191,7 @@ def test_sampler_partial_prefill_row_draws_no_noise():
     """A partially prefilled request does not advance its generator."""
     sampler = _sampler()
     req = SimpleNamespace(
-        rid="r0",
-        sampling_params=SimpleNamespace(sampling_seed=5),
-        inflight_middle_chunks=1,
+        rid="r0", sampling_params=SimpleNamespace(sampling_seed=5, top_k=-1)
     )
     sampling_info = SimpleNamespace(
         top_ks=torch.tensor([1 << 30]),
@@ -200,7 +199,7 @@ def test_sampler_partial_prefill_row_draws_no_noise():
         is_all_greedy=False,
         has_custom_logit_processor=False,
     )
-    sampler.set_batch_reqs([req])
+    sampler.set_batch_reqs([req], partial_req=req)
     sampler(
         SimpleNamespace(next_token_logits=torch.randn(1, 100)),
         sampling_info,
@@ -217,8 +216,7 @@ def test_sampler_samples_padding_rows_greedily():
     sampler = _sampler()
     req = SimpleNamespace(
         rid="r0",
-        sampling_params=SimpleNamespace(sampling_seed=3),
-        inflight_middle_chunks=0,
+        sampling_params=SimpleNamespace(sampling_seed=3, top_k=-1),
     )
     sampling_info = SimpleNamespace(
         top_ks=torch.tensor([1 << 30]),
@@ -243,7 +241,7 @@ def test_sampler_samples_padding_rows_greedily():
 def test_release_sessions_closes_this_ranks_sessions():
     """A release closes the named sessions and every session of the named groups,
     skipping sessions this rank never tagged, in sorted order."""
-    from torchtitan.rl.generator.sglang.engine import SGLangEngine
+    from torchtitan.rl.generator.sglang.engine import _OutputCollector, SGLangEngine
     from torchtitan.rl.generator.types import EngineRequest, SamplingConfig
 
     closed = []
@@ -254,7 +252,10 @@ def test_release_sessions_closes_this_ranks_sessions():
     engine._vocab_size = 100
     engine._session_groups = {}
     engine._group_sessions = {}
+    engine._share_group_prefill = False
+    engine._output_collector = _OutputCollector()
     engine._scheduler = SimpleNamespace(
+        schedule_stream=None,
         process_input_requests=lambda requests: None,
         waiting_queue=[],
         close_session=lambda request: closed.append(request.session_id),
@@ -284,3 +285,110 @@ def test_release_sessions_closes_this_ranks_sessions():
     assert closed == ["g1/s1", "g2/s0", "g2/s1"]
     engine.release_sessions(["g2/s0"], [1])
     assert closed == ["g1/s1", "g2/s0", "g2/s1", "g1/s0"]
+
+
+def test_group_samples_wait_for_the_first_prefill():
+    """share_group_prefill: a group's samples of one prompt enter the scheduler
+    after the first one's prefill, so they read its prompt from the radix cache."""
+    from torchtitan.rl.generator.sglang.engine import _OutputCollector, SGLangEngine
+    from torchtitan.rl.generator.types import EngineRequest, SamplingConfig
+
+    queued = []
+
+    def process_input_requests(requests):
+        for request in requests:
+            queued.append(
+                SimpleNamespace(rid=request.rid, output_ids=[], finished=lambda: False)
+            )
+
+    engine = SGLangEngine.__new__(SGLangEngine)
+    engine.config = SGLangEngine.Config()
+    engine._reset_kv_cache_on_model_state_dict_load = False
+    engine._max_context_length = 64
+    engine._vocab_size = 100
+    engine._share_group_prefill = True
+    engine._prefill_heads = {}
+    engine._waiting_siblings = {}
+    engine._head_reqs = {}
+    engine._output_collector = _OutputCollector()
+    engine._scheduler = SimpleNamespace(
+        schedule_stream=None,
+        process_input_requests=process_input_requests,
+        waiting_queue=queued,
+    )
+
+    def request(request_id, group_id, prompt):
+        r = EngineRequest(
+            request_id=request_id,
+            prompt_token_ids=prompt,
+            sampling=SamplingConfig(max_tokens=4),
+            group_id=group_id,
+            routing_session_id=request_id,
+            arrival_time=0.0,
+        )
+        r.min_policy_version = 0
+        return r
+
+    assert (
+        engine.add_requests(
+            [
+                request("g1/0", 1, [1, 2, 3]),
+                request("g1/1", 1, [1, 2, 3]),
+                request("g2/0", 2, [1, 2, 3]),
+                request("g1/2", 1, [1, 2, 4]),
+            ]
+        )
+        == []
+    )
+    # One request per (group, prompt); g1/1 waits for g1/0.
+    assert [r.rid for r in queued] == ["g1/0", "g2/0", "g1/2"]
+    engine.add_requests([request("g1/3", 1, [1, 2, 3])])
+    assert [r.rid for r in queued] == ["g1/0", "g2/0", "g1/2"]
+
+    engine._admit_waiting_siblings()
+    assert len(queued) == 3
+    queued[0].output_ids.append(7)  # g1/0's prefill is done
+    engine._admit_waiting_siblings()
+    assert [r.rid for r in queued] == ["g1/0", "g2/0", "g1/2", "g1/1", "g1/3"]
+    # A later sample of a prefilled prompt is admitted at once.
+    engine.add_requests([request("g1/4", 1, [1, 2, 3])])
+    assert queued[-1].rid == "g1/4"
+
+
+def test_finished_request_metrics_come_from_scheduler_timestamps():
+    """A finished request reports queue time, TTFT from its arrival in the generator,
+    and ITL, as the vLLM engine does."""
+    import time
+
+    from torchtitan.rl.generator.sglang.engine import _OutputCollector
+
+    collector = _OutputCollector()
+    now = time.perf_counter()
+    # Arrived 2 s before admission (waiting in the generator's queue).
+    collector.set_arrival_time("r", time.time() - 2.0)
+    stats = SimpleNamespace(
+        wait_queue_entry_time=now,
+        forward_entry_time=now + 0.5,
+        prefill_finished_time=now + 1.0,
+        completion_time=now + 4.0,
+    )
+    collector.send_output(
+        SimpleNamespace(
+            rids=["r"],
+            output_ids=[[5, 6, 7, 8]],
+            output_token_logprobs_val=[[-1.0] * 4],
+            cached_tokens=[16],
+            finished_reasons=[{"type": "length", "length": 4}],
+            time_stats=[stats],
+            retraction_counts=[1],
+        )
+    )
+    (finished,) = collector.pop_finished()
+    metrics = finished.metrics_inputs
+    assert metrics.has_stats
+    assert metrics.num_cached_tokens == 16
+    assert metrics.scheduled_ts - metrics.queued_ts == pytest.approx(0.5)
+    assert metrics.first_token_latency == pytest.approx(3.0, abs=0.05)
+    assert metrics.last_token_ts - metrics.first_token_ts == pytest.approx(3.0)
+    assert metrics.num_generation_tokens == 4
+    assert metrics.num_preemptions == 1

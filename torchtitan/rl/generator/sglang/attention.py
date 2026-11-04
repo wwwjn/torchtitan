@@ -57,6 +57,25 @@ class _VarlenMetadata:
     max_seqlen_q: int
     max_seqlen_k: int
     block_table: torch.Tensor  # [B, P] int32 page ids
+    zero_padding_rows: bool = False
+    """Zero the output rows past the step's real tokens: a prefill CUDA graph pads
+    the step to its token bucket, and the padding rows reach the next layers."""
+
+
+class _GraphMetadataBuffers:
+    """Static metadata buffers a CUDA graph reads; replays refill them in place."""
+
+    def __init__(self, max_requests: int, max_num_pages: int, device) -> None:
+        self.cu_seqlens_q = torch.zeros(
+            max_requests + 1, dtype=torch.int32, device=device
+        )
+        self.cu_seqlens_k = torch.zeros(
+            max_requests + 1, dtype=torch.int32, device=device
+        )
+        self.seqused_k = torch.zeros(max_requests, dtype=torch.int32, device=device)
+        self.block_table = torch.zeros(
+            max_requests, max_num_pages, dtype=torch.int32, device=device
+        )
 
 
 class TorchTitanVarlenAttnBackend(AttentionBackend):
@@ -75,7 +94,12 @@ class TorchTitanVarlenAttnBackend(AttentionBackend):
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.max_context_len = model_runner.model_config.context_len
+        self.max_num_pages = -(-self.max_context_len // self.page_size)
         self.forward_metadata: _VarlenMetadata | None = None
+        # Decode and prefill CUDA graphs keep separate buffers: SGLang captures
+        # them in separate runners, and decode recaptures can reallocate its own.
+        self._decode_graph_buffers: _GraphMetadataBuffers | None = None
+        self._prefill_graph_buffers: _GraphMetadataBuffers | None = None
 
         flash_attention_impl = get_cuda_flash_attention_impl()
         if flash_attention_impl is not None:
@@ -145,25 +169,16 @@ class TorchTitanVarlenAttnBackend(AttentionBackend):
         )
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
-        """Allocate the static metadata buffers decode CUDA graphs read.
-
-        A graph records the buffer addresses and the ``max_seqlen_*`` Python ints of
-        its capture, so replays refill the buffers in place and pass the context
-        length as ``max_seqlen_k`` (the kernel bounds keys by ``seqused_k``).
-        """
+        """Allocate the static metadata buffers decode CUDA graphs read."""
         del max_num_tokens
-        max_num_pages = -(-self.max_context_len // self.page_size)
-        self._graph_cu_seqlens_q = torch.arange(
-            0, max_bs + 1, dtype=torch.int32, device=self.device
+        self._decode_graph_buffers = _GraphMetadataBuffers(
+            max_bs, self.max_num_pages, self.device
         )
-        self._graph_cu_seqlens_k = torch.zeros(
-            max_bs + 1, dtype=torch.int32, device=self.device
-        )
-        self._graph_seqused_k = torch.zeros(
-            max_bs, dtype=torch.int32, device=self.device
-        )
-        self._graph_block_table = torch.zeros(
-            max_bs, max_num_pages, dtype=torch.int32, device=self.device
+        torch.arange(
+            0,
+            max_bs + 1,
+            dtype=torch.int32,
+            out=self._decode_graph_buffers.cu_seqlens_q,
         )
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
@@ -171,38 +186,66 @@ class TorchTitanVarlenAttnBackend(AttentionBackend):
         return 1
 
     def init_forward_metadata_out_graph(self, forward_batch, in_capture: bool = False):
-        """Fill the static decode buffers for a capture or replay of ``forward_batch``."""
+        """Fill the static buffers for a CUDA graph capture or replay of ``forward_batch``.
+
+        A graph records the buffer addresses and the ``max_seqlen_*`` Python ints of
+        its capture, so the ints are upper bounds that hold for every replay: the
+        context length for keys (the kernel bounds keys by ``seqused_k``), one query
+        for decode, and the token bucket for prefill (the kernel bounds queries by
+        ``cu_seqlens_q``). A prefill graph has a fixed number of request slots;
+        unused slots have zero queries and keys.
+        """
         del in_capture
-        if not forward_batch.forward_mode.is_decode_or_idle():
-            raise NotImplementedError(
-                f"{type(self).__name__} captures decode CUDA graphs only, got "
-                f"{forward_batch.forward_mode}"
-            )
+        forward_mode = forward_batch.forward_mode
         batch_size = forward_batch.batch_size
+        if forward_mode.is_decode_or_idle():
+            buffers = self._decode_graph_buffers
+            assert buffers is not None, "init_cuda_graph_state must run first"
+            max_seqlen_q = 1
+        elif forward_mode.is_extend():
+            if self._prefill_graph_buffers is None:
+                # The request pool bounds a prefill graph's request slots.
+                self._prefill_graph_buffers = _GraphMetadataBuffers(
+                    self.req_to_token_pool.size, self.max_num_pages, self.device
+                )
+            buffers = self._prefill_graph_buffers
+            torch.cumsum(
+                forward_batch.extend_seq_lens[:batch_size],
+                dim=0,
+                dtype=torch.int32,
+                out=buffers.cu_seqlens_q[1 : batch_size + 1],
+            )
+            max_seqlen_q = forward_batch.input_ids.shape[0]
+        else:
+            raise NotImplementedError(
+                f"{type(self).__name__} captures extend and decode CUDA graphs, got "
+                f"{forward_mode}"
+            )
         seq_lens_B = forward_batch.seq_lens[:batch_size]
-        self._graph_seqused_k[:batch_size].copy_(seq_lens_B)
+        buffers.seqused_k[:batch_size].copy_(seq_lens_B)
         if self._uses_fa2:
             torch.cumsum(
                 seq_lens_B,
                 dim=0,
                 dtype=torch.int32,
-                out=self._graph_cu_seqlens_k[1 : batch_size + 1],
+                out=buffers.cu_seqlens_k[1 : batch_size + 1],
             )
         token_slots_BL = self.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices[:batch_size], : self.max_context_len
         ]
-        self._graph_block_table[:batch_size].copy_(
+        buffers.block_table[:batch_size].copy_(
             token_slots_BL[:, :: self.page_size] // self.page_size
         )
         self.forward_metadata = _VarlenMetadata(
-            cu_seqlens_q=self._graph_cu_seqlens_q[: batch_size + 1],
+            cu_seqlens_q=buffers.cu_seqlens_q[: batch_size + 1],
             cu_seqlens_k=(
-                self._graph_cu_seqlens_k[: batch_size + 1] if self._uses_fa2 else None
+                buffers.cu_seqlens_k[: batch_size + 1] if self._uses_fa2 else None
             ),
-            seqused_k=self._graph_seqused_k[:batch_size],
-            max_seqlen_q=1,
+            seqused_k=buffers.seqused_k[:batch_size],
+            max_seqlen_q=max_seqlen_q,
             max_seqlen_k=self.max_context_len,
-            block_table=self._graph_block_table[:batch_size],
+            block_table=buffers.block_table[:batch_size],
+            zero_padding_rows=forward_mode.is_extend(),
         )
 
     def forward(
@@ -273,7 +316,7 @@ class TorchTitanVarlenAttnBackend(AttentionBackend):
         value_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
             -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
         )
-        if q_THK.shape[0] > num_tokens:
+        if q_THK.shape[0] > num_tokens or metadata.zero_padding_rows:
             out_THV = q_THK.new_zeros(q_THK.shape[0], num_heads, layer.v_head_dim)
         else:
             out_THV = q_THK.new_empty(q_THK.shape[0], num_heads, layer.v_head_dim)

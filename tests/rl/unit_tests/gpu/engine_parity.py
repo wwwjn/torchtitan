@@ -194,8 +194,10 @@ def _copy_live_weights_into_prefetched(engine) -> None:
     """
     from torch.distributed.tensor import DTensor
 
-    # Both engines expose the TorchTitan model wrapper they run through _get_model().
-    model = engine._get_model().model
+    # Both engines expose the model wrapper they run through _get_model(); the
+    # TorchTitan model is the SGLang wrapper's ``decoder``, the vLLM wrapper's ``model``.
+    wrapper = engine._get_model()
+    model = wrapper.decoder if hasattr(wrapper, "decoder") else wrapper.model
     live = dict(model.named_parameters())
     live.update(dict(model.named_buffers()))
     dp_rank, dp_size = engine.data_parallel_rank, engine.data_parallel_size
@@ -230,8 +232,24 @@ def _build_engine(args):
         attn_backend="varlen",
     )
     # Local compile regions do not support batch-invariant mode.
-    model_config.local_compile_regions = []
-    debug = DebugConfig(batch_invariant=True, deterministic=True, seed=0)
+    if not args.perf_mode:
+        model_config.local_compile_regions = []
+    dist_moe_runtime = None
+    if args.dist_moe:
+        from torchtitan.config.transform import transform_model_config_
+        from torchtitan.config.transform.dist_moe import DistMoeTransform
+        from torchtitan.models.common.dist_moe import DistMoeRuntime
+
+        model_config = transform_model_config_(model_config, [DistMoeTransform()])
+        dist_moe_runtime = DistMoeRuntime.Config(
+            inference=True,
+            scratch_capacity_factor=args.dist_moe_scratch_capacity_factor,
+        )
+    # --perf-mode: the default generator mode, for a sanity check of perf-only
+    # paths (e.g. custom all-reduce); outputs need not be bitwise there.
+    debug = DebugConfig(
+        batch_invariant=not args.perf_mode, deterministic=not args.perf_mode, seed=0
+    )
     # What Generator.__init__ does before it builds the engine.
     set_batch_invariance(debug.batch_invariant)
     Generator._set_determinism(debug)
@@ -269,7 +287,7 @@ def _build_engine(args):
         checkpointer=CheckpointManager.Config(
             initial_load_in_hf=True, initial_load_path=model_path
         ),
-        dist_moe_runtime=None,
+        dist_moe_runtime=dist_moe_runtime,
         debug=debug,
         reset_kv_cache_on_model_state_dict_load=not args.no_kv_reset,
         rank=int(os.environ.get("RANK", "0")),
@@ -506,6 +524,11 @@ def main() -> None:
     parser.add_argument("--hold-session-kv", action="store_true")
     parser.add_argument("--no-kv-reset", action="store_true")
     parser.add_argument("--cuda-graph", action="store_true")
+    parser.add_argument("--perf-mode", action="store_true")
+    parser.add_argument("--dist-moe", action="store_true", help="SM100+ only")
+    # The topology maximum at EP=4: a rank that receives more rows than the plan
+    # holds faults instead of raising.
+    parser.add_argument("--dist-moe-scratch-capacity-factor", type=float, default=4.0)
     parser.add_argument("--sglang-extra-server-args", default="{}")
     parser.add_argument("--vllm-extra-engine-args", default="{}")
     args = parser.parse_args()

@@ -22,6 +22,7 @@ from typing import Any
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.models.common.attention.gdn import GDN
 from torchtitan.models.common.decoder import Decoder
+from torchtitan.models.common.dist_moe import DistMoeRuntime
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
 from torchtitan.rl.generator.unified_model import get_attention_dimensions
 
@@ -113,6 +114,7 @@ def register_to_sglang(
     *,
     parallelism: InferenceParallelismConfig,
     checkpointer_config: CheckpointManager.Config | None,
+    dist_moe_runtime: DistMoeRuntime.Config | None = None,
 ) -> None:
     """Register the TorchTitan model class with SGLang's ``ModelRegistry``.
 
@@ -125,6 +127,8 @@ def register_to_sglang(
         checkpointer_config: Optional CheckpointManager configuration for initial
             weight loading. ``None`` for the RL loop, where weights arrive from
             TorchStore.
+        dist_moe_runtime: ``DistMoeRuntime.Config(inference=True)`` for models
+            with Dist-MoE routed experts.
     """
     from sglang.srt.models.registry import ModelRegistry
 
@@ -139,6 +143,7 @@ def register_to_sglang(
                 model_config=model_config,
                 parallelism=parallelism,
                 checkpointer_config=checkpointer_config,
+                dist_moe_runtime=dist_moe_runtime,
             )
 
     SGLangModelFromSpec.__name__ = SGLANG_MODEL_NAME

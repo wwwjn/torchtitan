@@ -168,6 +168,21 @@ class _GDNMetadata:
     num_tokens: int
 
 
+class _GDNGraphBuffers:
+    """Static metadata buffers a CUDA graph reads; replays refill them in place."""
+
+    def __init__(self, max_sequences: int, device) -> None:
+        self.state_indices = torch.zeros(
+            max_sequences, dtype=torch.int32, device=device
+        )
+        self.cu_seqlens = torch.zeros(
+            max_sequences + 1, dtype=torch.int32, device=device
+        )
+        self.has_initial_state = torch.zeros(
+            max_sequences, dtype=torch.bool, device=device
+        )
+
+
 class TorchTitanGDNAttnBackend(MambaAttnBackendBase):
     """Linear-attention backend for TorchTitan GDN layers.
 
@@ -175,6 +190,13 @@ class TorchTitanGDNAttnBackend(MambaAttnBackendBase):
     or a continued chunked prefill). A step uses the single-token path when every
     request processes one token, as the vLLM engine decides.
     """
+
+    def __init__(self, model_runner) -> None:
+        super().__init__(model_runner)
+        # Decode and prefill CUDA graphs keep separate buffers (see
+        # TorchTitanVarlenAttnBackend).
+        self._decode_graph_buffers: _GDNGraphBuffers | None = None
+        self._prefill_graph_buffers: _GDNGraphBuffers | None = None
 
     def init_forward_metadata(self, forward_batch) -> None:
         forward_mode = forward_batch.forward_mode
@@ -217,39 +239,75 @@ class TorchTitanGDNAttnBackend(MambaAttnBackendBase):
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
         """Allocate the static metadata buffers decode CUDA graphs read."""
         del max_num_tokens
-        self._graph_state_indices = torch.zeros(
-            max_bs, dtype=torch.int32, device=self.device
+        self._decode_graph_buffers = _GDNGraphBuffers(max_bs, self.device)
+        torch.arange(
+            0, max_bs + 1, dtype=torch.int32, out=self._decode_graph_buffers.cu_seqlens
         )
-        self._graph_cu_seqlens = torch.arange(
-            0, max_bs + 1, dtype=torch.int32, device=self.device
-        )
-        self._graph_has_initial_state = torch.ones(
-            max_bs, dtype=torch.bool, device=self.device
-        )
+        self._decode_graph_buffers.has_initial_state.fill_(True)
 
     def init_forward_metadata_out_graph(self, forward_batch, in_capture: bool = False):
-        """Fill the static decode buffers for a capture or replay of ``forward_batch``.
+        """Fill the static buffers for a CUDA graph capture or replay of ``forward_batch``.
 
-        Padded rows have request pool row 0, whose mamba slot is the null slot 0.
+        Padded rows have request pool row 0, whose mamba slot is the null slot 0. A
+        prefill graph has a fixed number of request slots, and pads the step's
+        tokens to its bucket: the padding tokens form one more sequence, on the null
+        slot, so every row belongs to a sequence (as the vLLM engine's FULL graphs
+        pad), and the step always takes the packed path.
         """
         del in_capture
-        if not forward_batch.forward_mode.is_decode_or_idle():
-            raise NotImplementedError(
-                f"{type(self).__name__} captures decode CUDA graphs only, got "
-                f"{forward_batch.forward_mode}"
-            )
+        forward_mode = forward_batch.forward_mode
         batch_size = forward_batch.batch_size
-        self._graph_state_indices[:batch_size].copy_(
-            self.req_to_token_pool.get_mamba_indices(
-                forward_batch.req_pool_indices[:batch_size]
+        req_pool_indices = forward_batch.req_pool_indices[:batch_size]
+        if forward_mode.is_decode_or_idle():
+            buffers = self._decode_graph_buffers
+            assert buffers is not None, "init_cuda_graph_state must run first"
+            buffers.state_indices[:batch_size].copy_(
+                self.req_to_token_pool.get_mamba_indices(req_pool_indices)
             )
+            self.forward_metadata = _GDNMetadata(
+                state_indices=buffers.state_indices[:batch_size],
+                cu_seqlens=buffers.cu_seqlens[: batch_size + 1],
+                has_initial_state=buffers.has_initial_state[:batch_size],
+                single_token=True,
+                num_tokens=batch_size,
+            )
+            return
+        if not forward_mode.is_extend():
+            raise NotImplementedError(
+                f"{type(self).__name__} captures extend and decode CUDA graphs, got "
+                f"{forward_mode}"
+            )
+        if self._prefill_graph_buffers is None:
+            # The request pool bounds a prefill graph's request slots; one more
+            # sequence holds the padding tokens.
+            self._prefill_graph_buffers = _GDNGraphBuffers(
+                self.req_to_token_pool.size + 1, self.device
+            )
+        buffers = self._prefill_graph_buffers
+        num_tokens = forward_batch.input_ids.shape[0]
+        buffers.state_indices[:batch_size].copy_(
+            self.req_to_token_pool.get_mamba_indices(req_pool_indices)
         )
+        buffers.state_indices[batch_size].zero_()
+        torch.cumsum(
+            forward_batch.extend_seq_lens[:batch_size],
+            dim=0,
+            dtype=torch.int32,
+            out=buffers.cu_seqlens[1 : batch_size + 1],
+        )
+        buffers.cu_seqlens[batch_size + 1].fill_(num_tokens)
+        torch.gt(
+            forward_batch.extend_prefix_lens[:batch_size],
+            0,
+            out=buffers.has_initial_state[:batch_size],
+        )
+        buffers.has_initial_state[batch_size].fill_(False)
         self.forward_metadata = _GDNMetadata(
-            state_indices=self._graph_state_indices[:batch_size],
-            cu_seqlens=self._graph_cu_seqlens[: batch_size + 1],
-            has_initial_state=self._graph_has_initial_state[:batch_size],
-            single_token=True,
-            num_tokens=batch_size,
+            state_indices=buffers.state_indices[: batch_size + 1],
+            cu_seqlens=buffers.cu_seqlens[: batch_size + 2],
+            has_initial_state=buffers.has_initial_state[: batch_size + 1],
+            single_token=False,
+            num_tokens=num_tokens,
         )
 
     def layer_state(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
