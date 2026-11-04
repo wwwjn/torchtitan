@@ -199,6 +199,71 @@ def resize_to_navit_patch_grid(
     return h, w, pad_h, pad_w
 
 
+def decode_and_resize_image(
+    image: str | bytes | Image.Image,
+    patch_size: int = 16,
+    merge_size: int = 2,
+    max_pixels: int = 16777216,
+    min_pixels: int = 65536,
+    resize_fn: Callable[..., tuple[int, int, int, int]] = resize_to_pixel_budget,
+    image_interpolation_mode: TVF.InterpolationMode = TVF.InterpolationMode.BICUBIC,
+    max_patches: int = 4096,
+    max_patches_per_side: int = 512,
+) -> torch.Tensor:
+    """Decode an image and resize (and pad) it to the vision encoder's patch grid.
+
+    The uint8 half of ``process_image`` (see there for the arguments); the image
+    cache stores its output. Raises on failure.
+
+    Returns:
+        Tensor of shape (C, H, W), uint8.
+    """
+    # Decode to (C, H, W) uint8 tensor
+    img_tensor = _decode_image(image)
+    _, original_height, original_width = img_tensor.shape
+
+    resize_h, resize_w, pad_h, pad_w = resize_fn(
+        original_height,
+        original_width,
+        patch_size=patch_size,
+        merge_size=merge_size,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+        max_patches=max_patches,
+        max_patches_per_side=max_patches_per_side,
+    )
+    if (resize_h, resize_w) != (original_height, original_width):
+        # Resize on uint8 (leverages AVX2/NEON SIMD fast paths)
+        img_tensor = TVF.resize(
+            img_tensor,
+            [resize_h, resize_w],
+            interpolation=image_interpolation_mode,
+            antialias=True,
+        )
+    if pad_h or pad_w:
+        # Pad right/bottom with zeros (black); after normalization these are
+        # constant padding patches the encoder sees as part of the grid.
+        img_tensor = TVF.pad(img_tensor, [0, 0, pad_w, pad_h])
+    return img_tensor
+
+
+def normalize_image(
+    image: torch.Tensor,
+    image_mean: tuple[float, ...] = (0.5, 0.5, 0.5),
+    image_std: tuple[float, ...] = (0.5, 0.5, 0.5),
+) -> torch.Tensor:
+    """Normalize a (C, H, W) uint8 image to a (1, H, W, C) float32 tensor.
+
+    The float half of ``process_image``; elementwise, so it gives the same values
+    on any device.
+    """
+    # uint8 → float32 [0, 1] → normalize
+    image = TVF.to_dtype(image, torch.float32, scale=True)
+    image = TVF.normalize(image, list(image_mean), list(image_std), inplace=True)
+    # (C, H, W) → (1, H, W, C)
+    return image.permute(1, 2, 0).unsqueeze(0)
+
+
 def process_image(
     image: str | bytes | Image.Image,
     patch_size: int = 16,
@@ -215,7 +280,8 @@ def process_image(
     """Load and preprocess a single image for VLM training.
 
     Uses torchvision APIs for decoding and resizing (faster uint8 SIMD paths),
-    then normalizes with the given mean/std. ``resize_fn`` is the resize strategy
+    then normalizes with the given mean/std: ``decode_and_resize_image``, then
+    ``normalize_image``. ``resize_fn`` is the resize strategy
     -- ``resize_to_pixel_budget`` (Qwen-VL, default) or
     ``resize_to_navit_patch_grid`` (Kimi-VL) -- with the uniform signature
     ``(height, width, *, patch_size, merge_size, **budget) -> (resize_h,
@@ -241,41 +307,18 @@ def process_image(
         Tensor of shape (1, H, W, C) with a dummy temporal dim, or None on failure.
     """
     try:
-        # Decode to (C, H, W) uint8 tensor
-        img_tensor = _decode_image(image)
-        _, original_height, original_width = img_tensor.shape
-
-        resize_h, resize_w, pad_h, pad_w = resize_fn(
-            original_height,
-            original_width,
+        img_tensor = decode_and_resize_image(
+            image,
             patch_size=patch_size,
             merge_size=merge_size,
-            min_pixels=min_pixels,
             max_pixels=max_pixels,
+            min_pixels=min_pixels,
+            resize_fn=resize_fn,
+            image_interpolation_mode=image_interpolation_mode,
             max_patches=max_patches,
             max_patches_per_side=max_patches_per_side,
         )
-        if (resize_h, resize_w) != (original_height, original_width):
-            # Resize on uint8 (leverages AVX2/NEON SIMD fast paths)
-            img_tensor = TVF.resize(
-                img_tensor,
-                [resize_h, resize_w],
-                interpolation=image_interpolation_mode,
-                antialias=True,
-            )
-        if pad_h or pad_w:
-            # Pad right/bottom with zeros (black); after normalization these are
-            # constant padding patches the encoder sees as part of the grid.
-            img_tensor = TVF.pad(img_tensor, [0, 0, pad_w, pad_h])
-
-        # uint8 → float32 [0, 1] → normalize
-        img_tensor = TVF.to_dtype(img_tensor, torch.float32, scale=True)
-        img_tensor = TVF.normalize(
-            img_tensor, list(image_mean), list(image_std), inplace=True
-        )
-
-        # (C, H, W) → (1, H, W, C)
-        return img_tensor.permute(1, 2, 0).unsqueeze(0)
+        return normalize_image(img_tensor, image_mean, image_std)
 
     except Exception as e:
         logger.warning(f"Error processing image: {e}")
