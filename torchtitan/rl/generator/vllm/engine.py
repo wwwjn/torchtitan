@@ -474,7 +474,7 @@ class VLLMEngine(GenerationEngine):
 
     def load_prefetched_model_state_dict(self) -> None:
         """Copy the prefetched model state dict from pinned CPU memory into the model, and
-        reset the KV cache when configured."""
+        reset the KV cache (and, for image prompts, vLLM's encoder cache) when configured."""
         model = self._get_model()
         model.load_state_dict(model._prefetched_model_state_dict)
         if self._reset_kv_cache_on_model_state_dict_load:
@@ -484,6 +484,14 @@ class VLLMEngine(GenerationEngine):
             self._engine.reset_prefix_cache(
                 reset_running_requests=True,
             )
+            if self._load_image is not None:
+                # Without the salt, image mm hashes carry no policy version (see
+                # `image_prompt`), so drop encoder outputs of the old vision weights too.
+                # vLLM warns here while requests are queued (the preempted ones always
+                # are); the caches it warns about are its processor caches, which image
+                # prompts turn off (mm_processor_cache_gb=0). Text-only engines have no
+                # encoder outputs and skip the call.
+                self._engine.reset_encoder_cache()
 
     def shutdown(self) -> None:
         """Close renderer-local resources.

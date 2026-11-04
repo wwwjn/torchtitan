@@ -161,7 +161,10 @@ class Generator(Configurable):
         later turns reuse its KV across model state dict loads, while new groups use the current
         version.
         Enable this to clear prefix-cache entries and preempt running requests; the engine
-        then recomputes their KV under the new weights when they resume."""
+        then recomputes their KV under the new weights when they resume. With image
+        prompts it also clears vLLM's encoder cache (image embeddings from the old vision
+        weights); without it, image embeddings are salted by the pinned version like the
+        KV."""
 
         def __post_init__(self):
             # The generator runs full expert parallelism: the engine forms the EP
