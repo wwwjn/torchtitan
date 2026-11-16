@@ -20,10 +20,13 @@ if TYPE_CHECKING:
     from torchtitan.rl.generator.types import SamplingConfig
 
 
+# `RolloutStatus` values by kind. A status can be in several sets, e.g. ERROR_INFRA is in _ERROR
+# and in _NOT_TRAINABLE.
 _TRUNCATED = frozenset(
     {"truncated_length", "truncated_prompt_too_long", "truncated_max_turns"}
 )
-_ERROR = frozenset({"error_parse", "error_timeout", "error_abort", "error"})
+_ERROR = frozenset({"error_parse", "error_timeout", "error", "error_infra"})
+_NOT_TRAINABLE = frozenset({"error_infra"})
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -150,7 +153,7 @@ class Completion:
     token_ids: list[int]
     token_logprobs: list[float]
     finish_reason: str | None = None
-    """vLLM `CompletionOutput.finish_reason` ("stop" | "length" | "abort")"""
+    """vLLM `CompletionOutput.finish_reason` ("stop" | "length" | "abort" | "error")"""
 
     metrics: list[m.Metric] = field(default_factory=list)
     """Per-generation metrics measured by the generator (latencies); the
@@ -205,24 +208,49 @@ class ReleaseSessionFn(Protocol):
         """
 
 
+# TODO: let users add a status without editing this file. A StrEnum with members can't be subclassed.
 class RolloutStatus(StrEnum):
-    """Per-rollout status."""
+    """How a rollout ended, and who failed if it failed. ERROR_INFRA never trains."""
 
     ONGOING = "ongoing"
+    """Still running."""
+
     COMPLETED = "completed"
+    """The env ended the episode."""
+
     TRUNCATED_LENGTH = "truncated_length"
+    """The last completion ran out of tokens."""
+
     TRUNCATED_PROMPT_TOO_LONG = "truncated_prompt_too_long"
+    """The next prompt left no room for one output token."""
+
     TRUNCATED_MAX_TURNS = "truncated_max_turns"
+    """The turn limit was reached."""
+
     ERROR_PARSE = "error_parse"
+    """The completion couldn't be parsed, e.g. a malformed tool call."""
+
     ERROR_TIMEOUT = "error_timeout"
-    ERROR_ABORT = "error_abort"
+    """A deadline passed, e.g. the policy ran a command that never ends. Counts as the policy's
+    failure."""
+
     ERROR = "error"
+    """Another failure the policy can cause, e.g. it killed its own agent's process."""
+
+    ERROR_INFRA = "error_infra"
+    """A failure outside the policy, e.g. an unreachable generator or a crashed env. Not trained."""
 
     def is_truncated(self) -> bool:
         return self.value in _TRUNCATED
 
     def is_error(self) -> bool:
         return self.value in _ERROR
+
+    def is_trainable(self) -> bool:
+        """False for a status that is never scored or trained. A trainable rollout can still be
+        left out of training later, e.g. one with no completion tokens makes the builder skip its
+        whole group."""
+        return self.value not in _NOT_TRAINABLE
 
     def is_terminal(self) -> bool:
         return self is not RolloutStatus.ONGOING
@@ -386,8 +414,10 @@ class Rollout:
     status: RolloutStatus
     """Rollout-level terminal status."""
 
+    # TODO: make it per token, e.g. to give each turn of a multi-turn rollout its own reward.
+    #   Not done yet: `RubricOutput.reward` and the advantage estimators give one float per rollout.
     reward: float | None = None
-    """Final weighted reward, filled by the rubric."""
+    """Final weighted reward, filled by the rubric. None if the rollout wasn't scored."""
 
     reward_breakdown: dict[str, float] = field(default_factory=dict)
     """Raw per-reward-function values, filled by the rubric."""

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import Counter
 from dataclasses import dataclass, replace
 from typing import Any, TYPE_CHECKING
 
@@ -34,6 +35,7 @@ from torchtitan.rl.examples.verifiers.generation_server import (
     GROUP_ID_SAMPLING_PARAM,
     VerifiersGenerationMetadata,
 )
+from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout.data import IterableRolloutDataLoader
 from torchtitan.rl.rollout.rollouter import BaseRolloutWorker, Rollouter
 from torchtitan.rl.rollout.rubric import RewardFn
@@ -259,7 +261,8 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
         self._generation_server.set_generate_fn(generate_fn)
 
         # Run the group's rollouts in the env server, all at once.
-        results = await asyncio.gather(
+        # Wait for every rollout, even after one fails (why: `BaseRolloutWorker.run_group`).
+        rollouts_or_errors = await asyncio.gather(
             *(
                 self._run_single_rollout(
                     release_session_fn=release_session_fn,
@@ -276,22 +279,22 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
             ),
             return_exceptions=True,
         )
-        # Raise only after every sibling finished: the caller releases the group next, and a
-        # sibling still generating would pin the group again, with nothing left to release it.
-        for result in results:
-            if isinstance(result, BaseException):
-                raise result
-        rollouts = results
-
-        outputs = await self.score_group(rollouts, sample)
-        for rollout, output in zip(rollouts, outputs, strict=True):
-            rollout.reward = output.reward
-            rollout.reward_breakdown = output.reward_breakdown
-
-        group = RolloutGroup(group_id=group_id, rollouts=rollouts)
-        advantages = self.advantage_estimator(group)
-        for rollout, advantage in zip(group.rollouts, advantages, strict=True):
-            rollout.advantage = advantage
+        group = await self.make_scored_group(
+            rollouts_or_errors=rollouts_or_errors, sample=sample, group_id=group_id
+        )
+        # Count the errors Verifiers recorded on the group's rollouts, by type: verifiers/errors/<type>.
+        # - A retried attempt's errors count too: Verifiers keeps them on the episode or the trace.
+        # - A rollout that raised has only logs["error"], so it adds nothing here.
+        # - Training only: validation doesn't log `group.metrics` yet (TODO in the controller).
+        error_counts = Counter(
+            error["type"]
+            for rollout in group.rollouts
+            for error in rollout.logs.get("errors", [])
+        )
+        group.metrics.extend(
+            m.Metric(f"verifiers/errors/{error_type}", m.Sum(count))
+            for error_type, count in sorted(error_counts.items())
+        )
         return group
 
     async def _run_single_rollout(
@@ -359,6 +362,10 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
         )
         status = self.rollout_status(verifiers_episode=verifiers_episode, trace=trace)
         if not turns:
+            # No turn: the policy took no action, so there is nothing to train.
+            # If it were scored, the builder would also skip its whole group.
+            if status.is_trainable():
+                status = RolloutStatus.ERROR_INFRA
             # Verifiers records an overlong first prompt as a failed model call; vLLM, the
             # renderer and the generation server all word it "maximum context length".
             first_prompt_too_long = any(
@@ -374,12 +381,12 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
                 )
                 logger.warning(
                     "rollout group=%d/rollout=%d: the first prompt%s does not fit the "
-                    "context; marking ERROR",
+                    "context; marking %s",
                     group_id,
                     rollout_id,
                     "" if task is None else f" of task {task}",
+                    status.name,
                 )
-            status = RolloutStatus.ERROR
         logs = verifiers_rollout_logs(verifiers_episode, trace)
         if status.is_error():
             log_failed_rollout(logs, group_id=group_id, rollout_id=rollout_id)
@@ -395,12 +402,43 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
 
     @staticmethod
     def rollout_status(*, verifiers_episode: Any, trace: Any) -> RolloutStatus:
+        """Say who failed: the policy (trained with `error_reward`) or something outside it (not
+        trained).
+
+            trace                                   status
+            setup_timeout                           ERROR_INFRA   the sandbox or harness didn't start in time
+            another deadline (agent, scoring, ...)  ERROR_TIMEOUT
+            failed, last error HarnessError         ERROR         e.g. the agent's `pkill -f` killed its harness
+            failed, last error TaskError            ERROR         e.g. the agent broke its box: no reward file
+            failed, last error ProviderError 400    ERROR         the prompt outgrew the context
+            failed, any other error or none         ERROR_INFRA   e.g. SandboxError, TunnelError, a 502
+            ok, but the episode failed elsewhere    ERROR_INFRA   e.g. another agent's trace, an env hook
+            ok                                      COMPLETED / TRUNCATED_*
+
+        `_run_single_rollout` then makes any trainable status ERROR_INFRA for a rollout with no turn.
+        """
+        # TODO: tell policy-caused failures from infra ones inside HarnessError, TaskError and the
+        #   deadline errors (agent, finalize, scoring). Today they all train: e.g. Harbor turns a
+        #   sandbox error while reading the reward file into a TaskError. Blocked: Verifiers' error
+        #   types say where a rollout broke, not who caused it.
+        if trace.stop_condition == "setup_timeout":
+            return RolloutStatus.ERROR_INFRA
         # Verifiers flags an expired deadline with is_timeout: a stage's on its trace (which can keep
         # ok=True), the whole episode's on the episode.
         if trace.is_timeout or verifiers_episode.is_timeout:
             return RolloutStatus.ERROR_TIMEOUT
-        if not verifiers_episode.ok or not trace.ok:
-            return RolloutStatus.ERROR
+        if not trace.ok:
+            # The newest error: the one that ended this trace, after any retried attempt's.
+            error = trace.last_error
+            policy_can_cause = error is not None and (
+                error.type in ("HarnessError", "TaskError")
+                or (error.type == "ProviderError" and error.status_code == 400)
+            )
+            return (
+                RolloutStatus.ERROR if policy_can_cause else RolloutStatus.ERROR_INFRA
+            )
+        if not verifiers_episode.ok:
+            return RolloutStatus.ERROR_INFRA
         if not trace.is_truncated:
             return RolloutStatus.COMPLETED
         if trace.stop_condition == "max_turns":

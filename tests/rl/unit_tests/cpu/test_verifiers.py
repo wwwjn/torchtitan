@@ -38,7 +38,9 @@ from torchtitan.rl.examples.verifiers.rollouter import (
 )
 from torchtitan.rl.generator.types import SamplingConfig
 from torchtitan.rl.observability import metrics as m
-from torchtitan.rl.rollout.types import Completion, RolloutStatus
+from torchtitan.rl.rollout.rubric import RubricOutput
+from torchtitan.rl.rollout.types import Completion, Rollout, RolloutGroup, RolloutStatus
+from verifiers.v1.trace import Error as VerifiersError
 
 
 def test_train_client_config_carries_an_in_tree_renderer() -> None:
@@ -762,7 +764,7 @@ def test_generation_server_requires_group_id() -> None:
                     headers={"X-Session-ID": "group=1/rollout=2"},
                     json={"token_ids": [10, 11], "sampling_params": {}},
                 )
-                assert response.status == 400
+                assert response.status == 422
                 payload = await response.json()
         finally:
             await server.close()
@@ -770,6 +772,72 @@ def test_generation_server_requires_group_id() -> None:
         assert "torchtitan_group_id" in payload["error"]
 
     asyncio.run(run_test())
+
+
+_GOOD_SAMPLING_PARAMS = {
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "max_tokens": 2,
+    "stop_token_ids": [99],
+    "torchtitan_group_id": 1,
+}
+
+
+@pytest.mark.parametrize(
+    "headers, request_kwargs",
+    [
+        pytest.param(
+            {},
+            {"json": {"token_ids": [10, 11], "sampling_params": _GOOD_SAMPLING_PARAMS}},
+            id="no_session_header",
+        ),
+        pytest.param(
+            {"X-Session-ID": "group=1/rollout=2"},
+            {"data": b"not json"},
+            id="body_not_json",
+        ),
+        pytest.param(
+            {"X-Session-ID": "group=1/rollout=2"},
+            {"json": {"token_ids": "10 11", "sampling_params": _GOOD_SAMPLING_PARAMS}},
+            id="token_ids_not_a_list",
+        ),
+        pytest.param(
+            {"X-Session-ID": "group=1/rollout=2"},
+            {
+                "json": {
+                    "token_ids": [10, 11],
+                    "sampling_params": {**_GOOD_SAMPLING_PARAMS, "top_k": 20},
+                }
+            },
+            id="sampling_key_that_filters",
+        ),
+    ],
+)
+def test_generation_server_answers_422_to_a_bad_request(
+    headers: dict, request_kwargs: dict
+) -> None:
+    """A bad request is a config or code mistake: 422. Only a prompt too long answers 400, the
+    one status the Verifiers worker trains as the policy's failure."""
+
+    async def run_test() -> int:
+        async def generate_fn(*args, **kwargs):
+            raise AssertionError("generate_fn must not run for a bad request")
+
+        server = GenerationServer.Config(max_rollout_tokens=40960).build()
+        server.set_generate_fn(generate_fn)
+        await server.start()
+        try:
+            async with ClientSession() as session:
+                response = await session.post(
+                    f"http://{server.host}:{server.port}/inference/v1/generate",
+                    headers=headers,
+                    **request_kwargs,
+                )
+                return response.status
+        finally:
+            await server.close()
+
+    assert asyncio.run(run_test()) == 422
 
 
 def test_generation_server_logs_each_request_at_debug_only(caplog) -> None:
@@ -858,8 +926,71 @@ def test_validate_token_ids(token_ids, accepted) -> None:
         _validate_token_ids(token_ids, field_name="token_ids")
 
 
-def test_rollout_whose_first_prompt_does_not_fit_is_flagged(caplog) -> None:
-    # The first model call fails for context length, so the rollout has no turns.
+_OVERFLOW_CALL = SimpleNamespace(
+    time=SimpleNamespace(duration=0.0),
+    error=SimpleNamespace(
+        message="Prompt length (9) exceeds maximum context length (8)."
+    ),
+)
+_SANDBOX_ERROR = VerifiersError(type="SandboxError", message="no capacity")
+_HARNESS_ERROR = VerifiersError(type="HarnessError", message="exited with no output")
+
+
+def _one_turn_fields() -> dict:
+    """Trace fields for one policy turn: prompt token 10, sampled token 11."""
+    from verifiers.v1.types import AssistantMessage as VerifiersAssistantMessage
+
+    node = SimpleNamespace(
+        token_ids=[10, 11],
+        mask=[False, True],
+        sampled=True,
+        message=VerifiersAssistantMessage(content="ls"),
+    )
+    branch = SimpleNamespace(nodes=[node], token_ids=[10, 11], logprobs=[0.0, -0.1])
+    return {"nodes": [node], "branches": [branch]}
+
+
+@pytest.mark.parametrize(
+    "trace_fields, expected_status, expected_log",
+    [
+        # The first model call overflows the context, and the harness ends the trace cleanly.
+        pytest.param(
+            {"calls": [_OVERFLOW_CALL]},
+            RolloutStatus.ERROR_INFRA,
+            "first prompt of task huge-task does not fit the context; marking ERROR_INFRA",
+            id="first_prompt_too_long",
+        ),
+        # The sandbox never started.
+        pytest.param(
+            {"ok": False, "errors": [_SANDBOX_ERROR], "last_error": _SANDBOX_ERROR},
+            RolloutStatus.ERROR_INFRA,
+            "error=SandboxError: no capacity",
+            id="sandbox_error",
+        ),
+        # The harness failed to launch: a HarnessError, but the policy took no action.
+        pytest.param(
+            {"ok": False, "errors": [_HARNESS_ERROR], "last_error": _HARNESS_ERROR},
+            RolloutStatus.ERROR_INFRA,
+            "error=HarnessError: exited with no output",
+            id="harness_error",
+        ),
+        # The rule's boundary: the same HarnessError after one turn stays ERROR, and trains.
+        pytest.param(
+            {
+                "ok": False,
+                "errors": [_HARNESS_ERROR],
+                "last_error": _HARNESS_ERROR,
+                **_one_turn_fields(),
+            },
+            RolloutStatus.ERROR,
+            "error=HarnessError: exited with no output",
+            id="harness_error_after_a_turn",
+        ),
+    ],
+)
+def test_only_a_rollout_with_no_turn_is_forced_to_error_infra(
+    trace_fields: dict, expected_status: RolloutStatus, expected_log: str, caplog
+) -> None:
     span = SimpleNamespace(duration=0.0)
     trace = SimpleNamespace(
         id="trace",
@@ -870,30 +1001,29 @@ def test_rollout_whose_first_prompt_does_not_fit_is_flagged(caplog) -> None:
         is_timeout=False,
         stop_condition="agent_completed",
         errors=[],
+        last_error=None,
         timing=SimpleNamespace(
             setup=span,
             agent=SimpleNamespace(duration=0.0, model=span, harness=span),
             scoring=span,
         ),
-        calls=[
-            SimpleNamespace(
-                time=span,
-                error=SimpleNamespace(
-                    message="Prompt length (9) exceeds maximum context length (8)."
-                ),
-            )
-        ],
+        calls=[],
         nodes=[],
         branches=[],
     )
+    for name, value in trace_fields.items():
+        setattr(trace, name, value)
     worker = object.__new__(VerifiersRolloutWorker)
     worker._generation_server = SimpleNamespace(
-        model_id="model", pop_generation_metadata=lambda trace_id: None
+        model_id="model",
+        pop_generation_metadata=lambda trace_id: VerifiersGenerationMetadata(
+            min_policy_version=0, max_policy_version=0, metrics=[]
+        ),
     )
     worker._verifiers_env_client = SimpleNamespace(
         run=AsyncMock(
             return_value=SimpleNamespace(
-                ok=True, is_timeout=False, errors=[], traces=[trace]
+                ok=trace.ok, is_timeout=False, errors=[], traces=[trace]
             )
         )
     )
@@ -910,26 +1040,117 @@ def test_rollout_whose_first_prompt_does_not_fit_is_flagged(caplog) -> None:
             )
         )
 
-    assert rollout.status is RolloutStatus.ERROR
-    assert "first prompt of task huge-task does not fit" in caplog.text
+    # ERROR_INFRA isn't trained, so `make_scored_group` gives it no reward and the builder keeps
+    # its siblings.
+    assert rollout.status is expected_status
+    assert len(rollout.turns) == len(trace.branches)
+    assert expected_log in caplog.text
+
+
+def _error(error_type: str, status_code: int | None = None) -> VerifiersError:
+    return VerifiersError(type=error_type, message="", status_code=status_code)
 
 
 @pytest.mark.parametrize(
-    "ok, is_timeout, episode_is_timeout, expected",
+    "trace_fields, episode_fields, expected",
     [
-        (True, True, False, RolloutStatus.ERROR_TIMEOUT),
-        (False, True, False, RolloutStatus.ERROR_TIMEOUT),
+        pytest.param(
+            {"is_timeout": True, "stop_condition": "setup_timeout"},
+            {},
+            RolloutStatus.ERROR_INFRA,
+            id="setup_timeout",
+        ),
+        pytest.param(
+            {"is_timeout": True, "stop_condition": "agent_timeout"},
+            {},
+            RolloutStatus.ERROR_TIMEOUT,
+            id="agent_timeout",
+        ),
+        pytest.param(
+            {
+                "ok": False,
+                "is_timeout": True,
+                "stop_condition": "scoring_timeout",
+                "last_error": _error("TaskError"),
+            },
+            {},
+            RolloutStatus.ERROR_TIMEOUT,
+            id="scoring_timeout",
+        ),
         # The episode's own deadline flags the episode and leaves it not ok.
-        (True, False, True, RolloutStatus.ERROR_TIMEOUT),
-        (False, False, False, RolloutStatus.ERROR),
-        (True, False, False, RolloutStatus.COMPLETED),
+        pytest.param(
+            {},
+            {"ok": False, "is_timeout": True},
+            RolloutStatus.ERROR_TIMEOUT,
+            id="episode_timeout",
+        ),
+        pytest.param(
+            {"ok": False, "last_error": _error("HarnessError")},
+            {"ok": False},
+            RolloutStatus.ERROR,
+            id="harness_error",
+        ),
+        pytest.param(
+            {"ok": False, "last_error": _error("TaskError")},
+            {"ok": False},
+            RolloutStatus.ERROR,
+            id="task_error",
+        ),
+        pytest.param(
+            {"ok": False, "last_error": _error("ProviderError", 400)},
+            {"ok": False},
+            RolloutStatus.ERROR,
+            id="prompt_too_long",
+        ),
+        pytest.param(
+            {"ok": False, "last_error": _error("ProviderError", 422)},
+            {"ok": False},
+            RolloutStatus.ERROR_INFRA,
+            id="malformed_request",
+        ),
+        pytest.param(
+            {"ok": False, "last_error": _error("ProviderError", 502)},
+            {"ok": False},
+            RolloutStatus.ERROR_INFRA,
+            id="bad_completion",
+        ),
+        pytest.param(
+            {"ok": False, "last_error": _error("SandboxError")},
+            {"ok": False},
+            RolloutStatus.ERROR_INFRA,
+            id="sandbox_error",
+        ),
+        pytest.param(
+            {"ok": False},
+            {"ok": False},
+            RolloutStatus.ERROR_INFRA,
+            id="no_error_record",
+        ),
+        # Another agent's trace, or an env hook, failed; the policy's trace finished.
+        pytest.param({}, {"ok": False}, RolloutStatus.ERROR_INFRA, id="episode_failed"),
+        # A retried attempt's error stays in the history; the final attempt finished.
+        pytest.param(
+            {"last_error": _error("SandboxError")},
+            {},
+            RolloutStatus.COMPLETED,
+            id="ok_after_a_retry",
+        ),
     ],
 )
-def test_rollout_status_maps_timeouts_to_error_timeout(
-    ok: bool, is_timeout: bool, episode_is_timeout: bool, expected: RolloutStatus
+def test_rollout_status_says_who_failed(
+    trace_fields: dict, episode_fields: dict, expected: RolloutStatus
 ) -> None:
-    trace = SimpleNamespace(ok=ok, is_timeout=is_timeout, is_truncated=False)
-    episode = SimpleNamespace(ok=not episode_is_timeout, is_timeout=episode_is_timeout)
+    trace = SimpleNamespace(
+        **{
+            "ok": True,
+            "is_timeout": False,
+            "is_truncated": False,
+            "stop_condition": "agent_completed",
+            "last_error": None,
+            **trace_fields,
+        }
+    )
+    episode = SimpleNamespace(**{"ok": True, "is_timeout": False, **episode_fields})
 
     status = VerifiersRolloutWorker.rollout_status(
         verifiers_episode=episode, trace=trace
@@ -1064,33 +1285,100 @@ def test_rollout_releases_every_trace_session_even_if_one_release_fails(caplog) 
     assert rollout.group_id == 1
 
 
-def test_a_failing_rollout_fails_its_group_only_after_every_sibling_finished() -> None:
-    """The caller releases the group once this raises; no sibling may still be generating."""
+def test_a_failing_rollout_is_error_infra_once_every_sibling_finished() -> None:
+    """The controller frees the group once `run_group` returns; no sibling may still be generating."""
 
-    async def run_test() -> list[int]:
+    async def run_test() -> tuple[list[int], RolloutGroup]:
         finished = []
 
-        async def run_single_rollout(*, rollout_id: int, **kwargs) -> None:
+        async def run_single_rollout(*, rollout_id: int, **kwargs) -> Rollout:
             if rollout_id == 0:
                 raise RuntimeError("rollout 0 failed")
             await asyncio.sleep(0.01)
             finished.append(rollout_id)
+            return Rollout(
+                group_id=1, rollout_id=rollout_id, status=RolloutStatus.COMPLETED
+            )
 
         worker = object.__new__(VerifiersRolloutWorker)
         worker._generation_server = SimpleNamespace(set_generate_fn=lambda fn: None)
         worker._run_single_rollout = run_single_rollout
-        with pytest.raises(RuntimeError, match="rollout 0 failed"):
-            await worker.run_group(
-                generate_fn=AsyncMock(),
-                release_session_fn=AsyncMock(),
-                sample=None,
-                group_id=1,
-                group_size=2,
-                sampling=SamplingConfig(),
-            )
-        return finished
+        worker.score_group = AsyncMock(return_value=[RubricOutput(reward=1.0)])
+        worker.advantage_estimator = lambda group: [0.0] * len(group.rollouts)
+        group = await worker.run_group(
+            generate_fn=AsyncMock(),
+            release_session_fn=AsyncMock(),
+            sample=None,
+            group_id=1,
+            group_size=2,
+            sampling=SamplingConfig(),
+        )
+        return finished, group
 
-    assert asyncio.run(run_test()) == [1]
+    finished, group = asyncio.run(run_test())
+    assert finished == [1]
+    assert [rollout.status for rollout in group.rollouts] == [
+        RolloutStatus.ERROR_INFRA,
+        RolloutStatus.COMPLETED,
+    ]
+    assert [rollout.reward for rollout in group.rollouts] == [None, 1.0]
+
+
+def test_run_group_counts_each_verifiers_error_type() -> None:
+    """Every error Verifiers recorded counts, an OK rollout's included; a raised rollout has none."""
+
+    def errors(*error_types: str) -> dict:
+        return {"errors": [{"type": error_type} for error_type in error_types]}
+
+    rollouts_or_errors = [
+        Rollout(
+            group_id=1,
+            rollout_id=0,
+            status=RolloutStatus.ERROR_INFRA,
+            logs=errors("SandboxError"),
+        ),
+        Rollout(
+            group_id=1,
+            rollout_id=1,
+            status=RolloutStatus.ERROR_INFRA,
+            logs=errors("SandboxError"),
+        ),
+        Rollout(
+            group_id=1,
+            rollout_id=2,
+            status=RolloutStatus.COMPLETED,
+            logs=errors("ProviderError"),
+        ),
+        RuntimeError("rollout 3 raised"),
+    ]
+
+    async def run_single_rollout(*, rollout_id: int, **kwargs) -> Rollout:
+        rollout_or_error = rollouts_or_errors[rollout_id]
+        if isinstance(rollout_or_error, Exception):
+            raise rollout_or_error
+        return rollout_or_error
+
+    worker = object.__new__(VerifiersRolloutWorker)
+    worker._generation_server = SimpleNamespace(set_generate_fn=lambda fn: None)
+    worker._run_single_rollout = run_single_rollout
+    worker.score_group = AsyncMock(return_value=[RubricOutput(reward=1.0)])
+    worker.advantage_estimator = lambda group: [0.0] * len(group.rollouts)
+
+    group = asyncio.run(
+        worker.run_group(
+            generate_fn=AsyncMock(),
+            release_session_fn=AsyncMock(),
+            sample=None,
+            group_id=1,
+            group_size=4,
+            sampling=SamplingConfig(),
+        )
+    )
+
+    assert [(metric.key, metric.value.value) for metric in group.metrics] == [
+        ("verifiers/errors/ProviderError", 1.0),
+        ("verifiers/errors/SandboxError", 2.0),
+    ]
 
 
 def test_parse_sampling_config_requires_temperature_top_p_max_tokens() -> None:

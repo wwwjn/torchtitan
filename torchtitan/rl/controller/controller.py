@@ -935,6 +935,9 @@ class Controller(Configurable):
                 continue
             rollout_groups.append(result)
 
+        # TODO: also log each validation group's `group.metrics`, prefixed `validation_` like the
+        #   metrics below. Today only training logs them. Left for its own PR: it adds keys to every
+        #   rollout worker's validation logs.
         metrics = compute_rollout_metrics(
             prefix="validation",
             rollouts=[
