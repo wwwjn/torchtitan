@@ -26,7 +26,7 @@ _TRUNCATED = frozenset(
     {"truncated_length", "truncated_prompt_too_long", "truncated_max_turns"}
 )
 _ERROR = frozenset({"error_parse", "error_timeout", "error", "error_infra"})
-_NOT_TRAINABLE = frozenset({"error_infra"})
+_NOT_TRAINABLE = frozenset({"error_infra", "dropped"})
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -212,7 +212,7 @@ class ReleaseSessionFn(Protocol):
 
 # TODO: let users add a status without editing this file. A StrEnum with members can't be subclassed.
 class RolloutStatus(StrEnum):
-    """How a rollout ended, and who failed if it failed. ERROR_INFRA never trains."""
+    """How a rollout ended, and who failed if it failed. ERROR_INFRA and DROPPED never train."""
 
     ONGOING = "ongoing"
     """Still running."""
@@ -241,6 +241,10 @@ class RolloutStatus(StrEnum):
 
     ERROR_INFRA = "error_infra"
     """A failure outside the policy, e.g. an unreachable generator or a crashed env. Not trained."""
+
+    DROPPED = "dropped"
+    """The env's grader declined to score it, e.g. a judge found the reference answer wrong. Not
+    trained."""
 
     def is_truncated(self) -> bool:
         return self.value in _TRUNCATED
@@ -341,7 +345,9 @@ class RolloutTurn:
         return self.prompt_prefix_len + len(self.prompt_delta_token_ids)
 
 
-def split_prompt(prompt: Prompt, previous: Prompt) -> tuple[int, np.ndarray]:
+def split_prompt(
+    prompt: Prompt | np.ndarray, previous: Prompt | np.ndarray
+) -> tuple[int, np.ndarray]:
     """Split a prompt into the part shared with the previous turn and the new part.
 
     The shared prefix is the longest run of equal tokens that also shows the same images. An
@@ -350,18 +356,21 @@ def split_prompt(prompt: Prompt, previous: Prompt) -> tuple[int, np.ndarray]:
     changed image is in the new part.
 
     Args:
-        prompt: this turn's full prompt.
-        previous: the previous turn's prompt + completion, with the previous prompt's images;
-            ``Prompt(token_ids=[])`` on the first turn.
+        prompt: this turn's full prompt: a `Prompt`, or a text prompt's token ids as an array.
+        previous: the previous turn's prompt + completion, of the same type as `prompt`, with the
+            previous prompt's images; `Prompt(token_ids=[])` or an empty array on the first turn.
 
     Returns:
         `(prompt_prefix_len, prompt_delta_token_ids)`: the length of the shared prefix, and the
         prompt after it.
 
-    Example (``Prompt(...)`` abbreviated to its token ids where it has no images):
+    Example (a list here is short for `Prompt(token_ids=list)`; a plain list raises):
         split_prompt([0, 1, 2, 3, 4, 5], previous=[0, 1, 2, 3])  # -> (4, array([4, 5])): continues
         split_prompt([0, 1, 9, 3], previous=[0, 1, 2, 3])        # -> (2, array([9, 3])): history edited
         split_prompt([0, 1, 2], previous=[])                     # -> (0, array([0, 1, 2])): first turn
+
+        # Arrays, as the Verifiers converter passes them:
+        split_prompt(np.array([0, 1, 9, 3]), previous=np.array([0, 1, 2, 3]))  # -> (2, array([9, 3]))
 
         # Tokens 1-2 are image placeholders in both, but the image changed from a to b:
         split_prompt(
@@ -369,6 +378,12 @@ def split_prompt(prompt: Prompt, previous: Prompt) -> tuple[int, np.ndarray]:
             previous=Prompt(token_ids=[0, 7, 7, 3], images=(a,), image_placeholders=(PlaceholderRange(1, 2),)),
         )  # -> (1, array([7, 7, 3]))
     """
+    if isinstance(prompt, np.ndarray):
+        # A text prompt's token ids as an array: one vectorized compare, no Python ints.
+        shared_len = min(len(prompt), len(previous))
+        mismatches = np.flatnonzero(prompt[:shared_len] != previous[:shared_len])
+        prefix_len = int(mismatches[0]) if mismatches.size else shared_len
+        return prefix_len, prompt[prefix_len:].astype(np.int32, copy=False)
     prompt_token_ids, previous_token_ids = prompt.token_ids, previous.token_ids
     # Common case: the prompt extends the previous turn. One list compare, no Python loop.
     if prompt_token_ids[: len(previous_token_ids)] == previous_token_ids:
