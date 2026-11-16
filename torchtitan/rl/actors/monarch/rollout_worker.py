@@ -34,7 +34,6 @@ class RolloutWorkerActor(Actor):
         self,
         *,
         worker_config: BaseRolloutWorker.Config,
-        worker_kwargs: dict[str, Any],
         num_threads: int,
         structured_logger_init_fn: functools.partial[None] | None,
     ) -> None:
@@ -45,7 +44,7 @@ class RolloutWorkerActor(Actor):
         asyncio.get_running_loop().set_default_executor(
             ThreadPoolExecutor(max_workers=num_threads)
         )
-        self._worker = worker_config.build(**worker_kwargs)
+        self._worker = worker_config.build()
         # Created at the end of `setup_async`, so setup isn't counted as lag.
         self._event_loop_lag: m.EventLoopLag
 
@@ -103,6 +102,10 @@ class RolloutWorkerActor(Actor):
                 m.Metric("rollout_worker/peak_memory_gib", m.Max(peak_memory_gib)),
             ]
         return group
+
+    @concurrent_endpoint
+    async def close(self) -> None:
+        await self._worker.close()
 
     @concurrent_endpoint
     async def sync_log_step(self, step: int) -> None:
