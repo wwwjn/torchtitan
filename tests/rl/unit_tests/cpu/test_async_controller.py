@@ -186,6 +186,8 @@ def test_batcher_carries_metric_only_groups_until_trainable_batch() -> None:
     assert batch.global_loss_token_counts[0] > 0
     assert batch.global_routing_token_counts.shape == (1,)
     assert batch.group_ids == [0, 1]
+    # Only group 1 trains; the controller retired group 0 when the batcher reported it untrainable.
+    assert batch.trainable_group_ids == [1]
 
 
 def test_batcher_prepares_per_depth_mtp_token_counts() -> None:
@@ -686,7 +688,7 @@ def test_take_finalized_does_not_release_active_slot() -> None:
         await asyncio.sleep(0)
         assert not waiter.done()
 
-        await buffer.release_active_groups(1, reason="trained")
+        await buffer.retire([0], reason="trained")
         assert await waiter
 
     asyncio.run(run())
@@ -714,7 +716,7 @@ def test_untrainable_group_releases_before_training() -> None:
         training_sample_group = TrainingSampleGroup(
             group_id=0, training_samples=[], metrics=[]
         )
-        await buffer.release_active_groups(1, reason="untrainable_group")
+        await buffer.retire([0], reason="untrainable_group")
         assert batcher.add_training_samples(
             training_sample_group=training_sample_group
         ) == (
@@ -944,6 +946,101 @@ def test_batcher_loop_times_each_add_group_call() -> None:
         metrics["timing/hop/add_group/transfer/max"]
         >= metrics["timing/hop/add_group/transfer/mean"]
     )
+
+
+async def _settle() -> None:
+    """Let every ready task run until it blocks again."""
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+
+def test_retire_frees_only_the_named_groups_slots() -> None:
+    async def run() -> list[m.Metric]:
+        buffer = _buffer(capacity=3, window_size=None)
+        await _admit(buffer, 0)
+        await _admit(buffer, 1)
+        # Each failure is a caller bug that would otherwise free or keep the wrong slots.
+        with pytest.raises(RuntimeError, match="already holds an active slot"):
+            await buffer.add_work(RolloutGroupWork(group_id=0, sample=object()))
+        with pytest.raises(RuntimeError, match=r"these do not: \[5\]"):
+            await buffer.retire([5], reason="trained")
+        with pytest.raises(RuntimeError, match="each group once"):
+            await buffer.retire([1, 1], reason="trained")
+        await buffer.retire([1], reason="untrainable_group")
+        with pytest.raises(RuntimeError, match=r"these do not: \[1\]"):
+            await buffer.retire([1], reason="trained")
+        return buffer.metrics()
+
+    metrics = {metric.key: metric.value.value for metric in asyncio.run(run())}
+    # Group 0 still holds its slot.
+    assert metrics["rollout_buffer/available_active_slots"] == 2
+
+
+def test_claim_next_takes_the_oldest_waiting_group() -> None:
+    async def run() -> list[int]:
+        buffer = _buffer(capacity=8, window_size=None)
+        for group_id in range(3):
+            await _admit(buffer, group_id)
+        claimed = [(await buffer.claim_next()).group_id]
+        await _admit(buffer, 3)
+        claimed.extend([(await buffer.claim_next()).group_id for _ in range(3)])
+        return claimed
+
+    assert asyncio.run(run()) == [0, 1, 2, 3]
+
+
+def test_add_work_wakes_one_claim_next_waiter(monkeypatch) -> None:
+    """A new group wakes one idle rollout loop. Waking all (S+1) x P loops, each of which then
+    goes back to wait, saturated the controller at P=1024."""
+    num_waits = 0
+    wait = asyncio.Condition.wait
+
+    async def counting_wait(self) -> bool:
+        nonlocal num_waits
+        num_waits += 1
+        return await wait(self)
+
+    monkeypatch.setattr(asyncio.Condition, "wait", counting_wait)
+
+    async def run() -> None:
+        buffer = _buffer(capacity=8, window_size=None)
+        claimers = [asyncio.create_task(buffer.claim_next()) for _ in range(5)]
+        await _settle()
+        assert num_waits == 5
+        await _admit(buffer, 0)
+        await _settle()
+        [claimed] = [claimer.result() for claimer in claimers if claimer.done()]
+        assert claimed.group_id == 0
+        # The four other loops never woke, so none of them waited again.
+        assert num_waits == 5
+        await buffer.close()
+        await asyncio.gather(*claimers)
+
+    asyncio.run(asyncio.wait_for(run(), timeout=10))
+
+
+def test_close_unblocks_every_waiter() -> None:
+    async def run() -> list:
+        buffer = _buffer(capacity=1, window_size=None)
+        await _admit(buffer, 0)
+        await buffer.claim_next()  # g0 CLAIMED: nothing to claim or take, and no free slot
+        waiters = [
+            *(asyncio.create_task(buffer.claim_next()) for _ in range(3)),
+            asyncio.create_task(buffer.wait_for_slot()),
+            asyncio.create_task(buffer.take_finalized()),
+        ]
+        await _settle()
+        assert not any(waiter.done() for waiter in waiters)
+        await buffer.close()
+        return await asyncio.gather(*waiters)
+
+    assert asyncio.run(asyncio.wait_for(run(), timeout=10)) == [
+        None,
+        None,
+        None,
+        False,
+        None,
+    ]
 
 
 async def _block_forever(*args, **kwargs) -> None:
