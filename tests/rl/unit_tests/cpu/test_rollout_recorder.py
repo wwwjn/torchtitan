@@ -20,6 +20,7 @@ from torchtitan.rl.rollout import Rollout, RolloutGroup, RolloutStatus, RolloutT
 
 from torchtitan.rl.rollout.recorder import (
     KeepExtremeRewardsFilter,
+    RolloutSampleEncoder,
     RolloutSampleRecorder,
 )
 from torchtitan.rl.rollout.types import PromptImage, RolloutTurnID
@@ -169,6 +170,34 @@ def test_appends_across_calls(tmp_path) -> None:
     assert "step" not in training_record  # training omits step
 
 
+def test_appended_worker_lines_equal_what_record_writes(tmp_path) -> None:
+    # Training groups are encoded in the rollout worker and appended by the controller;
+    # the file must be what the controller's own encoding wrote.
+    config = RolloutSampleRecorder.Config(
+        filter=KeepExtremeRewardsFilter.Config(keep_errors=True),
+        log_tensors=True,
+        log_logprobs=True,
+    )
+    group = _group(0, rewards=[0.1, 0.9, 0.5, 0.2])
+    group.rollouts[2].status = RolloutStatus.ERROR
+    group.rollouts[2].logs = {"error": "agent timeout"}
+    lines = RolloutSampleEncoder(config).encode(
+        is_validation=False, rollout_groups=[group]
+    )
+
+    recorder = config.build(dump_dir=str(tmp_path / "recorded"))
+    recorder.record(is_validation=False, rollout_groups=[group])
+    recorder.close()
+    recorder = config.build(dump_dir=str(tmp_path / "appended"))
+    recorder.append_lines(lines)
+    recorder.close()
+
+    recorded = (tmp_path / "recorded" / "rollout_samples.jsonl").read_text()
+    appended = (tmp_path / "appended" / "rollout_samples.jsonl").read_text()
+    assert appended == recorded == lines
+    assert len(lines.splitlines()) == 3  # lowest, highest, and the errored rollout
+
+
 def test_record_does_not_wait_for_the_file_write(tmp_path) -> None:
     recorder = _recorder(tmp_path)
     write_may_finish = threading.Event()
@@ -282,9 +311,11 @@ def test_none_policy_version_and_completion_message(tmp_path) -> None:
     assert record["turns"][0]["completion_message"] is None
 
 
-def test_encode_turn_covers_all_rollout_turn_fields(tmp_path) -> None:
-    recorder = _recorder(tmp_path, log_tensors=True, log_logprobs=True)
-    encoded = recorder._encode_turn(_turn(completion_logprobs=[-0.5, -1.5]))
+def test_encode_turn_covers_all_rollout_turn_fields() -> None:
+    encoder = RolloutSampleEncoder(
+        RolloutSampleRecorder.Config(log_tensors=True, log_logprobs=True)
+    )
+    encoded = encoder._encode_turn(_turn(completion_logprobs=[-0.5, -1.5]))
 
     # rollout_id is flattened to turn_id; metrics is not JSON-serializable;
     # prompt_delta_image_placeholders is folded into each prompt_delta_images entry.
