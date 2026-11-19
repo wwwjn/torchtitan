@@ -22,6 +22,8 @@ from torchtitan.rl.observability import metrics as m
 
 TRAINER_PUSH_KEY = "timing/weight_sync/trainer_push_model_state_dict"
 GENERATOR_PULL_KEY = "timing/weight_sync/generator_pull_model_state_dict"
+# The fake trainer's slowest rank spends this long in its forward_backward handler.
+TRAINER_HANDLER_S = 0.02
 
 
 class _RankValues:
@@ -51,13 +53,22 @@ class _Endpoint:
         return await self.call(*args, **kwargs)
 
 
-def _controller(events: list[str], *, on_push=None, on_pull=None) -> Controller:
+def _controller(
+    events: list[str], *, on_push=None, on_pull=None, on_forward_backward=None
+) -> Controller:
     """A controller with only the state `_trainer_loop` reads; each actor call appends to `events`."""
     version = 0
 
     async def forward_backward(*args):
         events.append(f"fwd_bwd {version + 1}")
-        return _RankValues({"loss/mean": 1.0})
+        if on_forward_backward is not None:
+            await on_forward_backward()
+        return _RankValues(
+            {
+                "loss/mean": 1.0,
+                "timing/hop/forward_backward/handler/max": TRAINER_HANDLER_S,
+            }
+        )
 
     async def optim_step(**kwargs):
         nonlocal version
@@ -222,6 +233,20 @@ def test_push_and_pull_times_are_logged_one_step_late() -> None:
     # Step 2 logs step 1's push and pull, which have run by then.
     assert second[TRAINER_PUSH_KEY].value.value > 0.0
     assert second[GENERATOR_PULL_KEY].value.value > 0.0
+
+
+def test_forward_backward_transfer_is_the_wall_time_minus_the_handler_time() -> None:
+    async def slow_forward_backward():
+        await asyncio.sleep(0.05)
+
+    controller = _controller([], on_forward_backward=slow_forward_backward)
+    _run(controller, num_training_steps=1)
+
+    [metrics] = controller.logged_metrics
+    wall_s = metrics["timing/step/forward_backward"].value.value
+    transfer_s = metrics["timing/hop/forward_backward/transfer"].value.value
+    assert wall_s >= 0.05
+    assert transfer_s == pytest.approx(wall_s - TRAINER_HANDLER_S, abs=5e-3)
 
 
 def test_push_failure_fails_the_loop() -> None:

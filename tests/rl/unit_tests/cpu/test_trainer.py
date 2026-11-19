@@ -395,7 +395,10 @@ def test_forward_backward_accumulates_microbatch_metrics(rdma: bool) -> None:
             assert trainer._num_rdma_batches_read == 1
             # The read time is reported only when there was a read.
             assert result.pop("timing/trainer/read_microbatches/max") >= 0
-        assert trainer._reduce_forward_backward_metrics.call_count == (3 if rdma else 2)
+        # The controller subtracts the handler time from its call's wall time.
+        assert result.pop("timing/hop/forward_backward/handler/max") > 0
+        # One reduction per microbatch, then one for the timings.
+        assert trainer._reduce_forward_backward_metrics.call_count == 3
         assert result == {"loss/mean": 3.0, "loss/max": 4.0}
 
     asyncio.run(run())
