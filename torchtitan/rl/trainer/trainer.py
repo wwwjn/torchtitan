@@ -355,19 +355,23 @@ class Trainer(Configurable):
                 )
 
         metrics = combine_microbatch_metrics(microbatch_metrics)
+        # The slowest rank's times this step (max over the loss mesh). The controller subtracts the
+        # handler time from its call's wall time to get the hop's transfer time.
+        max_reduced_timing = {
+            "timing/hop/forward_backward/handler/max": torch.tensor(
+                time.perf_counter() - self._step_compute_start, device=engine.device
+            )
+        }
         if uses_rdma:
-            # The slowest rank's total read time this step, hidden or not (max over the loss mesh).
-            read_microbatches_s = torch.tensor(
+            # The total read time, hidden or not.
+            max_reduced_timing["timing/trainer/read_microbatches/max"] = torch.tensor(
                 microbatch_groups.read_s, device=engine.device
             )
-            metrics.update(
-                self._reduce_forward_backward_metrics(
-                    sum_reduced_metrics={},
-                    max_reduced_metrics={
-                        "timing/trainer/read_microbatches/max": read_microbatches_s
-                    },
-                )
+        metrics.update(
+            self._reduce_forward_backward_metrics(
+                sum_reduced_metrics={}, max_reduced_metrics=max_reduced_timing
             )
+        )
         return metrics
 
     @sl.log_trace_span("optim_step")
