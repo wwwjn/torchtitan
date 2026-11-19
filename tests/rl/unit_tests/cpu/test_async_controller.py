@@ -570,6 +570,7 @@ def test_batcher_logs_the_bytes_each_rank_receives_by_value(rdma: bool) -> None:
         dp_degree=2,
         pad_id=0,
         temperature=1.0,
+        num_topk_logprobs=0,
         register_rdma_microbatch=lambda microbatch, **kwargs: microbatch,
     )
     batch, _ = batcher.add_training_samples(
