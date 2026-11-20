@@ -19,6 +19,10 @@ from torchtitan.components.renderer import RendererConfig
 
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.observability import structured_logger as sl
+from torchtitan.rl.actors.monarch.rdma_object import (
+    create_cuda_context_to_silence_monarch_log,
+    MonarchRDMAObject,
+)
 from torchtitan.rl.rollout.finished_group import (
     finish_rollout_group,
     FinishedRolloutGroup,
@@ -45,6 +49,13 @@ class RolloutWorkerActor(Actor):
         asyncio.get_running_loop().set_default_executor(
             ThreadPoolExecutor(max_workers=num_threads)
         )
+        if worker_config.rdma_min_image_bytes is not None:
+            # On the event loop's thread, where `run_group` registers the image files.
+            create_cuda_context_to_silence_monarch_log()
+            worker_kwargs = {
+                **worker_kwargs,
+                "register_rdma_object": MonarchRDMAObject.register,
+            }
         self._worker = worker_config.build(**worker_kwargs)
         self._encoder: RolloutSampleEncoder
 
