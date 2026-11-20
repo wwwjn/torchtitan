@@ -53,8 +53,13 @@ class FinishedRolloutGroup:
         ) + sum(len(data) for data in self.arrays.image_data.values())
 
     def select_rollouts(self, rollout_ids: set[int]) -> FinishedRolloutGroup:
-        """This group with only the rollouts in `rollout_ids` (by `Rollout.rollout_id`) and
-        the image files they show; no recorder lines.
+        """What a trainer DP replica leader gets of this group: only the rollouts in
+        `rollout_ids` (by `Rollout.rollout_id`), their arrays and the image files they show.
+
+        The rollouts are unchanged, so `rollout_to_training_samples` reads the same fields. The
+        group's `metrics` are dropped: the batcher logs them from its copy of the summary, and
+        they are many small objects (one per generator stat per turn) that the controller would
+        pickle a second time. No recorder lines.
 
         Example:
             finished.select_rollouts({0, 3}).summary.group.rollouts  # [rollout 0, rollout 3]
@@ -74,7 +79,7 @@ class FinishedRolloutGroup:
         }
         return FinishedRolloutGroup(
             summary=RolloutGroupSummary(
-                group=replace(group, rollouts=rollouts),
+                group=replace(group, rollouts=rollouts, metrics=[]),
                 turn_lengths=tuple(self.summary.turn_lengths[index] for index in kept),
             ),
             arrays=RolloutGroupArrays(

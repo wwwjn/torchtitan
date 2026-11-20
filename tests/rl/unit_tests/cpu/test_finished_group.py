@@ -9,12 +9,15 @@
 from __future__ import annotations
 
 import pickle
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 import numpy as np
 from renderers import PlaceholderRange
 
-from torchtitan.rl.controller.metrics import compute_rollout_metrics
+from torchtitan.rl.controller.metrics import (
+    compute_hop_metrics,
+    compute_rollout_metrics,
+)
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout import Rollout, RolloutGroup, RolloutStatus, RolloutTurn
 from torchtitan.rl.rollout.finished_group import (
@@ -26,6 +29,7 @@ from torchtitan.rl.rollout.finished_group import (
 )
 from torchtitan.rl.rollout.recorder import RolloutSampleEncoder, RolloutSampleRecorder
 from torchtitan.rl.rollout.types import PromptImage, RolloutTurnID
+from torchtitan.rl.trainer.training_sample_builder import TrainingSampleBuilder
 
 _IMAGE_BYTES = 1 << 20
 
@@ -217,8 +221,55 @@ def test_select_rollouts_keeps_only_the_named_rollouts_and_their_image_files() -
     assert list(selected.arrays.image_data) == ["h0", "h2"]
     assert selected.recorder_lines == ""
     assert selected.group_id == 3
-    assert selected.summary.group.metrics == finished.summary.group.metrics
     assert finished.num_bytes - selected.num_bytes == (16 + 8 + 8 + 32) + _IMAGE_BYTES
     rollout_2 = join_rollout_group(selected.summary, selected.arrays).rollouts[1]
     assert rollout_2.rollout_id == 2
     assert rollout_2.turns[0].prompt_delta_images[0].data == bytes(_IMAGE_BYTES)
+
+
+def test_a_leaders_rollouts_carry_no_group_metrics_and_build_the_same_samples() -> None:
+    """What the controller sends a trainer DP replica leader (`select_rollouts` of a training
+    group) has no group metrics, messages or logs, and the leader builds the same training
+    samples from it as from the full group."""
+    group = _group(group_size=3, with_image=False)
+    builder = TrainingSampleBuilder(TrainingSampleBuilder.Config())
+    expected = [
+        sample
+        for rollout in group.rollouts
+        for sample in builder.rollout_to_training_samples(rollout)
+    ]
+    finished = finish_rollout_group(
+        group,
+        for_training=True,
+        encoder=RolloutSampleEncoder(RolloutSampleRecorder.Config()),
+    )
+    # As the controller adds them after `run_group`.
+    finished.summary.group.metrics.extend(
+        compute_hop_metrics("run_group", wall_s=[1.0], handler_s=[0.9])
+    )
+    specs = builder.decide(
+        summary=finished.summary, num_mtp_layers=0
+    ).training_sample_specs
+
+    selected = finished.select_rollouts({0, 1, 2})
+
+    assert finished.summary.group.metrics
+    leader_group = join_rollout_group(selected.summary, selected.arrays)
+    assert leader_group.metrics == []
+    for rollout in leader_group.rollouts:
+        assert (rollout.logs, rollout.reward_breakdown) == ({}, {})
+        for turn in rollout.turns:
+            assert (turn.prompt_messages, turn.completion_message) == ([], None)
+            assert (turn.env_messages, turn.metrics) == ([], [])
+    samples = builder.materialize(
+        training_sample_specs=specs, rollout_groups={3: leader_group}
+    )
+    assert len(samples) == len(expected) == 3
+    for sample, expected_sample in zip(samples, expected, strict=True):
+        for sample_field in fields(sample):
+            value = getattr(sample, sample_field.name)
+            expected_value = getattr(expected_sample, sample_field.name)
+            if isinstance(value, np.ndarray):
+                np.testing.assert_array_equal(value, expected_value)
+            else:
+                assert value == expected_value

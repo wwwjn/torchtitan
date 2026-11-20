@@ -64,7 +64,8 @@ class ReplicaColumn:
     column d of `StepPlan.microbatch_groups`."""
 
     rollout_groups: list[FinishedRolloutGroup]
-    """Each group the column names, with only the rollouts it names."""
+    """Each group the column names, with only the rollouts it names and no group metrics
+    (`FinishedRolloutGroup.select_rollouts`)."""
 
 
 @dataclass(frozen=True, slots=True)
