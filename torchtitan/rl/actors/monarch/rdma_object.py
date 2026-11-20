@@ -6,8 +6,7 @@
 
 """Monarch's `RDMAObject` (`rl/rdma_object.py`): the owner registers a value's large
 tensors and bytes as Monarch RDMA buffers, and a reader reads them all in one RDMA action. The
-batcher sends trainer microbatches this way (`Batcher.Config.rdma_min_tensor_bytes`), and the
-rollout workers send prompt image files (`BaseRolloutWorker.Config.rdma_min_image_bytes`).
+rollout workers send prompt image files this way (`BaseRolloutWorker.Config.rdma_min_image_bytes`).
 """
 
 from __future__ import annotations
@@ -32,11 +31,10 @@ _ValueT = TypeVar("_ValueT")
 class MonarchRDMAObject(Generic[_ValueT]):
     """A value whose large tensors and bytes stay in its owner, the process that registered it.
 
-    Example (a microbatch: its 4 KiB ``input`` stays in the batcher, its 8-byte token counts go
-    by value):
-        rdma_microbatch = MonarchRDMAObject.register(microbatch, min_bytes=1024)  # owner
-        microbatch = await rdma_microbatch.read()  # reader: one RDMA action reads every buffer
-        await rdma_microbatch.drop()               # owner, after every reader has read it
+    Example (a 5 MB prompt image file stays in the rollout worker):
+        rdma_file = MonarchRDMAObject.register(image.data, min_bytes=1 << 20)  # owner
+        data = await rdma_file.read()  # reader: one RDMA action reads every buffer
+        await rdma_file.drop()         # owner, after every reader has read it
     """
 
     value: _ValueT
@@ -76,7 +74,7 @@ class _TensorRef:
     @classmethod
     def register(cls, tensor: torch.Tensor) -> _TensorRef:
         # A view, not a copy: the buffer keeps the tensor's storage alive until drop().
-        # view(-1) needs a contiguous tensor; the batcher builds only contiguous ones.
+        # view(-1) needs a contiguous tensor.
         return cls(
             buffer=RDMABuffer(tensor.view(-1).view(torch.uint8)),
             shape=tensor.shape,
@@ -84,8 +82,6 @@ class _TensorRef:
         )
 
     def queue_read(self, action: RDMAAction) -> torch.Tensor:
-        # TODO: allocate pinned tensors here. With max_num_documents also set, that removed the
-        # ~4 ms per microbatch in `TrainingEngine._forward_backward_body`'s TODO; pinned alone did not.
         tensor = torch.empty(self.shape, dtype=self.dtype)
         action.read_remote(tensor.view(-1).view(torch.uint8), self.buffer)
         return tensor
@@ -129,7 +125,7 @@ def _map_leaves(
 ) -> Any:
     """Return `value` with each `leaf_types` instance replaced by `fn(instance)`. Leaves are found
     in the containers pytree flattens (dict, list, tuple, ...) and, when `value` is a dataclass
-    (e.g. a `TrainingMicrobatch`), in each of its fields; a leaf inside any other object,
+    (e.g. a `PromptImage`), in each of its fields; a leaf inside any other object,
     including a nested dataclass, is kept. A dataclass `value` is rebuilt with
     `dataclasses.replace`, so its `__post_init__` sees the replaced leaves."""
     if isinstance(value, leaf_types) or not _is_dataclass_instance(value):

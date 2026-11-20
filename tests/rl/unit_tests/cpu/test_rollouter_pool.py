@@ -26,7 +26,10 @@ from torchtitan.rl.actors.monarch.system import MonarchActorSystem
 
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout import rollouter as rollouter_module, RolloutGroup
-from torchtitan.rl.rollout.finished_group import FinishedRolloutGroup
+from torchtitan.rl.rollout.finished_group import (
+    FinishedRolloutGroup,
+    split_rollout_group,
+)
 from torchtitan.rl.rollout.recorder import RolloutSampleRecorder
 from torchtitan.rl.rollout.rollouter import MessageEnvRolloutWorker, Rollouter
 from torchtitan.rl.rollout.types import (
@@ -63,7 +66,7 @@ class _ChooseRunGroupEndpoint:
         if self.error is not None:
             raise self.error
         group = RolloutGroup(group_id=kwargs["group_id"], rollouts=self.rollouts)
-        return FinishedRolloutGroup(group=group, recorder_lines=""), self.handler_s
+        return FinishedRolloutGroup(*split_rollout_group(group)), self.handler_s
 
 
 def test_rollout_worker_actor_builds_its_worker_and_inits_its_logger(
@@ -253,7 +256,7 @@ def test_rollout_group_dispatch_uses_choose(monkeypatch) -> None:
         ]
 
         actor_mesh.run_group.release.set()
-        assert (await dispatch).group.group_id == 1
+        assert (await dispatch).group_id == 1
         await rollouter.close()
         assert actor_mesh.stopped
 
@@ -272,7 +275,7 @@ def test_run_group_rollouts_logs_the_hop_and_the_payload(monkeypatch) -> None:
         actor_mesh = _WorkerActorMesh()
         rollouter = _rollouter_without_datasets()
         await _setup(rollouter, actor_mesh, monkeypatch)
-        # Both rollouts show one image file, shared as `share_image_data` leaves it.
+        # Both rollouts show one image file, which the split group keeps once.
         image = PromptImage(
             hash_value="h", source_path="a.png", grid_thw=(1, 2, 2), data=b"x" * 100
         )
@@ -319,7 +322,7 @@ def test_run_group_rollouts_logs_the_hop_and_the_payload(monkeypatch) -> None:
         actor_mesh.run_group.release.set()
         finished = await dispatch
         await rollouter.close()
-        return m.MetricsProcessor._aggregate_metrics(finished.group.metrics)
+        return m.MetricsProcessor._aggregate_metrics(finished.summary.group.metrics)
 
     metrics = asyncio.run(run())
 
@@ -332,7 +335,7 @@ def test_run_group_rollouts_logs_the_hop_and_the_payload(monkeypatch) -> None:
         metrics["timing/hop/run_group/transfer/mean"]
     )
     # Every array field counts, including ones RolloutTurn itself does not declare, and the
-    # shared image file once.
+    # image file once.
     assert metrics["payload/rollout_group_bytes/mean"] == 2 * (12 + 8 + 8 + 32) + 100
 
 

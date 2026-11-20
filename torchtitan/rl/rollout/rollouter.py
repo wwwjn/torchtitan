@@ -12,7 +12,7 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, TYPE_CHECKING
 
 import numpy as np
@@ -264,8 +264,9 @@ class Rollouter(Configurable):
                 which gets the full group.
 
         Returns:
-            One scored group. Its `metrics` hold the call's `timing/hop/run_group/*` (see
-            `compute_hop_metrics`) and `payload/rollout_group_bytes`.
+            One scored group, split. Its summary's `metrics` hold the call's
+            `timing/hop/run_group/*` (see `compute_hop_metrics`) and
+            `payload/rollout_group_bytes`.
         """
         if self._worker_actors is None:
             raise RuntimeError("rollout worker pool is not initialized")
@@ -289,27 +290,12 @@ class Rollouter(Configurable):
         # Shield `call` from the controller's end-of-training cancel, so `close` can still wait for it.
         finished, handler_s = await asyncio.shield(call)
         wall_s = time.perf_counter() - start
-        group = finished.group
-        group.metrics.extend(
+        metrics = finished.summary.group.metrics
+        metrics.extend(
             compute_hop_metrics("run_group", wall_s=[wall_s], handler_s=[handler_s])
         )
-        # Every array field of every turn (tokens, logprobs, and any per-token field a feature
-        # adds) plus each image file once (pickle writes a shared `bytes` object once): the bulk
-        # of the group's pickle.
-        payload_bytes = 0
-        image_data_ids: set[int] = set()
-        for rollout in group.rollouts:
-            for turn in rollout.turns:
-                for turn_field in fields(turn):
-                    value = getattr(turn, turn_field.name)
-                    if isinstance(value, np.ndarray):
-                        payload_bytes += value.nbytes
-                for image in turn.prompt_delta_images:
-                    if id(image.data) not in image_data_ids:
-                        image_data_ids.add(id(image.data))
-                        payload_bytes += len(image.data)
-        group.metrics.append(
-            m.Metric("payload/rollout_group_bytes", m.Mean(payload_bytes))
+        metrics.append(
+            m.Metric("payload/rollout_group_bytes", m.Mean(finished.num_bytes))
         )
         return finished
 

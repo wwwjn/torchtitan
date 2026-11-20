@@ -19,8 +19,10 @@ from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout import Rollout, RolloutGroup, RolloutStatus, RolloutTurn
 from torchtitan.rl.rollout.finished_group import (
     finish_rollout_group,
-    share_image_data,
+    FinishedRolloutGroup,
+    join_rollout_group,
     slim_rollout_group,
+    split_rollout_group,
 )
 from torchtitan.rl.rollout.recorder import RolloutSampleEncoder, RolloutSampleRecorder
 from torchtitan.rl.rollout.types import PromptImage, RolloutTurnID
@@ -35,14 +37,17 @@ class _TurnWithTopkLogprobs(RolloutTurn):
     completion_topk_logprobs: np.ndarray
 
 
-def _group(*, group_size: int = 8, with_image: bool = True) -> RolloutGroup:
-    """A scored group whose rollouts each read the same image file into their own bytes."""
+def _group(
+    *, group_size: int = 8, with_image: bool = True, image_per_rollout: bool = False
+) -> RolloutGroup:
+    """A scored group whose rollouts each read the same image file (or with
+    `image_per_rollout`, their own file) into their own bytes."""
     rollouts = []
     for rollout_id in range(group_size):
         images = (
             (
                 PromptImage(
-                    hash_value="h",
+                    hash_value=f"h{rollout_id}" if image_per_rollout else "h",
                     source_path="a.png",
                     grid_thw=(1, 2, 2),
                     # A copy per rollout, as each env reads the file.
@@ -120,21 +125,20 @@ def test_slim_rollout_group_drops_only_the_logging_fields() -> None:
     assert slim.metrics == group.metrics
 
 
-def test_share_image_data_pickles_each_image_file_once() -> None:
+def test_a_split_group_pickles_each_image_file_once() -> None:
     group = _group()
     assert len(pickle.dumps(group)) > 8 * _IMAGE_BYTES
 
-    share_image_data(group)
+    summary, arrays = split_rollout_group(group)
 
-    images = [
-        image
-        for rollout in group.rollouts
+    assert list(arrays.image_data) == ["h"]
+    assert {
+        image.data
+        for rollout in summary.group.rollouts
         for turn in rollout.turns
         for image in turn.prompt_delta_images
-    ]
-    assert len(images) == 8
-    assert len({id(image.data) for image in images}) == 1
-    assert len(pickle.dumps(group)) < 2 * _IMAGE_BYTES
+    } == {b""}
+    assert len(pickle.dumps((summary, arrays))) < 2 * _IMAGE_BYTES
 
 
 def test_finish_rollout_group_for_training_logs_records_then_slims() -> None:
@@ -154,15 +158,25 @@ def test_finish_rollout_group_for_training_logs_records_then_slims() -> None:
 
     # Metrics and recorder lines come from the full group (messages, reward breakdown).
     assert (
-        m.MetricsProcessor._aggregate_metrics(finished.group.metrics)
+        m.MetricsProcessor._aggregate_metrics(finished.summary.group.metrics)
         == expected_metrics
     )
     assert "rollout_reward/component/correct/mean" in expected_metrics
     assert finished.recorder_lines == expected_lines
     assert '"sort: b a"' in finished.recorder_lines
-    for rollout in finished.group.rollouts:
+    # The group is slim and split: the summary has no bytes, the arrays every array and one
+    # copy of the image file.
+    for rollout in finished.summary.group.rollouts:
         assert rollout.reward_breakdown == {}
         assert rollout.turns[0].prompt_messages == []
+        assert len(rollout.turns[0].completion_token_ids) == 0
+    assert set(finished.arrays.turn_arrays[0][0]) == {
+        "prompt_delta_token_ids",
+        "completion_token_ids",
+        "completion_logprobs",
+        "completion_topk_logprobs",
+    }
+    assert finished.num_bytes == 8 * (16 + 8 + 8 + 32) + _IMAGE_BYTES
     assert len(pickle.dumps(finished)) < 2 * _IMAGE_BYTES
 
 
@@ -173,6 +187,38 @@ def test_finish_rollout_group_for_validation_returns_the_full_group() -> None:
         for_training=False,
         encoder=RolloutSampleEncoder(RolloutSampleRecorder.Config()),
     )
-    assert finished.group is group
+    full_group = join_rollout_group(finished.summary, finished.arrays)
     assert finished.recorder_lines == ""
-    assert [metric.key for metric in group.metrics] == ["worker/x"]
+    assert [metric.key for metric in full_group.metrics] == ["worker/x"]
+    for rollout, full_rollout in zip(group.rollouts, full_group.rollouts, strict=True):
+        assert full_rollout.reward_breakdown == rollout.reward_breakdown
+        (turn,), (full_turn,) = rollout.turns, full_rollout.turns
+        assert full_turn.prompt_messages == turn.prompt_messages
+        assert full_turn.completion_token_ids is turn.completion_token_ids
+
+
+def test_select_rollouts_keeps_only_the_named_rollouts_and_their_image_files() -> None:
+    finished = FinishedRolloutGroup(
+        *split_rollout_group(_group(group_size=3, image_per_rollout=True)),
+        recorder_lines="lines",
+    )
+
+    selected = finished.select_rollouts({0, 2})
+
+    assert [rollout.rollout_id for rollout in selected.summary.group.rollouts] == [0, 2]
+    assert selected.summary.turn_lengths == (
+        finished.summary.turn_lengths[0],
+        finished.summary.turn_lengths[2],
+    )
+    assert selected.arrays.turn_arrays == (
+        finished.arrays.turn_arrays[0],
+        finished.arrays.turn_arrays[2],
+    )
+    assert list(selected.arrays.image_data) == ["h0", "h2"]
+    assert selected.recorder_lines == ""
+    assert selected.group_id == 3
+    assert selected.summary.group.metrics == finished.summary.group.metrics
+    assert finished.num_bytes - selected.num_bytes == (16 + 8 + 8 + 32) + _IMAGE_BYTES
+    rollout_2 = join_rollout_group(selected.summary, selected.arrays).rollouts[1]
+    assert rollout_2.rollout_id == 2
+    assert rollout_2.turns[0].prompt_delta_images[0].data == bytes(_IMAGE_BYTES)

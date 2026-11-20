@@ -222,37 +222,54 @@ def test_spec_token_counts_equal_the_packed_counts(
 
 @pytest.mark.parametrize("dp_degree", [1, 2])
 def test_plan_global_counts_equal_the_packed_microbatches(dp_degree: int) -> None:
+    group = _trainable_group()
     batcher = Batcher.Config(num_mtp_layers=3, per_sample_pad_multiple=8).build(
         num_tokens_per_microbatch_per_dp_rank=32,
         max_context_length=32,
         num_prompts_per_train_step=1,
         dp_degree=dp_degree,
-        pad_id=0,
-        temperature=1.0,
-        vision_processor=VisionProcessor.Config(**QWEN3_5_VISION_PROCESSOR_KWARGS),
     )
-    batch, _ = batcher.add_group(rollout_group=_trainable_group())
+    summary, arrays = split_rollout_group(group)
+    batch, _ = batcher.add_group(summary=summary)
 
     assert batch is not None
-    microbatches = [
-        microbatch
-        for group in batch.microbatch_groups
-        for row in group
-        for microbatch in row
+    plan = batch.plan
+    cells = [
+        microbatch_specs
+        for group_specs in plan.microbatch_groups
+        for row in group_specs
+        for microbatch_specs in row
     ]
+    samples = iter(
+        _builder().materialize(
+            training_sample_specs=[spec for specs in cells for spec in specs],
+            rollout_groups={0: join_rollout_group(summary, arrays)},
+        )
+    )
+    packer = MicrobatchPacker(
+        num_tokens_per_microbatch_per_dp_rank=32,
+        max_context_length=32,
+        pad_id=0,
+        temperature=1.0,
+        per_sample_pad_multiple=8,
+        num_mtp_layers=3,
+        build_mrope_positions=False,
+        vision_processor=VisionProcessor.Config(**QWEN3_5_VISION_PROCESSOR_KWARGS),
+    )
+    microbatches = [packer.pack([next(samples) for _ in specs]) for specs in cells]
     assert torch.equal(
-        batch.global_loss_token_counts,
+        plan.global_loss_token_counts,
         torch.stack([microbatch.loss_token_counts for microbatch in microbatches]).sum(
             0
         ),
     )
     assert torch.equal(
-        batch.global_routing_token_counts,
+        plan.global_routing_token_counts,
         torch.stack(
             [microbatch.routing_token_counts for microbatch in microbatches]
         ).sum(0),
     )
-    assert batch.global_loss_token_counts.dtype == torch.int64
+    assert plan.global_loss_token_counts.dtype == torch.int64
 
 
 def test_decide_reads_lengths_and_keeps_the_filters_and_metrics() -> None:
