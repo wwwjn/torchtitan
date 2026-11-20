@@ -30,6 +30,11 @@ from torchtitan.rl.trainer.trainer import (
 )
 from torchtitan.training_engine import ForwardBackwardResult, TrainingEngine
 
+from tests.rl.unit_tests.cpu.test_microbatch_group_reader import (
+    fake_column,
+    fake_training_sample_builder,
+)
+
 
 def test_mirrored_state_uses_a_fixed_opaque_template() -> None:
     source = MirroredState()
@@ -311,11 +316,7 @@ def _leader(
     trainer._is_replica_leader = True
     trainer._replica_column = None
     trainer._num_microbatches_per_group = num_microbatches_per_group
-    trainer._training_sample_builder = SimpleNamespace(
-        materialize=lambda *, training_sample_specs, rollout_groups: list(
-            training_sample_specs
-        )
-    )
+    trainer._training_sample_builder = fake_training_sample_builder
     microbatches = iter(packed)
     trainer._microbatch_packer = SimpleNamespace(
         pack=lambda samples: next(microbatches)
@@ -323,12 +324,14 @@ def _leader(
 
 
 def _column(num_groups: int, num_microbatches_per_group: int = 1) -> ReplicaColumn:
-    return ReplicaColumn(
-        microbatch_groups=[
-            [[f"spec_{group}_{index}"] for index in range(num_microbatches_per_group)]
+    return fake_column(
+        [
+            [
+                [group * num_microbatches_per_group + index]
+                for index in range(num_microbatches_per_group)
+            ]
             for group in range(num_groups)
-        ],
-        rollout_groups=[],
+        ]
     )
 
 

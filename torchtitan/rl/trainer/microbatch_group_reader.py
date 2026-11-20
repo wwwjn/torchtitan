@@ -34,6 +34,7 @@ from torchtitan.rl.rollout.finished_group import join_rollout_group
 
 if TYPE_CHECKING:
     from torchtitan.rl.rollout.finished_group import FinishedRolloutGroup
+    from torchtitan.rl.rollout.types import RolloutTurnID
     from torchtitan.rl.trainer.batcher import MicrobatchPacker, TrainingMicrobatch
     from torchtitan.rl.trainer.training_sample_builder import (
         TrainingSample,
@@ -111,7 +112,10 @@ class MicrobatchGroupReader:
         assert column is not None or replica_group is not None
         self._num_microbatch_groups = num_microbatch_groups
         self._replica_group = replica_group
-        self._column = column
+        # The leader's column. The reader keeps the rollout groups only until it materializes
+        # them, so the caller must not hold `column` past this call.
+        self._microbatch_groups = None if column is None else column.microbatch_groups
+        self._rollout_groups = [] if column is None else list(column.rollout_groups)
         self._training_sample_builder = training_sample_builder
         self._microbatch_packer = microbatch_packer
         # The leader's materialized samples, in column order, and where each group's samples start.
@@ -161,11 +165,11 @@ class MicrobatchGroupReader:
             raise RuntimeError(
                 f"The DP replica's leader failed to pack a microbatch group: {self._leader_error}"
             )
-        if self._column is None:
+        if self._microbatch_groups is None:
             microbatch_group = self._receive()
         else:
             try:
-                microbatch_group = self._pack(index, self._column)
+                microbatch_group = self._pack(index, self._microbatch_groups)
             except Exception as error:
                 self._leader_error = f"{type(error).__name__}: {error}"
                 self._send(_LeaderError(self._leader_error))
@@ -174,29 +178,19 @@ class MicrobatchGroupReader:
         # Here too, so training hides it like the packing.
         return [microbatch.preprocess_images() for microbatch in microbatch_group]
 
-    def _pack(self, index: int, column: ReplicaColumn) -> list[TrainingMicrobatch]:
+    def _pack(
+        self, index: int, microbatch_groups: list[list[list[TrainingSampleSpec]]]
+    ) -> list[TrainingMicrobatch]:
         start = time.perf_counter()
         if self._training_samples is None:
-            specs = [
-                spec
-                for group in column.microbatch_groups
-                for microbatch_specs in group
-                for spec in microbatch_specs
-            ]
-            self._training_samples = self._training_sample_builder.materialize(
-                training_sample_specs=specs,
-                rollout_groups={
-                    group.group_id: join_rollout_group(group.summary, group.arrays)
-                    for group in column.rollout_groups
-                },
-            )
+            self._training_samples = self._materialize(microbatch_groups)
             num_samples = 0
-            for group in column.microbatch_groups:
+            for group in microbatch_groups:
                 self._sample_starts.append(num_samples)
                 num_samples += sum(len(specs) for specs in group)
         microbatch_group = []
         sample_start = self._sample_starts[index]
-        for microbatch_specs in column.microbatch_groups[index]:
+        for microbatch_specs in microbatch_groups[index]:
             sample_end = sample_start + len(microbatch_specs)
             microbatch_group.append(
                 self._microbatch_packer.pack(
@@ -206,6 +200,40 @@ class MicrobatchGroupReader:
             sample_start = sample_end
         self.pack_s += time.perf_counter() - start
         return microbatch_group
+
+    def _materialize(
+        self, microbatch_groups: list[list[list[TrainingSampleSpec]]]
+    ) -> list[TrainingSample]:
+        """The column's samples, in column order. One rollout group at a time, dropping its
+        arrays as soon as its samples exist, so the column's arrays and its samples (copies)
+        are never all alive together."""
+        specs = [
+            spec
+            for group in microbatch_groups
+            for microbatch_specs in group
+            for spec in microbatch_specs
+        ]
+        specs_by_group_id: dict[int, list[TrainingSampleSpec]] = {}
+        for spec in specs:
+            specs_by_group_id.setdefault(spec.rollout_id.group_id, []).append(spec)
+        samples_by_id: dict[RolloutTurnID, TrainingSample] = {}
+        rollout_groups, self._rollout_groups = self._rollout_groups, []
+        rollout_groups.reverse()
+        while rollout_groups:
+            rollout_group = rollout_groups.pop()
+            group_specs = specs_by_group_id[rollout_group.group_id]
+            samples = self._training_sample_builder.materialize(
+                training_sample_specs=group_specs,
+                rollout_groups={
+                    rollout_group.group_id: join_rollout_group(
+                        rollout_group.summary, rollout_group.arrays
+                    )
+                },
+            )
+            del rollout_group
+            for spec, sample in zip(group_specs, samples, strict=True):
+                samples_by_id[spec.rollout_id] = sample
+        return [samples_by_id.pop(spec.rollout_id) for spec in specs]
 
     def _send(self, value: list[TrainingMicrobatch] | _LeaderError) -> None:
         if self._replica_group is None:

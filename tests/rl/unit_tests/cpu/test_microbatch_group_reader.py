@@ -14,6 +14,7 @@ import contextvars
 import dataclasses
 import threading
 import time
+import weakref
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,7 +29,7 @@ from torchtitan.rl.rollout.finished_group import (
     join_rollout_group,
     split_rollout_group,
 )
-from torchtitan.rl.rollout.types import RolloutGroup
+from torchtitan.rl.rollout.types import RolloutGroup, RolloutTurnID
 from torchtitan.rl.trainer.batcher import Batcher, MicrobatchPacker, TrainingMicrobatch
 from torchtitan.rl.trainer.microbatch_group_reader import (
     _NUM_MICROBATCH_GROUPS_READ_AHEAD,
@@ -297,12 +298,45 @@ def test_a_leader_that_fails_to_pack_fails_every_rank_of_its_replica(
             assert "KeyError" in error
 
 
+def fake_column(microbatch_groups: list[list[list[int]]]) -> ReplicaColumn:
+    """A column whose specs `fake_training_sample_builder` turns into the given ints, all from
+    one empty rollout group."""
+    return ReplicaColumn(
+        microbatch_groups=[
+            [
+                [
+                    SimpleNamespace(
+                        rollout_id=RolloutTurnID(
+                            group_id=0, rollout_id=index, turn_id=0
+                        )
+                    )
+                    for index in microbatch
+                ]
+                for microbatch in group
+            ]
+            for group in microbatch_groups
+        ],
+        rollout_groups=[
+            FinishedRolloutGroup(
+                *split_rollout_group(RolloutGroup(group_id=0, rollouts=[]))
+            )
+        ],
+    )
+
+
+fake_training_sample_builder = SimpleNamespace(
+    materialize=lambda *, training_sample_specs, rollout_groups: [
+        spec.rollout_id.rollout_id for spec in training_sample_specs
+    ]
+)
+
+
 def _counting_reader(
     num_groups: int, packed: list[int], *, pack=None
 ) -> MicrobatchGroupReader:
     """A reader on a replica of one rank whose packer records each group it packs."""
 
-    def default_pack(samples: list[str]) -> SimpleNamespace:
+    def default_pack(samples: list[int]) -> SimpleNamespace:
         [index] = samples
         packed.append(index)
         return SimpleNamespace(preprocess_images=lambda: index)
@@ -310,15 +344,8 @@ def _counting_reader(
     return MicrobatchGroupReader(
         num_microbatch_groups=num_groups,
         replica_group=None,
-        column=ReplicaColumn(
-            microbatch_groups=[[[index]] for index in range(num_groups)],
-            rollout_groups=[],
-        ),
-        training_sample_builder=SimpleNamespace(
-            materialize=lambda *, training_sample_specs, rollout_groups: list(
-                training_sample_specs
-            )
-        ),
+        column=fake_column([[[index]] for index in range(num_groups)]),
+        training_sample_builder=fake_training_sample_builder,
         microbatch_packer=SimpleNamespace(pack=pack or default_pack),
     )
 
@@ -376,3 +403,48 @@ def test_reader_skips_queued_groups_when_training_stops() -> None:
     assert group_1_done.wait(timeout=5)
     time.sleep(0.05)
     assert packed == [0, 1]
+
+
+def test_the_leader_frees_each_groups_arrays_before_the_next_materializes() -> None:
+    """The column's arrays and their samples (copies) are never all alive at once on the
+    leader: each rollout group's arrays go as soon as its samples exist."""
+    array_refs: list[weakref.ref] = []
+    num_alive_at_materialize = []
+
+    class _CountingBuilder(TrainingSampleBuilder):
+        def materialize(self, *, training_sample_specs, rollout_groups):
+            num_alive_at_materialize.append(
+                sum(array_ref() is not None for array_ref in array_refs)
+            )
+            return super().materialize(
+                training_sample_specs=training_sample_specs,
+                rollout_groups=rollout_groups,
+            )
+
+    builder = _CountingBuilder(TrainingSampleBuilder.Config())
+    rollout_groups, specs = [], []
+    for group in _groups()[:3]:
+        finished = FinishedRolloutGroup(*split_rollout_group(group))
+        array_refs.append(
+            weakref.ref(finished.arrays.turn_arrays[0][0]["completion_logprobs"])
+        )
+        specs += builder.decide(
+            summary=finished.summary, num_mtp_layers=0
+        ).training_sample_specs
+        rollout_groups.append(finished)
+    del group, finished
+    reader = MicrobatchGroupReader(
+        num_microbatch_groups=1,
+        replica_group=None,
+        column=ReplicaColumn(
+            microbatch_groups=[[specs]], rollout_groups=rollout_groups
+        ),
+        training_sample_builder=builder,
+        microbatch_packer=SimpleNamespace(
+            pack=lambda samples: SimpleNamespace(preprocess_images=lambda: len(samples))
+        ),
+    )
+    del rollout_groups
+
+    assert list(reader) == [[len(specs)]]
+    assert num_alive_at_materialize == [3, 2, 1]

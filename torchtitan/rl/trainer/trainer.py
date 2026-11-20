@@ -380,6 +380,8 @@ class Trainer(Configurable):
             training_sample_builder=self._training_sample_builder,
             microbatch_packer=self._microbatch_packer,
         )
+        # The reader frees each rollout group once its samples exist.
+        del column
         # The packer pads every microbatch to the same token count.
         self._step_num_tokens_per_dp_rank = (
             num_microbatch_groups
