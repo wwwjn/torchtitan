@@ -315,6 +315,7 @@ def _leader(
     trainer._replica_group = None
     trainer._is_replica_leader = True
     trainer._replica_column = None
+    trainer._rdma_byte_buffers = None
     trainer._num_microbatches_per_group = num_microbatches_per_group
     trainer._training_sample_builder = fake_training_sample_builder
     microbatches = iter(packed)
@@ -425,6 +426,9 @@ def test_forward_backward_accumulates_microbatch_metrics() -> None:
         assert result.pop("timing/trainer/pack_microbatches/max") > 0
         # No other rank in the replica: nothing to broadcast.
         assert result.pop("timing/trainer/broadcast_microbatches/max") == 0
+        # Every group came by value: nothing read from the rollout workers.
+        assert result.pop("timing/trainer/read_rollout_groups/max") == 0
+        assert result.pop("payload/trainer_read_bytes/max") == 0
         # One reduction per microbatch, then one for the timings.
         assert trainer._reduce_forward_backward_metrics.call_count == 3
         assert result == {"loss/mean": 3.0, "loss/max": 4.0}

@@ -15,6 +15,10 @@ step plan, and broadcasts each packed microbatch group to the replica's other ra
 Every rank of a replica trains on the same microbatches, so packing once per replica instead
 of once per rank saves the pp * cp * tp - 1 other ranks' CPU, and they need neither the rollouts
 nor the builder. Image files travel packed; every rank turns them into pixel values itself.
+
+Rollout groups packed in their rollout workers (`BaseRolloutWorker.Config.rdma_min_group_bytes`)
+reach the leader as handles; before packing the first microbatch group, the leader reads the
+rollouts its column names from every worker at once (`read_packed_rollout_groups`).
 """
 
 from __future__ import annotations
@@ -30,11 +34,15 @@ from typing import TYPE_CHECKING
 import torch.distributed as dist
 
 from torchtitan.observability import structured_logger as sl
-from torchtitan.rl.rollout.finished_group import join_rollout_group
+from torchtitan.rl.rollout.finished_group import (
+    join_rollout_group,
+    read_packed_rollout_groups,
+)
 
 if TYPE_CHECKING:
     from torchtitan.rl.rollout.finished_group import FinishedRolloutGroup
     from torchtitan.rl.rollout.types import RolloutTurnID
+    from torchtitan.rl.torch_transport_rdma import RDMAByteBuffers
     from torchtitan.rl.trainer.batcher import MicrobatchPacker, TrainingMicrobatch
     from torchtitan.rl.trainer.training_sample_builder import (
         TrainingSample,
@@ -65,7 +73,7 @@ class ReplicaColumn:
 
     rollout_groups: list[FinishedRolloutGroup]
     """Each group the column names, with only the rollouts it names and no group metrics
-    (`FinishedRolloutGroup.select_rollouts`)."""
+    (`FinishedRolloutGroup.select_rollouts`): their arrays, or their handles when packed."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +116,7 @@ class MicrobatchGroupReader:
         column: ReplicaColumn | None,
         training_sample_builder: TrainingSampleBuilder,
         microbatch_packer: MicrobatchPacker,
+        rdma_byte_buffers: RDMAByteBuffers | None = None,
     ) -> None:
         # The replica's rank 0 is its leader.
         assert column is not None or replica_group is not None
@@ -119,6 +128,8 @@ class MicrobatchGroupReader:
         self._rollout_groups = [] if column is None else list(column.rollout_groups)
         self._training_sample_builder = training_sample_builder
         self._microbatch_packer = microbatch_packer
+        # Reads the column's packed groups; set on leaders when groups go by RDMA.
+        self._rdma_byte_buffers = rdma_byte_buffers
         # The leader's materialized samples, in column order, and where each group's samples start.
         self._training_samples: list[TrainingSample] | None = None
         self._sample_starts: list[int] = []
@@ -126,6 +137,8 @@ class MicrobatchGroupReader:
         # broadcast, so no rank waits for a group the others never send.
         self._leader_error: str | None = None
         # This rank's total times, hidden or not; final once a pass ends.
+        self.read_s = 0.0
+        self.read_bytes = 0
         self.pack_s = 0.0
         self.broadcast_s = 0.0
 
@@ -182,6 +195,8 @@ class MicrobatchGroupReader:
     def _pack(
         self, index: int, microbatch_groups: list[list[list[TrainingSampleSpec]]]
     ) -> list[TrainingMicrobatch]:
+        if self._training_samples is None:
+            self._read_packed_rollout_groups()
         start = time.perf_counter()
         if self._training_samples is None:
             self._training_samples = self._materialize(microbatch_groups)
@@ -201,6 +216,20 @@ class MicrobatchGroupReader:
             sample_start = sample_end
         self.pack_s += time.perf_counter() - start
         return microbatch_group
+
+    def _read_packed_rollout_groups(self) -> None:
+        """Read the column's packed groups from their rollout workers, all reads in flight
+        together; groups sent by value pass through."""
+        num_bytes = sum(group.num_packed_bytes for group in self._rollout_groups)
+        if num_bytes == 0:
+            return
+        assert self._rdma_byte_buffers is not None
+        start = time.perf_counter()
+        self._rollout_groups = read_packed_rollout_groups(
+            self._rollout_groups, self._rdma_byte_buffers
+        )
+        self.read_s += time.perf_counter() - start
+        self.read_bytes += num_bytes
 
     def _materialize(
         self, microbatch_groups: list[list[list[TrainingSampleSpec]]]
@@ -223,6 +252,7 @@ class MicrobatchGroupReader:
         while rollout_groups:
             rollout_group = rollout_groups.pop()
             group_specs = specs_by_group_id[rollout_group.group_id]
+            assert rollout_group.arrays is not None
             samples = self._training_sample_builder.materialize(
                 training_sample_specs=group_specs,
                 rollout_groups={

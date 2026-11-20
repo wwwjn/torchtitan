@@ -9,9 +9,10 @@
 from __future__ import annotations
 
 import pickle
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 
 import numpy as np
+import pytest
 from renderers import PlaceholderRange
 
 from torchtitan.rl.controller.metrics import (
@@ -24,12 +25,18 @@ from torchtitan.rl.rollout.finished_group import (
     finish_rollout_group,
     FinishedRolloutGroup,
     join_rollout_group,
+    pack_rollout_group,
+    read_packed_rollout_groups,
+    RolloutGroupArrays,
+    RolloutGroupBuffers,
     slim_rollout_group,
     split_rollout_group,
 )
 from torchtitan.rl.rollout.recorder import RolloutSampleEncoder, RolloutSampleRecorder
 from torchtitan.rl.rollout.types import PromptImage, RolloutTurnID
 from torchtitan.rl.trainer.training_sample_builder import TrainingSampleBuilder
+
+from tests.rl.unit_tests.cpu.test_torch_transport_rdma import loopback_buffers
 
 _IMAGE_BYTES = 1 << 20
 
@@ -270,6 +277,246 @@ def test_a_leaders_rollouts_carry_no_group_metrics_and_build_the_same_samples() 
             value = getattr(sample, sample_field.name)
             expected_value = getattr(expected_sample, sample_field.name)
             if isinstance(value, np.ndarray):
+                np.testing.assert_array_equal(value, expected_value)
+            else:
+                assert value == expected_value
+
+
+def _multiturn_group(*, empty_completion: bool = True) -> RolloutGroup:
+    """3 rollouts: one with an image and two turns, one with an empty completion (unless
+    `empty_completion` is False: the batcher drops such a group), and turns that carry `[N, k]`
+    top-k rows (a non-contiguous `[:, 1:]` view, as vLLM returns them) and a
+    `uint8 [rows, 48, 8]` field, as router replay would."""
+    rollouts = []
+    for rollout_id in range(3):
+        turns = []
+        for turn_id in range(2 if rollout_id == 0 else 1):
+            num_completion = 0 if rollout_id == 1 and empty_completion else 3 + turn_id
+            topk = np.arange(num_completion * 5, dtype=np.float32).reshape(-1, 5)[:, 1:]
+            turns.append(
+                _TurnWithTopkAndExperts(
+                    rollout_id=RolloutTurnID(
+                        group_id=9, rollout_id=rollout_id, turn_id=turn_id
+                    ),
+                    # Turn 1 continues turn 0's 4 prompt and 3 completion tokens.
+                    prompt_prefix_len=7 * turn_id,
+                    prompt_delta_token_ids=np.arange(4 + turn_id, dtype=np.int32),
+                    prompt_delta_images=(
+                        (
+                            PromptImage(
+                                hash_value="img",
+                                source_path="a.png",
+                                grid_thw=(1, 2, 2),
+                                data=bytes(range(256)) * 3,
+                            ),
+                        )
+                        if rollout_id == 0 and turn_id == 0
+                        else ()
+                    ),
+                    prompt_delta_image_placeholders=(
+                        (PlaceholderRange(offset=1, length=1),)
+                        if rollout_id == 0 and turn_id == 0
+                        else ()
+                    ),
+                    completion_token_ids=np.arange(num_completion, dtype=np.int32) + 10,
+                    completion_logprobs=np.full(num_completion, -0.5, dtype=np.float32),
+                    completion_topk_logprobs=topk,
+                    routed_expert_ids=np.full(
+                        (num_completion + 3, 48, 8), rollout_id, dtype=np.uint8
+                    ),
+                    min_policy_version=1,
+                    max_policy_version=1,
+                )
+            )
+        rollouts.append(
+            Rollout(
+                group_id=9,
+                rollout_id=rollout_id,
+                status=RolloutStatus.COMPLETED,
+                turns=turns,
+                reward=float(rollout_id),
+                advantage=float(rollout_id) - 1.0,
+            )
+        )
+    return RolloutGroup(group_id=9, rollouts=rollouts)
+
+
+@dataclass(kw_only=True, slots=True)
+class _TurnWithTopkAndExperts(RolloutTurn):
+    completion_topk_logprobs: np.ndarray
+    routed_expert_ids: np.ndarray
+
+
+def _assert_arrays_equal(
+    actual: RolloutGroupArrays, expected: RolloutGroupArrays
+) -> None:
+    assert len(actual.turn_arrays) == len(expected.turn_arrays)
+    for actual_rollout, expected_rollout in zip(
+        actual.turn_arrays, expected.turn_arrays, strict=True
+    ):
+        for actual_turn, expected_turn in zip(
+            actual_rollout, expected_rollout, strict=True
+        ):
+            assert list(actual_turn) == list(expected_turn)
+            for name, expected_array in expected_turn.items():
+                assert actual_turn[name].dtype == expected_array.dtype
+                np.testing.assert_array_equal(actual_turn[name], expected_array)
+    assert actual.image_data == expected.image_data
+
+
+def _packed(
+    finished: FinishedRolloutGroup, owner, *, generation: int = 1
+) -> FinishedRolloutGroup:
+    packed = pack_rollout_group(
+        finished.arrays,
+        group_id=finished.group_id,
+        generation=generation,
+        allocate=owner.allocate,
+    )
+    return replace(finished, arrays=None, packed=packed)
+
+
+def test_a_packed_group_reads_back_equal_to_its_arrays() -> None:
+    owner, reader = loopback_buffers()
+    finished = FinishedRolloutGroup(*split_rollout_group(_multiturn_group()))
+
+    packed = _packed(finished, owner)
+    [read] = read_packed_rollout_groups([packed], reader)
+
+    assert (packed.arrays, packed.num_bytes) == (None, 0)
+    assert read.packed is None
+    _assert_arrays_equal(read.arrays, finished.arrays)
+    assert read.arrays.turn_arrays[0][0]["completion_topk_logprobs"].shape == (3, 4)
+    regions = packed.packed.regions()
+    assert len(regions) == 3 + 1  # one per rollout, one per distinct image
+    assert all(region.offset % 64 == 0 for region in regions)
+    assert packed.num_packed_bytes == sum(region.num_bytes for region in regions)
+
+
+def test_a_leader_reads_only_its_rollouts_and_their_images() -> None:
+    owner, reader = loopback_buffers()
+    finished = FinishedRolloutGroup(*split_rollout_group(_multiturn_group()))
+    packed = _packed(finished, owner)
+    regions = packed.packed.rollout_regions
+
+    without_image = packed.select_rollouts({1, 2})
+    [read] = read_packed_rollout_groups([without_image], reader)
+
+    _assert_arrays_equal(read.arrays, finished.select_rollouts({1, 2}).arrays)
+    # Rollouts 1 and 2 are adjacent: one read covering both, nothing of rollout 0 or the image.
+    assert reader._transport.read_ranges == [
+        (
+            regions[1].offset,
+            regions[2].offset + regions[2].num_bytes - regions[1].offset,
+        )
+    ]
+
+    reader._transport.read_ranges.clear()
+    [read] = read_packed_rollout_groups([packed.select_rollouts({0})], reader)
+    _assert_arrays_equal(read.arrays, finished.select_rollouts({0}).arrays)
+    assert (
+        len(reader._transport.read_ranges) == 2
+    )  # rollout 0 and the image, not adjacent
+
+
+def test_groups_sent_by_value_pass_through_the_read() -> None:
+    owner, reader = loopback_buffers()
+    by_value = FinishedRolloutGroup(*split_rollout_group(_group(group_size=2)))
+    packed = _packed(
+        FinishedRolloutGroup(*split_rollout_group(_multiturn_group())), owner
+    )
+
+    read = read_packed_rollout_groups([by_value, packed], reader)
+
+    assert read[0] is by_value
+    assert read[1].group_id == 9 and read[1].arrays is not None
+
+
+def test_a_read_of_a_reused_buffer_raises_naming_both_tags() -> None:
+    """A handle read after its buffer went to another group (a retire-order bug) raises instead
+    of returning the other group's bytes."""
+    owner, reader = loopback_buffers()
+    group_buffers = RolloutGroupBuffers(min_bytes=1, buffers=owner)
+    old = group_buffers.pack(
+        FinishedRolloutGroup(*split_rollout_group(_group(group_size=2)))
+    )
+    group_buffers.release([old.group_id])
+    new_group = replace(_group(group_size=2), group_id=4)
+    new = group_buffers.pack(FinishedRolloutGroup(*split_rollout_group(new_group)))
+
+    assert new.packed.buffer.buffer_index == old.packed.buffer.buffer_index
+    with pytest.raises(RuntimeError, match=r"group 3 \(generation 1\).*\(4, 2\)"):
+        read_packed_rollout_groups([old], reader)
+
+
+def test_a_torn_region_raises() -> None:
+    owner, reader = loopback_buffers()
+    packed = _packed(
+        FinishedRolloutGroup(*split_rollout_group(_multiturn_group())), owner
+    )
+    region = packed.packed.rollout_regions[1]
+    tensor = owner.pool.buffer(packed.packed.buffer.buffer_index).tensor
+    tensor[region.offset + region.num_bytes - 1] += 1  # the trailing tag
+
+    with pytest.raises(RuntimeError, match="reused the buffer"):
+        read_packed_rollout_groups([packed], reader)
+
+
+def test_rollout_group_buffers_pack_large_groups_and_reuse_released_buffers() -> None:
+    owner, reader = loopback_buffers()
+    finished = FinishedRolloutGroup(*split_rollout_group(_group(group_size=2)))
+    group_buffers = RolloutGroupBuffers(min_bytes=finished.num_bytes, buffers=owner)
+
+    small = replace(_group(group_size=1), group_id=5)
+    assert (
+        group_buffers.pack(FinishedRolloutGroup(*split_rollout_group(small))).packed
+        is None
+    )
+    packed = group_buffers.pack(finished)
+
+    assert packed.arrays is None and packed.packed.group_id == 3
+    metrics = {metric.key: metric.value for metric in packed.summary.group.metrics}
+    assert metrics["rollout_worker/pool_registrations"].value == 1
+    assert (
+        metrics["rollout_worker/live_group_bytes"].value == owner.pool.registered_bytes
+    )
+    [read] = read_packed_rollout_groups([packed], reader)
+    _assert_arrays_equal(read.arrays, finished.arrays)
+
+    group_buffers.release([3, 77])  # 77 is on another worker
+    group_buffers.release([3])  # already released: nothing to do
+    assert owner.pool.free_bytes == owner.pool.registered_bytes
+    again = group_buffers.pack(replace(finished, summary=replace(finished.summary)))
+    assert again.packed.buffer.buffer_index == packed.packed.buffer.buffer_index
+    assert owner._transport.num_registrations == 1
+    assert owner._transport.num_unregistrations == 0
+
+
+def test_a_packed_group_builds_the_same_samples_as_by_value() -> None:
+    owner, reader = loopback_buffers()
+    group = _multiturn_group(empty_completion=False)
+    builder = TrainingSampleBuilder(TrainingSampleBuilder.Config())
+    finished = FinishedRolloutGroup(*split_rollout_group(group))
+    specs = builder.decide(
+        summary=finished.summary, num_mtp_layers=0
+    ).training_sample_specs
+
+    [read] = read_packed_rollout_groups([_packed(finished, owner)], reader)
+
+    expected = builder.materialize(
+        training_sample_specs=specs, rollout_groups={9: group}
+    )
+    samples = builder.materialize(
+        training_sample_specs=specs,
+        rollout_groups={9: join_rollout_group(read.summary, read.arrays)},
+    )
+    assert len(samples) == len(expected) > 0
+    for sample, expected_sample in zip(samples, expected, strict=True):
+        for sample_field in fields(sample):
+            value = getattr(sample, sample_field.name)
+            expected_value = getattr(expected_sample, sample_field.name)
+            if isinstance(value, np.ndarray):
+                assert value.dtype == expected_value.dtype
                 np.testing.assert_array_equal(value, expected_value)
             else:
                 assert value == expected_value

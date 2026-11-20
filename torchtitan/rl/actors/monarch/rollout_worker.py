@@ -26,9 +26,15 @@ from torchtitan.rl.actors.monarch.rdma_object import (
 from torchtitan.rl.rollout.finished_group import (
     finish_rollout_group,
     FinishedRolloutGroup,
+    RolloutGroupBuffers,
 )
 from torchtitan.rl.rollout.recorder import RolloutSampleEncoder, RolloutSampleRecorder
 from torchtitan.rl.rollout.rollouter import BaseRolloutWorker
+from torchtitan.rl.torch_transport_rdma import (
+    make_rdma_probe,
+    RDMAByteBuffers,
+    RDMAProbe,
+)
 
 
 class RolloutWorkerActor(Actor):
@@ -58,6 +64,16 @@ class RolloutWorkerActor(Actor):
             }
         self._worker = worker_config.build(**worker_kwargs)
         self._encoder: RolloutSampleEncoder
+        # Large training groups wait here, packed, until the controller retires them.
+        self._group_buffers: RolloutGroupBuffers | None = None
+        self._rdma_byte_buffers: RDMAByteBuffers | None = None
+        self._rdma_probe: RDMAProbe | None = None
+        if worker_config.rdma_min_group_bytes is not None:
+            self._rdma_byte_buffers = RDMAByteBuffers()
+            self._group_buffers = RolloutGroupBuffers(
+                min_bytes=worker_config.rdma_min_group_bytes,
+                buffers=self._rdma_byte_buffers,
+            )
 
     @concurrent_endpoint
     async def setup_async(
@@ -104,7 +120,28 @@ class RolloutWorkerActor(Actor):
         finished = finish_rollout_group(
             group, for_training=for_training, encoder=self._encoder
         )
+        if for_training and self._group_buffers is not None:
+            finished = self._group_buffers.pack(finished)
         return finished, time.perf_counter() - start
+
+    @concurrent_endpoint
+    async def release_groups(self, group_ids: list[int]) -> None:
+        """Return the buffers of the retired groups packed here to the pool."""
+        assert self._group_buffers is not None
+        self._group_buffers.release(group_ids)
+
+    @concurrent_endpoint
+    async def make_rdma_probe(self) -> RDMAProbe:
+        """A small buffer for every trainer DP replica leader to read at setup."""
+        assert self._rdma_byte_buffers is not None and self._rdma_probe is None
+        self._rdma_probe = make_rdma_probe(self._rdma_byte_buffers)
+        return self._rdma_probe
+
+    @concurrent_endpoint
+    async def drop_rdma_probe(self) -> None:
+        assert self._rdma_byte_buffers is not None and self._rdma_probe is not None
+        self._rdma_byte_buffers.release(self._rdma_probe.buffer)
+        self._rdma_probe = None
 
     @concurrent_endpoint
     async def sync_log_step(self, step: int) -> None:

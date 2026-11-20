@@ -11,6 +11,7 @@ import asyncio
 import itertools
 import json
 import logging
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -987,6 +988,48 @@ def test_batcher_loop_times_each_add_group_call() -> None:
         metrics["timing/hop/add_group/transfer/max"]
         >= metrics["timing/hop/add_group/transfer/mean"]
     )
+
+
+def test_batcher_loop_releases_an_untrainable_packed_group_at_once() -> None:
+    """A packed group the batcher drops goes back to its worker's pool right away; a trainable
+    packed group waits for its step; a group sent by value needs no release."""
+    released: list[list[int]] = []
+
+    async def add_group(*, summary):
+        # Groups 0 (packed) and 2 (by value) are untrainable; group 1 (packed) fills a batch.
+        group_id = summary.group.group_id
+        batch = SimpleNamespace(metrics=[]) if group_id == 1 else None
+        return batch, group_id == 1, 0.0
+
+    async def run() -> Controller:
+        buffer = _buffer(capacity=3, window_size=None)
+        for group_id in (0, 2, 1):
+            await _admit(buffer, group_id)
+            await buffer.claim_next()
+            finished = _finished_group(group_id)
+            if group_id != 2:
+                finished = replace(finished, arrays=None, packed=object())
+            await buffer.finalize_work(finished)
+        controller = object.__new__(Controller)
+        controller._group_buffer = buffer
+        controller._finished_groups_by_id = {}
+        controller._packed_group_ids = set()
+        controller._rollouter = SimpleNamespace(release_groups=released.append)
+        controller.batcher = SimpleNamespace(
+            add_group=SimpleNamespace(call_one=add_group)
+        )
+        queue: asyncio.Queue = asyncio.Queue()
+        loop = asyncio.create_task(controller._batcher_loop(training_batch_queue=queue))
+        await queue.get()
+        await buffer.close()
+        await loop
+        return controller
+
+    controller = asyncio.run(asyncio.wait_for(run(), timeout=10))
+
+    assert released == [[0]]
+    assert controller._packed_group_ids == {1}
+    assert list(controller._finished_groups_by_id) == [1]
 
 
 async def _settle() -> None:

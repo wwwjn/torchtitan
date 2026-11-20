@@ -42,8 +42,8 @@ RolloutGroupWorkBuffer
 _batcher_loop
 +----------------------------------------------------------------------------------------+
 | batch, trainable, _ = batcher.add_group.call_one(finished.summary)                     |
-| if trainable: _finished_groups_by_id[group_id] = finished  (arrays wait here)          |
-| else: group_buffer.retire([group_id], "untrainable_group")                             |
+| if trainable: _finished_groups_by_id[group_id] = finished  (arrays or handles wait)    |
+| else: _retire_groups([group_id], "untrainable_group")                                  |
 | training_batch_queue.put(TrainerStepBatch)                                             |
 +-----------------------+------------------------------+---------------------------------+
                         |  ^                           |
@@ -60,7 +60,8 @@ _trainer_loop
 +----------------------------------------------------------------------------------------------------------+
 | per DP rank d: leader_by_dp_rank[d].receive_replica_column(plan column d + the rollouts it names)         |
 | by_dp_rank[d].forward_backward(num groups, global counts): the leader packs, broadcasts to its replica    |
-| -> optim -> push/pull weights -> buffer.retire(batch.trainable_group_ids)                                |
+| -> optim -> push/pull weights -> _retire_groups(batch.trainable_group_ids)                               |
+|    (packed groups: rollouter.release_groups -> each rollout worker returns their buffers to its pool)    |
 +----------------------------------------------------------------------------------------------------------+
 
 Backpressure (each loop: what it consumes/produces, and what gates each side):
@@ -595,6 +596,9 @@ class Controller(Configurable):
         # Each trainable group the batcher has, until its step sends the rollouts it trains on to
         # the trainer's DP replica leaders (the batcher gets only summaries).
         self._finished_groups_by_id: dict[int, FinishedRolloutGroup] = {}
+        # Groups whose arrays wait packed in a rollout worker
+        # (`BaseRolloutWorker.Config.rdma_min_group_bytes`): retiring one tells the workers.
+        self._packed_group_ids: set[int] = set()
         # Resume step (0 = fresh); set in setup_async from the loaded checkpoint.
         self.start_step = 0
         self.metrics_processor: m.MetricsProcessor = config.metrics.build(
@@ -840,6 +844,25 @@ class Controller(Configurable):
                 hf_assets_path=config.hf_assets_path,
                 rollout_recorder_config=config.rollout_recorder,
                 vision_processor_config=config.vision_processor,
+            )
+
+        if config.rollouter.worker.rdma_min_group_bytes is not None:
+            # Each trainer DP replica leader reads one probe from each rollout worker, so a host
+            # whose RDMA reads fail raises here instead of in the first step.
+            with sl.log_trace_span("rdma_group_probe"):
+                probes = await self._rollouter.make_rdma_probes()
+                await asyncio.gather(
+                    *(
+                        leader.check_rdma_probes.call_one(probes)
+                        for leader in self.trainer.leader_by_dp_rank
+                    )
+                )
+                await self._rollouter.drop_rdma_probes()
+            logger.info(
+                "Rollout groups of >= %d bytes stay in the rollout workers; trainer DP "
+                "replica leaders read them over torch transport (UCX_TLS=%s)",
+                config.rollouter.worker.rdma_min_group_bytes,
+                os.environ.get("UCX_TLS"),
             )
 
         if config.model_state_dict_transport is not None:
@@ -1312,10 +1335,12 @@ class Controller(Configurable):
                 ) = await self.batcher.add_group.call_one(summary=finished.summary)
                 add_group_wall_s.append(time.perf_counter() - start)
                 add_group_handler_s.append(handler_s)
+            if finished.packed is not None:
+                self._packed_group_ids.add(finished.group_id)
             if group_is_trainable:
                 self._finished_groups_by_id[finished.group_id] = finished
             else:
-                await self._group_buffer.retire(
+                await self._retire_groups(
                     [finished.group_id], reason="untrainable_group"
                 )
             del finished
@@ -1606,6 +1631,10 @@ class Controller(Configurable):
             sum(group.num_bytes for group in column.rollout_groups)
             for column in columns
         ]
+        column_packed_bytes = [
+            sum(group.num_packed_bytes for group in column.rollout_groups)
+            for column in columns
+        ]
         return [
             *compute_hop_metrics(
                 "receive_replica_column",
@@ -1614,6 +1643,11 @@ class Controller(Configurable):
             ),
             # What each leader's call carries: the arrays of the rollouts its column names.
             m.Metric("payload/replica_column_bytes", m.Mean.from_list(column_bytes)),
+            # What each leader reads from the rollout workers instead (packed groups).
+            m.Metric(
+                "payload/replica_column_packed_bytes",
+                m.Mean.from_list(column_packed_bytes),
+            ),
         ]
 
     def _start_push_model_state_dict(self) -> asyncio.Task[float]:
@@ -1656,5 +1690,17 @@ class Controller(Configurable):
             len(trainable_group_ids)
             == self.config.async_loop.num_prompts_per_train_step
         )
-        await self._group_buffer.retire(trainable_group_ids, reason="trained")
+        await self._retire_groups(trainable_group_ids, reason="trained")
         return pull_s
+
+    async def _retire_groups(self, group_ids: list[int], *, reason: str) -> None:
+        """Free the groups' active slots (`RolloutGroupWorkBuffer.retire`), and tell the rollout
+        workers to reuse the buffers of those that wait packed there. Every read of a trained
+        group's buffer ends before its step's `forward_backward` returns, before this."""
+        await self._group_buffer.retire(group_ids, reason=reason)
+        packed_group_ids = [
+            group_id for group_id in group_ids if group_id in self._packed_group_ids
+        ]
+        if packed_group_ids:
+            self._packed_group_ids.difference_update(packed_group_ids)
+            self._rollouter.release_groups(packed_group_ids)

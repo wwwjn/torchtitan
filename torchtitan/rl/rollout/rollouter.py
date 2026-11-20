@@ -49,6 +49,7 @@ if TYPE_CHECKING:
 
     # Type-only: importing the generator module here would pull in vLLM at import time.
     from torchtitan.rl.generator.types import SamplingConfig
+    from torchtitan.rl.torch_transport_rdma import RDMAProbe
 
 
 logger = logging.getLogger(__name__)
@@ -238,6 +239,21 @@ class Rollouter(Configurable):
         if self._worker_actors is not None:
             await self._worker_actors.sync_log_step.call(step)
 
+    def release_groups(self, group_ids: list[int]) -> None:
+        """Tell every rollout worker that these packed groups are retired: the worker that
+        holds each one returns its buffer to its pool. One-way, not awaited."""
+        assert self._worker_actors is not None
+        self._worker_actors.release_groups.broadcast(group_ids)
+
+    async def make_rdma_probes(self) -> list[RDMAProbe]:
+        """One probe buffer per rollout worker (`check_rdma_probes`)."""
+        assert self._worker_actors is not None
+        return list((await self._worker_actors.make_rdma_probe.call()).values())
+
+    async def drop_rdma_probes(self) -> None:
+        assert self._worker_actors is not None
+        await self._worker_actors.drop_rdma_probe.call()
+
     async def run_group_rollouts(
         self,
         *,
@@ -349,11 +365,28 @@ class BaseRolloutWorker(Configurable, ABC):
         `Rollouter.Config.worker_pool_size` x 256 MiB in all; on a single-host run, GPU 0 is
         trainer rank 0's GPU."""
 
+        rdma_min_group_bytes: int | None = None
+        """Keep each training group whose arrays are at least this many bytes in this worker,
+        packed into one registered buffer, instead of sending the arrays to the controller; each
+        trainer DP replica leader reads only the rollouts it trains on, over torch transport
+        (NIXL). The worker keeps the buffer until the step that trains the group commits, then
+        reuses it for a later group:
+            None (default): every group by value, worker -> controller -> leaders.
+            e.g. 1: every training group by RDMA.
+        Needs torch transport in every rollout worker and trainer DP replica leader; setup reads
+        a probe from each worker on each leader and raises if a read fails. The workers' pools
+        never shrink: each holds about the bytes of its largest set of live groups."""
+
         def __post_init__(self) -> None:
             if self.rdma_min_image_bytes is not None and self.rdma_min_image_bytes < 1:
                 raise ValueError(
                     "rdma_min_image_bytes must be None or >= 1 (RDMABuffer rejects empty "
                     f"buffers), got {self.rdma_min_image_bytes}"
+                )
+            if self.rdma_min_group_bytes is not None and self.rdma_min_group_bytes < 1:
+                raise ValueError(
+                    "rdma_min_group_bytes must be None or >= 1, got "
+                    f"{self.rdma_min_group_bytes}"
                 )
 
     def __init__(

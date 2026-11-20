@@ -27,10 +27,16 @@ from torchtitan.rl.controller.controller import Controller
 from torchtitan.rl.rollout.finished_group import (
     FinishedRolloutGroup,
     join_rollout_group,
+    RolloutGroupBuffers,
     split_rollout_group,
 )
 from torchtitan.rl.rollout.types import RolloutGroup, RolloutTurnID
-from torchtitan.rl.trainer.batcher import Batcher, MicrobatchPacker, TrainingMicrobatch
+from torchtitan.rl.trainer.batcher import (
+    Batcher,
+    MicrobatchPacker,
+    StepPlan,
+    TrainingMicrobatch,
+)
 from torchtitan.rl.trainer.microbatch_group_reader import (
     _NUM_MICROBATCH_GROUPS_READ_AHEAD,
     MicrobatchGroupReader,
@@ -39,6 +45,7 @@ from torchtitan.rl.trainer.microbatch_group_reader import (
 from torchtitan.rl.trainer.trainer import trainer_ranks_by_dp_rank
 from torchtitan.rl.trainer.training_sample_builder import TrainingSampleBuilder
 
+from tests.rl.unit_tests.cpu.test_torch_transport_rdma import loopback_buffers
 from tests.rl.unit_tests.cpu.test_training_sample_spec import _NAN, _rollout
 
 _SEQ_LEN = 16
@@ -98,6 +105,28 @@ def _plan_columns(
     *, dp_degree: int, num_pp_microbatches: int
 ) -> tuple[list[ReplicaColumn], dict[int, FinishedRolloutGroup]]:
     """Plan `_groups()` with the batcher, and cut each DP rank's column as the controller does."""
+    plan, finished_by_id = _plan(
+        dp_degree=dp_degree, num_pp_microbatches=num_pp_microbatches
+    )
+    return _columns(plan, finished_by_id, dp_degree=dp_degree), finished_by_id
+
+
+def _columns(
+    plan: StepPlan,
+    finished_by_id: dict[int, FinishedRolloutGroup],
+    *,
+    dp_degree: int,
+) -> list[ReplicaColumn]:
+    controller = SimpleNamespace(
+        trainer_dp_degree=dp_degree, _finished_groups_by_id=finished_by_id
+    )
+    return Controller._replica_columns(controller, plan)
+
+
+def _plan(
+    *, dp_degree: int, num_pp_microbatches: int
+) -> tuple[StepPlan, dict[int, FinishedRolloutGroup]]:
+    """Plan `_groups()` with the batcher."""
     batcher = Batcher.Config().build(
         num_tokens_per_microbatch_per_dp_rank=_NUM_TOKENS_PER_MICROBATCH,
         max_context_length=_SEQ_LEN,
@@ -115,10 +144,7 @@ def _plan_columns(
         for finished in finished_by_id.values()
     ]
     assert batch is not None
-    controller = SimpleNamespace(
-        trainer_dp_degree=dp_degree, _finished_groups_by_id=finished_by_id
-    )
-    return Controller._replica_columns(controller, batch.plan), finished_by_id
+    return batch.plan, finished_by_id
 
 
 def _batcher_packed_column(
@@ -296,6 +322,72 @@ def test_a_leader_that_fails_to_pack_fails_every_rank_of_its_replica(
         else:
             assert error.startswith("RuntimeError: The DP replica's leader failed")
             assert "KeyError" in error
+
+
+def test_a_leader_reads_only_its_packed_rollouts_and_packs_the_same_microbatches() -> None:
+    """With every group packed in a rollout worker, each leader reads the rollouts its column
+    names (one read call, before its first group) and packs exactly what it packs by value."""
+    owner, reader_buffers = loopback_buffers()
+    group_buffers = RolloutGroupBuffers(min_bytes=1, buffers=owner)
+    plan, finished_by_id = _plan(dp_degree=2, num_pp_microbatches=1)
+    packed_by_id = {
+        group_id: group_buffers.pack(finished)
+        for group_id, finished in finished_by_id.items()
+    }
+    columns = _columns(plan, finished_by_id, dp_degree=2)
+    packed_columns = _columns(plan, packed_by_id, dp_degree=2)
+
+    for column, packed_column in zip(columns, packed_columns, strict=True):
+        assert all(group.arrays is None for group in packed_column.rollout_groups)
+        num_packed_bytes = sum(
+            group.num_packed_bytes for group in packed_column.rollout_groups
+        )
+        reader_buffers._transport.read_ranges.clear()
+        reader = MicrobatchGroupReader(
+            num_microbatch_groups=len(packed_column.microbatch_groups),
+            replica_group=None,
+            column=packed_column,
+            training_sample_builder=TrainingSampleBuilder.Config().build(),
+            microbatch_packer=_packer(),
+            rdma_byte_buffers=reader_buffers,
+        )
+
+        _assert_microbatches_equal(
+            list(reader), _batcher_packed_column(column, finished_by_id)
+        )
+        assert reader.read_bytes == num_packed_bytes
+        assert reader.read_s > 0
+        # Adjacent regions merge into one read, with the alignment padding between them.
+        num_regions = sum(
+            len(group.packed.regions()) for group in packed_column.rollout_groups
+        )
+        bytes_read = sum(length for _, length in reader_buffers._transport.read_ranges)
+        assert num_packed_bytes <= bytes_read < num_packed_bytes + 64 * num_regions
+        assert len(reader_buffers._transport.read_ranges) < num_regions
+
+
+def test_a_leader_whose_read_fails_raises_from_the_reader() -> None:
+    owner, reader_buffers = loopback_buffers()
+    group_buffers = RolloutGroupBuffers(min_bytes=1, buffers=owner)
+    columns, finished_by_id = _plan_columns(dp_degree=1, num_pp_microbatches=1)
+    column = dataclasses.replace(
+        columns[0],
+        rollout_groups=[
+            group_buffers.pack(group) for group in columns[0].rollout_groups
+        ],
+    )
+    reader_buffers._transport.fail_reads = True
+    reader = MicrobatchGroupReader(
+        num_microbatch_groups=len(column.microbatch_groups),
+        replica_group=None,
+        column=column,
+        training_sample_builder=TrainingSampleBuilder.Config().build(),
+        microbatch_packer=_packer(),
+        rdma_byte_buffers=reader_buffers,
+    )
+
+    with pytest.raises(RuntimeError, match="NIXL_ERR_REMOTE_DISCONNECT"):
+        list(reader)
 
 
 def fake_column(microbatch_groups: list[list[list[int]]]) -> ReplicaColumn:
