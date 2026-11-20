@@ -4,23 +4,21 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Collects trainable `TrainingSample`s until a group-count training batch is ready, then packs it.
-`Batcher` packs a `TrainerStepBatch` of `[num_microbatches][dp_degree]`
-`TrainingMicrobatch`es;
+"""Plans training steps from rollout group summaries (`Batcher`), and packs the planned
+training samples into microbatches (`MicrobatchPacker`, on each trainer DP replica's leader).
+
+    Batcher:            summaries -> decide -> plan -> `TrainerStepBatch(plan=StepPlan)`
+    replica leader:     plan column + rollout arrays -> materialize -> `MicrobatchPacker.pack`
 """
 
-import asyncio
 import heapq
-import itertools
 import logging
 import math
-from collections import deque
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
 import torch
-from torch.utils import _pytree as pytree
 
 from torchtitan.components.data.multimodal.mrope import get_mrope_positions
 
@@ -32,14 +30,8 @@ from torchtitan.config import Configurable
 from torchtitan.models.deepseek_v3.mtp import get_mtp_token_counts
 from torchtitan.observability import structured_logger as sl
 from torchtitan.rl.observability import metrics as m
-from torchtitan.rl.rollout.finished_group import (
-    join_rollout_group,
-    RolloutGroupArrays,
-    RolloutGroupSummary,
-    split_rollout_group,
-)
-from torchtitan.rl.rollout.types import PromptImage, RolloutGroup
-from torchtitan.rl.trainer.rdma_microbatch import RDMAMicrobatch, RegisterRDMAMicrobatch
+from torchtitan.rl.rollout.finished_group import RolloutGroupSummary
+from torchtitan.rl.rollout.types import PromptImage
 from torchtitan.rl.trainer.training_sample_builder import (
     TrainingSample,
     TrainingSampleBuilder,
@@ -60,9 +52,9 @@ class TrainingMicrobatch(TokenizedTrainingMicrobatch):
     N-1), matching the pre-training dataloader convention.
 
     With images, ``model_kwargs`` holds each distinct image of the microbatch once
-    (`Batcher._pack_image_inputs`, whose example draws the dedup):
+    (`MicrobatchPacker._pack_image_inputs`, whose example draws the dedup):
 
-        from the batcher         image_files, image_file_sizes   the files, concatenated
+        from the packer          image_files, image_file_sizes   the files, concatenated
                                  grid_thw                        one row per distinct image
                                  image_vision_bank_indices_T     each token's row in the image
                                                                  embeddings, -1 for text
@@ -85,12 +77,12 @@ class TrainingMicrobatch(TokenizedTrainingMicrobatch):
         """This microbatch with its image files turned into pixel values, as the generator's
         `_preprocess_images` does for a request; unchanged without images.
 
-        The batcher ships each distinct image file once, concatenated into one uint8 tensor
+        The packer ships each distinct image file once, concatenated into one uint8 tensor
         (``image_files``, split by ``image_file_sizes``): a Geometry3K file is ~15 KB, its
-        float32 pixel values ~2.4 MB. The trainer calls this on each microbatch it receives
-        (on the read-ahead thread with RDMA), and each file becomes pixel values on the CPU,
-        as in the SFT dataloader (`VisionProcessor.resize_and_normalize`, then
-        `patchify_all`).
+        float32 pixel values ~2.4 MB. Each trainer rank calls this on each microbatch it
+        receives, on its reader thread (`MicrobatchGroupReader`), and each file becomes pixel
+        values on the CPU, as in the SFT dataloader (`VisionProcessor.resize_and_normalize`,
+        then `patchify_all`).
         """
         if "image_files" not in self.model_kwargs:
             return self
@@ -168,40 +160,6 @@ class TrainingMicrobatch(TokenizedTrainingMicrobatch):
 
 
 @dataclass(frozen=True, slots=True)
-class TrainerStepBatch:
-    """Packed microbatches for one optimizer step.
-
-    Example:
-        # 5 training samples, effective length 5 each; 2 rows/rank, dp_degree=1
-        # next-fit rows -> [[s5, s5], [s5, s5], [s5]] = 3 rows; rows_per_microbatch = 2 * 1 = 2
-        # -> 2 microbatches (3 rows padded to 4 with one pad-only row), one per
-        #    group without pipeline parallelism:
-        #    microbatch_groups = [[[TrainingMicrobatch(input=[20])]],
-        #                         [[TrainingMicrobatch(input=[20])]]]
-        # The second microbatch contains one real row and one pad row.
-        # global_loss_token_counts = per-objective loss-token counts
-        # global_routing_token_counts = per-depth non-padding token counts
-    """
-
-    # [num_groups][num_microbatches_per_group][dp_degree]; under PP, each group runs as one
-    # pipeline step. RDMAMicrobatches when `rdma_min_tensor_bytes` is set.
-    microbatch_groups: (
-        list[list[list[TrainingMicrobatch]]] | list[list[list[RDMAMicrobatch]]]
-    )
-    global_loss_token_counts: torch.Tensor
-    global_routing_token_counts: torch.Tensor
-    metrics: list[m.Metric]
-    group_ids: list[int]
-    """Every consumed rollout group, including metric-only groups."""
-    trainable_group_ids: list[int]
-    """The groups in `group_ids` with training samples, `num_prompts_per_train_step` of them. The
-    controller retires their active slots after the step; it retired the other groups when the
-    batcher reported them untrainable."""
-    # one per packed training_sample; trainer computes policy_age at consume time
-    min_policy_versions: list[int]
-
-
-@dataclass(frozen=True, slots=True)
 class StepPlan:
     """Which training samples each microbatch of one optimizer step packs, decided from specs.
 
@@ -216,12 +174,37 @@ class StepPlan:
 
     microbatch_groups: list[list[list[list[TrainingSampleSpec]]]]
     """[num_groups][num_microbatches_per_group][dp_degree] -> the microbatch's specs, in packing
-    order; the grid of `TrainerStepBatch.microbatch_groups`."""
+    order. Under PP, each group runs as one pipeline step; DP rank d trains column d."""
     global_loss_token_counts: torch.Tensor
     """int64 [1 + num_mtp_layers]: the specs' loss-token counts summed, which equal the packed
     microbatches' `loss_token_counts` summed."""
     global_routing_token_counts: torch.Tensor
     """int64 [1 + num_mtp_layers]: the specs' routing-token counts summed."""
+
+
+@dataclass(frozen=True, slots=True)
+class TrainerStepBatch:
+    """One optimizer step as the batcher plans it: which training samples each microbatch packs,
+    and the groups the step consumes. No tensors: each trainer DP replica's leader packs its
+    column of the plan.
+
+    Example:
+        # 5 training samples of 5 tokens each, 2 rows per microbatch, dp_degree=1
+        # -> 2 microbatches, one per group without pipeline parallelism:
+        #    plan.microbatch_groups = [[[[s0, s1, s2, s3]]], [[[s4]]]]
+        # The second microbatch packs one sample and padding.
+    """
+
+    plan: StepPlan
+    metrics: list[m.Metric]
+    group_ids: list[int]
+    """Every consumed rollout group, including metric-only groups."""
+    trainable_group_ids: list[int]
+    """The groups in `group_ids` with training samples, `num_prompts_per_train_step` of them. The
+    controller retires their active slots after the step; it retired the other groups when the
+    batcher reported them untrainable."""
+    # one per packed training_sample; trainer computes policy_age at consume time
+    min_policy_versions: list[int]
 
 
 _MAX_CONSECUTIVE_UNTRAINABLE_BATCHES = 10
@@ -294,17 +277,17 @@ def assign_sorted_bins_to_dp_ranks(
 
 
 class Batcher(Configurable):
-    """Accumulate `num_prompts_per_train_step` groups and packs
-    `[num_microbatches][dp_degree]` flat `TrainingMicrobatch`es.
+    """Accumulate `num_prompts_per_train_step` trainable groups and plan one step of
+    `[num_microbatches][dp_degree]` microbatches from their summaries.
 
-    Each group is split into a summary and its arrays (`split_rollout_group`). The metadata half
-    decides the group's samples (`TrainingSampleBuilder.decide`) and plans the step from their
-    specs (`StepPlan`); the bytes half materializes the planned samples and packs them
+    It reads only group summaries (`RolloutGroupSummary`: lengths, rewards, no bytes). It
+    decides each group's samples (`TrainingSampleBuilder.decide`) and plans the step from their
+    specs (`StepPlan`); each trainer DP replica's leader materializes and packs its column
     (`MicrobatchPacker`):
 
-        add_group:  split -> decide -> accumulate (specs, arrays)
+        add_group:  decide (summary) -> accumulate specs
         when num_prompts_per_train_step trainable groups:
-                    plan (specs) -> materialize (specs, arrays) -> pack -> TrainerStepBatch
+                    plan (specs) -> TrainerStepBatch(plan=StepPlan)
 
     Example:
         # num_prompts_per_train_step=2, dp_degree=2, 256 tokens/rank
@@ -314,22 +297,13 @@ class Batcher(Configurable):
             max_context_length=128,
             num_prompts_per_train_step=2,
             dp_degree=2,
-            pad_id=0,
-            temperature=1.0,
-            num_topk_logprobs=0,
         )
-        pending, _ = batcher.add_group(rollout_group=group0)
-        batch, _ = batcher.add_group(rollout_group=group1)
-        # pending is None; batch.microbatch_groups: [num_groups][1][2 ranks];
-        # each TrainingMicrobatch.input: [256 tokens]
+        pending, _ = batcher.add_group(summary=summary0)
+        batch, _ = batcher.add_group(summary=summary1)
+        # pending is None; batch.plan.microbatch_groups: [num_groups][1][2 ranks] -> specs
 
-    With `rdma_min_tensor_bytes` set, it returns `RDMAMicrobatch`es registered with
-    `register_rdma_microbatch`, the actor system's RDMA registration (e.g.
-    `MonarchRDMAMicrobatch.register`), which is then required.
-
-    With `vision_processor` (`Controller.Config.vision_processor`, the one the renderer and
-    the generator use), it packs the samples' images as model inputs: each image token's row
-    in the image embeddings, and with `build_mrope_positions` M-RoPE positions.
+    With `vision_processor` (`Controller.Config.vision_processor`), it logs how many images
+    the planned microbatches encode.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -346,14 +320,6 @@ class Batcher(Configurable):
         When unset, the trainer uses the microbatch token capacity as the
         CUDA-graph-safe metadata bound without imposing a tighter packing cap.
         """
-        rdma_min_tensor_bytes: int | None = None
-        """Send microbatch tensors of at least this many bytes as RDMA buffers (the actor system's
-        `RDMAMicrobatch`), not in the RPC message:
-            None (default): every tensor in the message.
-            e.g. 1024: tensors >= 1 KiB stay in the batcher; token counts (8 B) and empty tensors go in the message.
-        The Monarch actor system uses ibverbs where the host has it, else TCP; a host that lists unusable
-        ibverbs devices fails instead. MONARCH_RDMA_DISABLE_IBVERBS=1 forces TCP in every process, weight sync
-        included."""
         build_mrope_positions: bool = False
         """Give microbatches with images 3D M-RoPE positions (``mrope_positions``), as SFT's
         ``MultiModalCollator.Config.build_mrope_positions`` does: True for models whose image
@@ -371,14 +337,6 @@ class Batcher(Configurable):
                 raise ValueError("per_sample_pad_multiple must be positive")
             if self.max_num_documents is not None and self.max_num_documents <= 0:
                 raise ValueError("max_num_documents must be positive")
-            if (
-                self.rdma_min_tensor_bytes is not None
-                and self.rdma_min_tensor_bytes < 1
-            ):
-                raise ValueError(
-                    "rdma_min_tensor_bytes must be None or >= 1 (RDMABuffer rejects empty tensors), "
-                    f"got {self.rdma_min_tensor_bytes}"
-                )
 
     def __init__(
         self,
@@ -389,32 +347,9 @@ class Batcher(Configurable):
         num_prompts_per_train_step: int,
         dp_degree: int,
         num_pp_microbatches: int = 1,
-        pad_id: int,
-        temperature: float,
-        num_topk_logprobs: int,
-        register_rdma_microbatch: RegisterRDMAMicrobatch | None = None,
         vision_processor: VisionProcessor.Config | None = None,
     ) -> None:
-        if (
-            config.rdma_min_tensor_bytes is not None
-            and register_rdma_microbatch is None
-        ):
-            raise ValueError(
-                "rdma_min_tensor_bytes is set, but no register_rdma_microbatch was given: "
-                "the batcher must run in an actor system that provides RDMA."
-            )
         self._training_sample_builder = config.training_sample_builder.build()
-        self._packer = MicrobatchPacker(
-            num_tokens_per_microbatch_per_dp_rank=num_tokens_per_microbatch_per_dp_rank,
-            max_context_length=max_context_length,
-            pad_id=pad_id,
-            temperature=temperature,
-            per_sample_pad_multiple=config.per_sample_pad_multiple,
-            num_mtp_layers=config.num_mtp_layers,
-            build_mrope_positions=config.build_mrope_positions,
-            vision_processor=vision_processor,
-            num_topk_logprobs=num_topk_logprobs,
-        )
         self.seq_len = max_context_length
         self._num_rows_per_microbatch, remainder = divmod(
             num_tokens_per_microbatch_per_dp_rank,
@@ -434,16 +369,7 @@ class Batcher(Configurable):
         # Trainer PP runs this many consecutive microbatches per pipeline step.
         self._num_pp_microbatches = num_pp_microbatches
         self._groups_for_next_batch: list[TrainingSampleSpecGroup] = []
-        # The summary and arrays of each accumulated group with specs, until its step is packed.
-        self._split_groups: dict[
-            int, tuple[RolloutGroupSummary, RolloutGroupArrays]
-        ] = {}
         self._num_consecutive_zero_output_groups = 0
-        self._rdma_min_tensor_bytes = config.rdma_min_tensor_bytes
-        self._register_rdma_microbatch = register_rdma_microbatch
-        # Batches that trainer ranks may still read, oldest first; each buffer keeps its tensor alive until drop().
-        self._batches_being_read: deque[list[list[list[RDMAMicrobatch]]]] = deque()
-        self._num_batches_registered = 0
         self._logs_image_metrics = vision_processor is not None
 
     def _record_untrainable_groups(self, *, group_is_trainable: bool) -> None:
@@ -485,12 +411,12 @@ class Batcher(Configurable):
         )
 
     def add_group(
-        self, *, rollout_group: RolloutGroup
+        self, *, summary: RolloutGroupSummary
     ) -> tuple[TrainerStepBatch | None, bool]:
-        """Add one group and report whether any samples survive batcher filtering.
+        """Add one group's summary and report whether any samples survive batcher filtering.
 
         Args:
-            rollout_group: One scored rollout group plus its rollout metrics.
+            summary: One scored rollout group without its bytes, plus its rollout metrics.
 
         Example:
             batcher = Batcher.Config().build(
@@ -498,15 +424,11 @@ class Batcher(Configurable):
                 max_context_length=2048,
                 num_prompts_per_train_step=2,
                 dp_degree=1,
-                pad_id=0,
-                temperature=1.0,
-                num_topk_logprobs=0,
             )
-            batcher.add_group(rollout_group=group0)  # -> (None, True)
-            batcher.add_group(rollout_group=group1)  # -> (TrainerStepBatch, True)
+            batcher.add_group(summary=summary0)  # -> (None, True)
+            batcher.add_group(summary=summary1)  # -> (TrainerStepBatch, True)
         """
         with sl.log_trace_span("batcher_decide"):
-            summary, arrays = split_rollout_group(rollout_group)
             training_sample_spec_group = self._training_sample_builder.decide(
                 summary=summary, num_mtp_layers=self._num_mtp_layers
             )
@@ -542,143 +464,18 @@ class Batcher(Configurable):
         # at the optimizer/checkpoint boundary; dropping an empty group here would
         # leave its dataloader entry pending forever.
         self._groups_for_next_batch.append(training_sample_spec_group)
-        if group_is_trainable:
-            self._split_groups[rollout_group.group_id] = (summary, arrays)
         self._record_untrainable_groups(group_is_trainable=group_is_trainable)
         num_trainable_groups = sum(
             bool(group.training_sample_specs) for group in self._groups_for_next_batch
         )
         if num_trainable_groups < self._num_prompts_per_train_step:
             return None, group_is_trainable  # accumulate until one full batch is ready
-        batch = self._pack_one_training_batch()
-        if self._rdma_min_tensor_bytes is None:
-            # What each DP rank's `forward_backward` call carries: the tensors of its column.
-            bytes_per_rank = [0] * self._dp_degree
-            for group in batch.microbatch_groups:
-                for row in group:
-                    for dp_rank, microbatch in enumerate(row):
-                        bytes_per_rank[dp_rank] += sum(
-                            leaf.nbytes
-                            for leaf in pytree.tree_leaves(
-                                [
-                                    getattr(microbatch, microbatch_field.name)
-                                    for microbatch_field in fields(microbatch)
-                                ]
-                            )
-                            if isinstance(leaf, torch.Tensor)
-                        )
-            batch.metrics.append(
-                m.Metric(
-                    "payload/forward_backward_bytes_per_rank",
-                    m.Mean.from_list(bytes_per_rank),
-                )
-            )
-            return batch, group_is_trainable
-        assert self._register_rdma_microbatch is not None
-
-        # Trainer ranks read these tensors from this process. Microbatch indices
-        # count rows across groups, in training order.
-        microbatch_indices = itertools.count()
-        rdma_microbatch_groups = [
-            [
-                [
-                    self._register_rdma_microbatch(
-                        microbatch,
-                        min_bytes=self._rdma_min_tensor_bytes,
-                        batch_index=self._num_batches_registered,
-                        dp_rank=dp_rank,
-                        microbatch_index=microbatch_index,
-                    )
-                    for dp_rank, microbatch in enumerate(row)
-                ]
-                for row, microbatch_index in zip(group, microbatch_indices)
-            ]
-            for group in batch.microbatch_groups
-        ]
-        self._num_batches_registered += 1
-        self._batches_being_read.append(rdma_microbatch_groups)
-        return (
-            replace(batch, microbatch_groups=rdma_microbatch_groups),
-            group_is_trainable,
-        )
-
-    async def maybe_release_oldest_batch(self) -> None:
-        """Free the oldest batch's RDMA buffers; a no-op when `rdma_min_tensor_bytes` is None.
-
-        Call once per trained batch, in training order, after `forward_backward` returns or raises.
-        """
-        if self._rdma_min_tensor_bytes is None:
-            return
-        rdma_microbatch_groups = self._batches_being_read.popleft()
-        await asyncio.gather(
-            *(
-                rdma_microbatch.drop()
-                for group in rdma_microbatch_groups
-                for row in group
-                for rdma_microbatch in row
-            )
-        )
-
-    def _pack_one_training_batch(self) -> TrainerStepBatch:
-        """Plan the oldest accumulated groups (up to `num_prompts_per_train_step` trainable groups)
-        into one step, then materialize and pack its samples."""
         with sl.log_trace_span("batcher_plan"):
-            (
-                plan,
-                metrics,
-                group_ids,
-                trainable_group_ids,
-                min_policy_versions,
-            ) = self._plan_one_training_batch()
-        specs = [
-            spec
-            for group in plan.microbatch_groups
-            for row in group
-            for microbatch_specs in row
-            for spec in microbatch_specs
-        ]
-        with sl.log_trace_span("batcher_materialize"):
-            rollout_groups = {
-                group_id: join_rollout_group(*self._split_groups.pop(group_id))
-                for group_id in trainable_group_ids
-            }
-            training_samples = iter(
-                self._training_sample_builder.materialize(
-                    training_sample_specs=specs, rollout_groups=rollout_groups
-                )
-            )
-        with sl.log_trace_span("batcher_pack"):
-            microbatch_groups = [
-                [
-                    [
-                        self._packer.pack(
-                            [next(training_samples) for _ in microbatch_specs]
-                        )
-                        for microbatch_specs in row
-                    ]
-                    for row in group
-                ]
-                for group in plan.microbatch_groups
-            ]
-        return TrainerStepBatch(
-            microbatch_groups=microbatch_groups,
-            global_loss_token_counts=plan.global_loss_token_counts,
-            global_routing_token_counts=plan.global_routing_token_counts,
-            metrics=metrics,
-            group_ids=group_ids,
-            trainable_group_ids=trainable_group_ids,
-            min_policy_versions=min_policy_versions,
-        )
+            return self._plan_one_training_batch(), group_is_trainable
 
-    def _plan_one_training_batch(
-        self,
-    ) -> tuple[StepPlan, list[m.Metric], list[int], list[int], list[int]]:
-        """Plan the oldest accumulated groups into one step from their specs alone.
-
-        Returns:
-            The plan, the step's metrics, every taken group id, the trainable ones, and each
-            planned sample's `min_policy_version` (the trainer computes policy age from them).
-        """
+    def _plan_one_training_batch(self) -> TrainerStepBatch:
+        """Plan the oldest accumulated groups (up to `num_prompts_per_train_step` trainable groups)
+        into one step from their specs alone."""
         (
             training_sample_specs,
             metrics,
@@ -737,13 +534,15 @@ class Batcher(Configurable):
                 num_metric_only_groups,
             ),
         ]
-        return (
-            plan,
-            metrics,
-            group_ids,
-            trainable_group_ids,
+        return TrainerStepBatch(
+            plan=plan,
+            metrics=metrics,
+            group_ids=group_ids,
+            trainable_group_ids=trainable_group_ids,
             # min_policy_version is the oldest version this training_sample was sampled under.
-            [spec.min_policy_version for spec in training_sample_specs],
+            min_policy_versions=[
+                spec.min_policy_version for spec in training_sample_specs
+            ],
         )
 
     def _take_groups(
@@ -1141,7 +940,8 @@ class MicrobatchPacker:
     """Pack training samples into one DP rank's fixed-size `TrainingMicrobatch`.
 
     The bytes half of batching: the batcher plans which samples share a microbatch from their
-    specs (`StepPlan`), then packs each microbatch's materialized samples here.
+    specs (`StepPlan`), and each trainer DP replica's leader packs each microbatch of its column
+    here from the materialized samples (`MicrobatchGroupReader`).
 
     Example:
         packer = MicrobatchPacker(
@@ -1331,9 +1131,10 @@ class MicrobatchPacker:
         grid, each placeholder token's row in the image embeddings (-1 for text), and with
         `build_mrope_positions` 3D M-RoPE positions.
 
-        The samples of a GRPO group show the same images. The batcher dedups them in two
-        steps: it packs a group's samples into the same microbatch (step 1), then ships and
-        encodes each distinct image of a microbatch once (step 2, here). Example: one step of
+        The samples of a GRPO group show the same images. They are deduped in two
+        steps: the batcher plans a group's samples into the same microbatch (step 1), then the
+        packer ships and the trainer encodes each distinct image of a microbatch once (step 2,
+        here). Example: one step of
         2 groups x 2 samples on 2 DP ranks, image k in group g0 and image m in group g1, each
         placeholder token drawn as its image's letter:
 

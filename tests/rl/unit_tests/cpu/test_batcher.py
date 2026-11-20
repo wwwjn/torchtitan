@@ -4,7 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""CPU tests for batcher packing (fixed-bin LPT, FFD fallback) and image microbatches."""
+"""CPU tests for batcher planning (fixed-bin LPT, FFD fallback) and microbatch packing,
+including image microbatches."""
 
 import dataclasses
 import random
@@ -24,7 +25,7 @@ from torchtitan.components.renderer import hash_image_file
 from torchtitan.models.qwen3_5 import QWEN3_5_VISION_PROCESSOR_KWARGS
 from torchtitan.rl.rollout.types import PromptImage, RolloutTurnID
 
-from torchtitan.rl.trainer.batcher import Batcher
+from torchtitan.rl.trainer.batcher import Batcher, MicrobatchPacker
 from torchtitan.rl.trainer.training_sample_builder import (
     TrainingSample,
     TrainingSampleSpec,
@@ -66,15 +67,37 @@ def _make_specs(lengths: list[int]) -> list[TrainingSampleSpec]:
     return [_spec(sample) for sample in _make_samples(lengths)]
 
 
+def _packer(
+    num_tokens: int,
+    *,
+    max_context_length: int | None = None,
+    pad_id: int = 0,
+    temperature: float = 1.0,
+    per_sample_pad_multiple: int = 1,
+    build_mrope_positions: bool = False,
+    vision_processor: VisionProcessor.Config | None = None,
+    num_topk_logprobs: int = 0,
+) -> MicrobatchPacker:
+    """A packer for `num_tokens`-token microbatches (one row unless `max_context_length`)."""
+    return MicrobatchPacker(
+        num_tokens_per_microbatch_per_dp_rank=num_tokens,
+        max_context_length=max_context_length or num_tokens,
+        pad_id=pad_id,
+        temperature=temperature,
+        per_sample_pad_multiple=per_sample_pad_multiple,
+        num_mtp_layers=0,
+        build_mrope_positions=build_mrope_positions,
+        vision_processor=vision_processor,
+        num_topk_logprobs=num_topk_logprobs,
+    )
+
+
 def test_padding_workload_matches_existing_full_length_segments() -> None:
     batcher = Batcher.Config(max_num_documents=20).build(
         num_tokens_per_microbatch_per_dp_rank=60,
         max_context_length=10,
         num_prompts_per_train_step=1,
         dp_degree=1,
-        pad_id=0,
-        temperature=1.0,
-        num_topk_logprobs=0,
     )
     long_samples = _make_samples([8] * 6)
     short_samples = _make_samples([1] * 20)
@@ -87,8 +110,9 @@ def test_padding_workload_matches_existing_full_length_segments() -> None:
     )
     assert batcher._attention_workload([]) == 6 * 10**2
 
+    packer = _packer(60, max_context_length=10)
     for samples in (long_samples, short_samples, []):
-        microbatch = batcher._packer.pack(samples)
+        microbatch = packer.pack(samples)
         num_padding_segments = int(
             ((microbatch.positions == 0) & microbatch.padding_mask).sum().item()
         )
@@ -101,9 +125,6 @@ def test_lpt_uses_padding_workload_for_full_length_documents() -> None:
         max_context_length=8,
         num_prompts_per_train_step=1,
         dp_degree=2,
-        pad_id=0,
-        temperature=1.0,
-        num_topk_logprobs=0,
     )
     samples = _make_specs([8] * 3 + [2] * 16)
 
@@ -127,9 +148,6 @@ def test_lpt_does_not_leave_a_full_length_document_in_an_expensive_bin() -> None
         max_context_length=10,
         num_prompts_per_train_step=1,
         dp_degree=2,
-        pad_id=0,
-        temperature=1.0,
-        num_topk_logprobs=0,
     )
     samples = _make_specs([10, 5, 5, 5, 5])
 
@@ -148,9 +166,6 @@ def test_lpt_rebalances_ffd_bins_with_document_limit() -> None:
         max_context_length=4,
         num_prompts_per_train_step=1,
         dp_degree=2,
-        pad_id=0,
-        temperature=1.0,
-        num_topk_logprobs=0,
     )
     samples = _make_specs([4, 4, 3, 3, 3, 3, 2, 2])
 
@@ -180,9 +195,6 @@ def test_lpt_falls_back_when_ffd_fits_but_lpt_cannot() -> None:
         max_context_length=3,
         num_prompts_per_train_step=1,
         dp_degree=1,
-        pad_id=0,
-        temperature=1.0,
-        num_topk_logprobs=0,
     )
     samples = _make_specs([3] * 8 + [2] * 9)
     assert batcher._pack_with_lpt(samples, target_num_bins=7) is None
@@ -206,9 +218,6 @@ def test_three_pp_microbatches_balance_rank_costs_within_step() -> None:
         max_context_length=10,
         num_prompts_per_train_step=1,
         dp_degree=2,
-        pad_id=0,
-        temperature=1.0,
-        num_topk_logprobs=0,
     )
     samples = _make_specs([10, 9, 8, 7, 6, 5])
 
@@ -242,9 +251,11 @@ def test_packing_preserves_all_samples_and_capacity_constraints() -> None:
             max_context_length=seq_len,
             num_prompts_per_train_step=1,
             dp_degree=dp_degree,
-            pad_id=0,
-            temperature=1.0,
-            num_topk_logprobs=0,
+        )
+        packer = _packer(
+            num_rows * seq_len,
+            max_context_length=seq_len,
+            per_sample_pad_multiple=pad_multiple,
         )
         samples = _make_samples(
             [rng.randint(1, seq_len) for _ in range(rng.randint(1, 30))]
@@ -264,7 +275,7 @@ def test_packing_preserves_all_samples_and_capacity_constraints() -> None:
                 )
                 if max_num_documents is not None:
                     assert len(rank_samples) <= max_num_documents
-                microbatch = batcher._packer.pack(
+                microbatch = packer.pack(
                     [samples_by_id[spec.rollout_id] for spec in rank_samples]
                 )
                 assert int((~microbatch.padding_mask).sum()) == sum(
@@ -292,11 +303,9 @@ def test_per_sample_padding_preserves_shifted_fields(pad_multiple) -> None:
         max_context_length=24,
         num_prompts_per_train_step=1,
         dp_degree=1,
-        pad_id=99,
-        temperature=1.0,
-        num_topk_logprobs=0,
     )
-    microbatch = batcher._packer.pack(samples)
+    packer = _packer(24, pad_id=99, per_sample_pad_multiple=pad_multiple)
+    microbatch = packer.pack(samples)
     valid = ~microbatch.padding_mask
     assert microbatch.input[valid].tolist() == [10, 11, 12, 13, 14, 20, 21, 22]
     assert microbatch.labels[valid].tolist() == [11, 12, 13, 14, 15, 21, 22, 23]
@@ -322,20 +331,11 @@ def test_per_sample_padding_preserves_shifted_fields(pad_multiple) -> None:
     samples[0].advantage = samples[0].advantage[:-1]
     samples[1].advantage = np.pad(samples[1].advantage, (0, 1))
     with pytest.raises(ValueError, match="Segment fields must share one length"):
-        batcher._packer.pack(samples)
+        packer.pack(samples)
 
 
 def test_microbatch_carries_the_sampling_temperature_into_the_loss() -> None:
-    batcher = Batcher.Config().build(
-        num_tokens_per_microbatch_per_dp_rank=8,
-        max_context_length=8,
-        num_prompts_per_train_step=1,
-        dp_degree=1,
-        pad_id=0,
-        temperature=0.5,
-        num_topk_logprobs=0,
-    )
-    microbatch = batcher._packer.pack(_make_samples([3]))
+    microbatch = _packer(8, temperature=0.5).pack(_make_samples([3]))
 
     temperature = microbatch.as_input_dict()["loss_kwargs"]["temperature"]
     assert temperature.dtype == torch.float32
@@ -343,16 +343,7 @@ def test_microbatch_carries_the_sampling_temperature_into_the_loss() -> None:
 
 
 def test_microbatch_moves_loss_kwargs_with_the_model_inputs() -> None:
-    batcher = Batcher.Config().build(
-        num_tokens_per_microbatch_per_dp_rank=8,
-        max_context_length=8,
-        num_prompts_per_train_step=1,
-        dp_degree=1,
-        pad_id=0,
-        temperature=1.0,
-        num_topk_logprobs=0,
-    )
-    microbatch = batcher._packer.pack(_make_samples([3]))
+    microbatch = _packer(8).pack(_make_samples([3]))
 
     input_dict = microbatch.to_input_dict("meta")
 
@@ -368,15 +359,7 @@ def test_microbatch_moves_loss_kwargs_with_the_model_inputs() -> None:
 
 
 def test_microbatch_ships_topk_rows_for_loss_tokens_only() -> None:
-    batcher = Batcher.Config().build(
-        num_tokens_per_microbatch_per_dp_rank=8,
-        max_context_length=8,
-        num_prompts_per_train_step=1,
-        dp_degree=1,
-        pad_id=0,
-        temperature=1.0,
-        num_topk_logprobs=2,
-    )
+    packer = _packer(8, num_topk_logprobs=2)
     first, second = _make_samples([3, 3])
     # Prompt, completion, env reply, completion: two loss tokens, so two top-k rows.
     first.loss_mask = np.array([False, True, False, True])
@@ -386,7 +369,7 @@ def test_microbatch_ships_topk_rows_for_loss_tokens_only() -> None:
     second.topk_token_ids = np.array([[1, 2], [3, 7]], dtype=np.int32)
     second.topk_logprobs = np.array([[-0.5, -1.0], [-0.6, -1.1]], dtype=np.float32)
 
-    microbatch = batcher._packer.pack([first, second])
+    microbatch = packer.pack([first, second])
     loss_kwargs = microbatch.to_input_dict("cpu")["loss_kwargs"]
 
     assert microbatch.generator_topk_token_ids.shape == (4, 2)
@@ -403,7 +386,7 @@ def test_microbatch_ships_topk_rows_for_loss_tokens_only() -> None:
         ),
     )
     # An empty bin ships no rows but still gives the loss [T, k], so every rank calls it alike.
-    empty_microbatch = batcher._packer.pack([])
+    empty_microbatch = packer.pack([])
     assert empty_microbatch.generator_topk_token_ids.shape == (0, 2)
     empty_loss_kwargs = empty_microbatch.to_input_dict("cpu")["loss_kwargs"]
     assert empty_loss_kwargs["generator_topk_token_ids"].tolist() == [[0, 0]] * 8
@@ -414,7 +397,7 @@ def test_microbatch_ships_topk_rows_for_loss_tokens_only() -> None:
     second.topk_token_ids = second.topk_token_ids[:1]
     second.topk_logprobs = second.topk_logprobs[:1]
     with pytest.raises(ValueError, match="3 top-k rows for 2 loss tokens"):
-        batcher._packer.pack([first, second])
+        packer.pack([first, second])
 
 
 _VISION_PROCESSOR = dataclasses.replace(
@@ -471,14 +454,10 @@ def _image_sample(
 
 
 def test_microbatch_encodes_each_distinct_image_once(image_paths) -> None:
-    batcher = Batcher.Config(build_mrope_positions=True).build(
-        num_tokens_per_microbatch_per_dp_rank=64,
+    packer = _packer(
+        64,
         max_context_length=32,
-        num_prompts_per_train_step=1,
-        dp_degree=1,
-        pad_id=0,
-        temperature=1.0,
-        num_topk_logprobs=0,
+        build_mrope_positions=True,
         vision_processor=_VISION_PROCESSOR,
     )
     image_a, placeholder_a = _prompt_image(image_paths[0], offset=1)
@@ -492,10 +471,10 @@ def test_microbatch_encodes_each_distinct_image_once(image_paths) -> None:
         _image_sample(2, [], 5),
     ]
 
-    microbatch = batcher._packer.pack(samples)
+    microbatch = packer.pack(samples)
     kwargs = microbatch.model_kwargs
 
-    # The batcher ships the image files once each; moving the inputs to the trainer's
+    # The packer ships the image files once each; moving the inputs to the trainer's
     # device turns them into the model's pixel_values.
     processor = _VISION_PROCESSOR.build()
     pixel_values = torch.cat(
@@ -542,25 +521,18 @@ def test_microbatch_encodes_each_distinct_image_once(image_paths) -> None:
     assert torch.equal(kwargs["mrope_positions"], expected_mrope)
 
 
-def _image_batcher(
+def _image_packer(
     num_tokens: int = 16, *, build_mrope_positions: bool = True
-) -> Batcher:
-    return Batcher.Config(build_mrope_positions=build_mrope_positions).build(
-        num_tokens_per_microbatch_per_dp_rank=num_tokens,
-        max_context_length=num_tokens,
-        num_prompts_per_train_step=1,
-        dp_degree=1,
-        pad_id=0,
-        temperature=1.0,
-        num_topk_logprobs=0,
+) -> MicrobatchPacker:
+    return _packer(
+        num_tokens,
+        build_mrope_positions=build_mrope_positions,
         vision_processor=_VISION_PROCESSOR,
     )
 
 
 def test_text_microbatch_with_a_vision_processor_has_no_image_inputs() -> None:
-    batcher = _image_batcher()
-
-    microbatch = batcher._packer.pack(_make_samples([5]))
+    microbatch = _image_packer().pack(_make_samples([5]))
 
     # The model uses the 1D positions and runs its dummy vision forward, as on every
     # rank without images.
@@ -571,9 +543,9 @@ def test_image_microbatch_without_mrope_positions(image_paths) -> None:
     """Without build_mrope_positions (a model whose image tokens take 1D positions, e.g.
     Muse Spark), an image microbatch carries no mrope_positions: the model uses positions."""
     image, placeholder = _prompt_image(image_paths[0], offset=1)
-    batcher = _image_batcher(num_tokens=64, build_mrope_positions=False)
+    packer = _image_packer(num_tokens=64, build_mrope_positions=False)
 
-    microbatch = batcher._packer.pack([_image_sample(0, [(image, placeholder)], 12)])
+    microbatch = packer.pack([_image_sample(0, [(image, placeholder)], 12)])
 
     assert "mrope_positions" not in microbatch.model_kwargs
     assert "image_vision_bank_indices_T" in microbatch.model_kwargs
@@ -586,10 +558,10 @@ def test_image_grid_must_match_the_resized_image(image_paths) -> None:
     # count) for the same image.
     image = dataclasses.replace(image, grid_thw=(t, h + 2, w))
     placeholder = PlaceholderRange(offset=1, length=t * (h + 2) * w // 4)
-    batcher = _image_batcher(num_tokens=64)
-    microbatch = batcher._packer.pack([_image_sample(0, [(image, placeholder)], 12)])
+    packer = _image_packer(num_tokens=64)
+    microbatch = packer.pack([_image_sample(0, [(image, placeholder)], 12)])
 
-    # The trainer resizes the file and finds the batcher's vision processor's grid.
+    # The trainer resizes the file and finds the packer's vision processor's grid.
     with pytest.raises(ValueError, match="same vision processor"):
         microbatch.preprocess_images()
 
@@ -598,10 +570,10 @@ def test_placeholder_count_must_match_the_grid(image_paths) -> None:
     image, placeholder = _prompt_image(image_paths[0], offset=1)
     # Embedding rows follow the placeholder count, the vision encoder's embeddings the grid.
     placeholder = PlaceholderRange(offset=1, length=placeholder.length - 1)
-    batcher = _image_batcher(num_tokens=64)
+    packer = _image_packer(num_tokens=64)
 
     with pytest.raises(ValueError, match="placeholders"):
-        batcher._packer.pack([_image_sample(0, [(image, placeholder)], 12)])
+        packer.pack([_image_sample(0, [(image, placeholder)], 12)])
 
 
 def test_packing_keeps_samples_of_an_image_together(image_paths) -> None:
@@ -611,9 +583,6 @@ def test_packing_keeps_samples_of_an_image_together(image_paths) -> None:
         max_context_length=64,
         num_prompts_per_train_step=1,
         dp_degree=2,
-        pad_id=0,
-        temperature=1.0,
-        num_topk_logprobs=0,
         vision_processor=_VISION_PROCESSOR,
     )
     images = [_prompt_image(path, offset=1) for path in image_paths]

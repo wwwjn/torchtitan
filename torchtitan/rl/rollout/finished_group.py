@@ -4,8 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""What a rollout worker sends back for a finished rollout group, and the group's split into a
-summary (what the batcher decides and plans from) and its arrays (what packing reads)."""
+"""What a rollout worker sends back for a finished rollout group: the group split into a summary
+(what the batcher decides and plans from) and its arrays (what the trainer packs from)."""
 
 from __future__ import annotations
 
@@ -16,23 +16,76 @@ import numpy as np
 
 from torchtitan.rl.controller.metrics import compute_rollout_metrics
 from torchtitan.rl.rollout.recorder import RolloutSampleEncoder
-from torchtitan.rl.rollout.types import PromptImage, RolloutGroup
+from torchtitan.rl.rollout.types import RolloutGroup
 
 
 @dataclass(frozen=True, slots=True)
 class FinishedRolloutGroup:
-    """A finished rollout group, as the rollout worker returns it.
+    """A finished rollout group, as the rollout worker returns it: split into its summary and its
+    arrays (`split_rollout_group`), so the batcher gets only the summary and the trainer's DP
+    replica leaders get only the arrays of the rollouts they train on (`select_rollouts`).
 
-    For training, the worker has already logged and recorded the full group, so `group` keeps
-    only what training needs (see `slim_rollout_group`). For validation, `group` is the full
-    group and the controller records it.
+    For training, the worker has already logged and recorded the full group, so the group keeps
+    only what training needs (see `slim_rollout_group`). For validation, it is the full group and
+    the controller records it (`join_rollout_group(summary, arrays)`).
     """
 
-    group: RolloutGroup
+    summary: RolloutGroupSummary
 
-    recorder_lines: str
+    arrays: RolloutGroupArrays
+
+    recorder_lines: str = ""
     """The group's `RolloutSampleRecorder` JSONL lines, encoded from the full group; "" for
     validation."""
+
+    @property
+    def group_id(self) -> int:
+        return self.summary.group.group_id
+
+    @property
+    def num_bytes(self) -> int:
+        """Its arrays' bytes plus each image file once: the bulk of its pickle."""
+        return sum(
+            array.nbytes
+            for rollout_turn_arrays in self.arrays.turn_arrays
+            for turn_arrays in rollout_turn_arrays
+            for array in turn_arrays.values()
+        ) + sum(len(data) for data in self.arrays.image_data.values())
+
+    def select_rollouts(self, rollout_ids: set[int]) -> FinishedRolloutGroup:
+        """This group with only the rollouts in `rollout_ids` (by `Rollout.rollout_id`) and
+        the image files they show; no recorder lines.
+
+        Example:
+            finished.select_rollouts({0, 3}).summary.group.rollouts  # [rollout 0, rollout 3]
+        """
+        kept = [
+            index
+            for index, rollout in enumerate(self.summary.group.rollouts)
+            if rollout.rollout_id in rollout_ids
+        ]
+        group = self.summary.group
+        rollouts = [group.rollouts[index] for index in kept]
+        image_hashes = {
+            image.hash_value
+            for rollout in rollouts
+            for turn in rollout.turns
+            for image in turn.prompt_delta_images
+        }
+        return FinishedRolloutGroup(
+            summary=RolloutGroupSummary(
+                group=replace(group, rollouts=rollouts),
+                turn_lengths=tuple(self.summary.turn_lengths[index] for index in kept),
+            ),
+            arrays=RolloutGroupArrays(
+                turn_arrays=tuple(self.arrays.turn_arrays[index] for index in kept),
+                image_data={
+                    hash_value: data
+                    for hash_value, data in self.arrays.image_data.items()
+                    if hash_value in image_hashes
+                },
+            ),
+        )
 
 
 def slim_rollout_group(group: RolloutGroup) -> RolloutGroup:
@@ -70,45 +123,23 @@ def slim_rollout_group(group: RolloutGroup) -> RolloutGroup:
     )
 
 
-def share_image_data(group: RolloutGroup) -> None:
-    """Point every image with the same `hash_value` at one `bytes` object, in place.
-
-    The envs read each image file once per rollout, so a group of G rollouts holds G equal
-    copies. Pickle writes an object it has seen before as a reference, so after this the group
-    pickles each image file once.
-    """
-    data_by_hash: dict[str, bytes] = {}
-    for rollout in group.rollouts:
-        for turn in rollout.turns:
-            if not turn.prompt_delta_images:
-                continue
-            images: list[PromptImage] = []
-            for image in turn.prompt_delta_images:
-                data = data_by_hash.setdefault(image.hash_value, image.data)
-                images.append(
-                    image if data is image.data else replace(image, data=data)
-                )
-            turn.prompt_delta_images = tuple(images)
-
-
 def finish_rollout_group(
     group: RolloutGroup, *, for_training: bool, encoder: RolloutSampleEncoder
 ) -> FinishedRolloutGroup:
     """Turn a scored group into what the rollout worker returns.
 
     For training: compute the group's rollout metrics and recorder lines from the full group,
-    then slim it and share its image files. Validation aggregates metrics across groups and
-    records full groups in the controller, so its group is returned as is.
+    then slim it and split it. Validation aggregates metrics across groups and records full
+    groups in the controller, so its full group is split as is.
     """
     if not for_training:
-        return FinishedRolloutGroup(group=group, recorder_lines="")
+        return FinishedRolloutGroup(*split_rollout_group(group))
     group.metrics.extend(
         compute_rollout_metrics(prefix="rollout", rollouts=group.rollouts)
     )
     recorder_lines = encoder.encode(is_validation=False, rollout_groups=[group])
-    slim_group = slim_rollout_group(group)
-    share_image_data(slim_group)
-    return FinishedRolloutGroup(group=slim_group, recorder_lines=recorder_lines)
+    summary, arrays = split_rollout_group(slim_rollout_group(group))
+    return FinishedRolloutGroup(summary, arrays, recorder_lines)
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,7 +196,8 @@ def split_rollout_group(
 
     Every `np.ndarray`-valued field of a turn is an array, so per-token fields a feature adds
     (e.g. top-k logprobs) move with the arrays without code here; a `None` field stays in the
-    summary.
+    summary. The envs read each image file once per rollout, so a group of G rollouts holds G
+    equal copies; the arrays keep one per `hash_value`, so the group pickles each file once.
 
     Example:
         summary, arrays = split_rollout_group(group)
