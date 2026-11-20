@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import dataclasses
+import weakref
 from dataclasses import dataclass
 
 import numpy as np
@@ -423,3 +424,47 @@ def test_split_keeps_the_generator_topk_rows_with_the_arrays() -> None:
     for sample in samples:
         assert sample.topk_token_ids is not None
         assert sample.topk_token_ids.shape == (int(sample.loss_mask[1:].sum()), k)
+
+
+def test_the_step_trigger_frees_each_groups_arrays_before_the_next_materializes() -> None:
+    """The step's arrays and their samples (copies) are never all alive at once: each group's
+    arrays go as soon as its samples exist."""
+    num_groups = 3
+    array_refs: list[weakref.ref] = []
+    num_alive_at_materialize = []
+
+    class _CountingBuilder(TrainingSampleBuilder):
+        def materialize(self, *, training_sample_specs, rollout_groups):
+            num_alive_at_materialize.append(
+                sum(array_ref() is not None for array_ref in array_refs)
+            )
+            return super().materialize(
+                training_sample_specs=training_sample_specs,
+                rollout_groups=rollout_groups,
+            )
+
+    batcher = Batcher.Config().build(
+        num_tokens_per_microbatch_per_dp_rank=64,
+        max_context_length=64,
+        num_prompts_per_train_step=num_groups,
+        dp_degree=1,
+        pad_id=0,
+        temperature=1.0,
+        num_topk_logprobs=0,
+    )
+    batcher._training_sample_builder = _CountingBuilder(TrainingSampleBuilder.Config())
+    for group_id in range(num_groups):
+        group = RolloutGroup(
+            group_id=group_id,
+            rollouts=[
+                _rollout(0, [([1, 2], [-0.1, -0.2])], group_id=group_id, reward=0.0),
+                _rollout(1, [([1, 2], [-0.3])], group_id=group_id, reward=1.0),
+            ],
+        )
+        array_refs.append(weakref.ref(group.rollouts[0].turns[0].completion_logprobs))
+        batch, _ = batcher.add_group(rollout_group=group)
+        del group
+
+    assert batch is not None
+    # Groups materialize in id order; each one's arrays are gone before the next starts.
+    assert num_alive_at_materialize == [3, 2, 1]

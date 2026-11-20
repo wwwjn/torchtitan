@@ -38,7 +38,7 @@ from torchtitan.rl.rollout.finished_group import (
     RolloutGroupSummary,
     split_rollout_group,
 )
-from torchtitan.rl.rollout.types import PromptImage, RolloutGroup
+from torchtitan.rl.rollout.types import PromptImage, RolloutGroup, RolloutTurnID
 from torchtitan.rl.trainer.rdma_microbatch import RDMAMicrobatch, RegisterRDMAMicrobatch
 from torchtitan.rl.trainer.training_sample_builder import (
     TrainingSample,
@@ -638,14 +638,27 @@ class Batcher(Configurable):
             for spec in microbatch_specs
         ]
         with sl.log_trace_span("batcher_materialize"):
-            rollout_groups = {
-                group_id: join_rollout_group(*self._split_groups.pop(group_id))
-                for group_id in trainable_group_ids
-            }
+            # One group at a time, freeing its arrays once its samples exist, so the step's
+            # arrays and its samples (copies) are never all alive together.
+            specs_by_group_id: dict[int, list[TrainingSampleSpec]] = {}
+            for spec in specs:
+                specs_by_group_id.setdefault(spec.rollout_id.group_id, []).append(spec)
+            samples_by_id: dict[RolloutTurnID, TrainingSample] = {}
+            for group_id in trainable_group_ids:
+                group_specs = specs_by_group_id.get(group_id, [])
+                rollout_group = join_rollout_group(*self._split_groups.pop(group_id))
+                for spec, sample in zip(
+                    group_specs,
+                    self._training_sample_builder.materialize(
+                        training_sample_specs=group_specs,
+                        rollout_groups={group_id: rollout_group},
+                    ),
+                    strict=True,
+                ):
+                    samples_by_id[spec.rollout_id] = sample
+                del rollout_group
             training_samples = iter(
-                self._training_sample_builder.materialize(
-                    training_sample_specs=specs, rollout_groups=rollout_groups
-                )
+                [samples_by_id.pop(spec.rollout_id) for spec in specs]
             )
         with sl.log_trace_span("batcher_pack"):
             microbatch_groups = [
