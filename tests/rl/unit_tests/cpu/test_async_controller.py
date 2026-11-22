@@ -11,6 +11,7 @@ import asyncio
 import itertools
 import json
 import logging
+import math
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -1164,3 +1165,25 @@ def test_validation_config_rejects_bad_sampling() -> None:
         ValidationConfig(num_samples_per_prompt=0)
     with pytest.raises(ValueError, match="greedy"):
         ValidationConfig(temperature=0.0, num_samples_per_prompt=4)
+
+
+def test_generator_max_num_seqs_overrides_the_derived_cap() -> None:
+    from torchtitan_recipes.tests.rl.alphabet_sort import rl_grpo_qwen3_5_debug_varlen
+
+    # Token budget 128: the cap must be in [128 / 64, 128] = [2, 128].
+    config = rl_grpo_qwen3_5_debug_varlen(seq_len=128)
+    loop = config.async_loop
+    rollouts_per_rank = math.ceil(
+        loop.max_active_rollout_groups
+        * loop.num_samples_per_prompt
+        / (config.num_generators * config.generator.parallelism.data_parallel_degree)
+    )
+    derived = min(2 ** math.ceil(math.log2(max(2 * rollouts_per_rank, 2))), 128)
+    assert config.max_num_seqs_per_generator_dp_rank == derived
+
+    config.generator.max_num_seqs = 3
+    assert config.max_num_seqs_per_generator_dp_rank == 3
+    for out_of_range in (1, 129):
+        config.generator.max_num_seqs = out_of_range
+        with pytest.raises(ValueError, match=r"must be in \[2, 128\]"):
+            config.max_num_seqs_per_generator_dp_rank

@@ -142,6 +142,14 @@ class Generator(Configurable):
         (prefill + decode, summed over the batch). ``None`` (default) leaves the
         engine's own default in place."""
 
+        max_num_seqs: int | None = None
+        """The engine's cap on concurrently scheduled sequences per generator DP rank.
+        ``None`` (default) derives it from the rollouts in flight
+        (``Controller.Config.max_num_seqs_per_generator_dp_rank``). Set it when the derived
+        cap does not fit the GPU: vLLM sizes its startup memory profile by this cap, e.g.
+        Qwen3-8B with 1,920 rollouts in flight on 2 generators derives 2048 and OOMs an 80 GB
+        A100 at startup, while 256 runs."""
+
         checkpointer: CheckpointManager.Config | None = None
         """Optional initial-weight loader for the engine's model.
 
