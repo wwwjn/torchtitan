@@ -71,7 +71,9 @@ def paged_varlen_attention_out(
     # unmasked (a sequence's single query token is the last position of its KV).
     # Window (-1, -1) alone triggers FA2's own packing, but varlen_attn_out then
     # leaves `out` unwritten. Qwen3-8B (GQA 4), 256 decode rows, A100: 1595 -> 457 us
-    # per call, bitwise identical.
+    # per call, bitwise identical. FA3 packs GQA for any varlen query, and FA4
+    # (>= 4.0.0b38) decodes on its SwapAB kernel, which runs a KV head's query heads in
+    # one CTA.
     if (
         fa_impl in (None, "FA2")
         and max_seqlen_q == 1
