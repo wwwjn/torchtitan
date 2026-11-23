@@ -11,7 +11,6 @@ import asyncio
 import itertools
 import json
 import logging
-import math
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -1170,16 +1169,10 @@ def test_validation_config_rejects_bad_sampling() -> None:
 def test_generator_max_num_seqs_overrides_the_derived_cap() -> None:
     from torchtitan_recipes.tests.rl.alphabet_sort import rl_grpo_qwen3_5_debug_varlen
 
-    # Token budget 128: the cap must be in [128 / 64, 128] = [2, 128].
+    # 256 rollouts in flight on one generator DP rank derive 2 x 256 -> 512, clamped to the
+    # 128-token budget. An override must be in [128 / 64, 128] = [2, 128].
     config = rl_grpo_qwen3_5_debug_varlen(seq_len=128)
-    loop = config.async_loop
-    rollouts_per_rank = math.ceil(
-        loop.max_active_rollout_groups
-        * loop.num_samples_per_prompt
-        / (config.num_generators * config.generator.parallelism.data_parallel_degree)
-    )
-    derived = min(2 ** math.ceil(math.log2(max(2 * rollouts_per_rank, 2))), 128)
-    assert config.max_num_seqs_per_generator_dp_rank == derived
+    assert config.max_num_seqs_per_generator_dp_rank == 128
 
     config.generator.max_num_seqs = 3
     assert config.max_num_seqs_per_generator_dp_rank == 3
