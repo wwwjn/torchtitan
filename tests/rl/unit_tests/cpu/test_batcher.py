@@ -585,3 +585,49 @@ def test_token_budget_must_fit_a_full_context_sample() -> None:
             pad_id=0,
             temperature=1.0,
         )
+
+
+@pytest.mark.parametrize("trim_multiple", [None, 8])
+def test_trim_microbatches_to_the_longest_packed_microbatch(trim_multiple) -> None:
+    """Trimming drops only the padding the step does not need: same packing, one length per step."""
+    from torchtitan.rl.trainer.training_sample_builder import TrainingSampleGroup
+
+    capacity = 64
+    batcher = Batcher.Config(trim_microbatch_token_multiple=trim_multiple).build(
+        num_tokens_per_microbatch_per_dp_rank=capacity,
+        max_context_length=capacity,
+        num_prompts_per_train_step=1,
+        dp_degree=2,
+        pad_id=0,
+        temperature=1.0,
+    )
+    lengths = [20, 13, 9, 5, 3]
+    samples = [
+        dataclasses.replace(sample, advantage=np.ones_like(sample.advantage))
+        for sample in _make_samples(lengths)
+    ]
+    batch, _ = batcher.add_training_samples(
+        training_sample_group=TrainingSampleGroup(
+            group_id=0, training_samples=samples, metrics=[]
+        )
+    )
+    assert batch is not None
+    microbatches = [
+        mb for group in batch.microbatch_groups for row in group for mb in row
+    ]
+    num_real_tokens = [int((~mb.padding_mask).sum()) for mb in microbatches]
+    assert sum(num_real_tokens) == sum(lengths)
+    microbatch_lengths = {mb.input.numel() for mb in microbatches}
+    assert len(microbatch_lengths) == 1
+    (length,) = microbatch_lengths
+    if trim_multiple is None:
+        assert length == capacity
+    else:
+        # The smallest multiple of 8 that holds the longest packed microbatch.
+        assert length % trim_multiple == 0
+        assert length - trim_multiple < max(num_real_tokens) <= length < capacity
+    metrics = {metric.key: metric.value.value for metric in batch.metrics}
+    assert metrics["train_batch/num_tokens_per_microbatch"] == length
+    assert metrics["train_batch/padding_frac"] == pytest.approx(
+        1 - sum(lengths) / (len(microbatches) * length)
+    )

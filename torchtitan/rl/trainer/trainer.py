@@ -298,12 +298,16 @@ class Trainer(Configurable):
         microbatches = [
             microbatch for group in microbatch_groups for microbatch in group
         ]
-        # The batcher pads every microbatch to the same token count.
+        uses_rdma = bool(microbatches) and isinstance(microbatches[0], RDMAMicrobatch)
+        # The batcher pads a step's microbatches to one token count: the capacity, or the step's
+        # longest packed microbatch with `Batcher.Config.trim_microbatch_token_multiple`. RDMA
+        # microbatches are not read yet; the controller rejects trimming with RDMA.
         self._step_num_tokens_per_dp_rank = (
             len(microbatches)
             * self.config.training.num_tokens_per_microbatch_per_dp_rank
+            if uses_rdma
+            else sum(microbatch.labels.numel() for microbatch in microbatches)
         )
-        uses_rdma = bool(microbatches) and isinstance(microbatches[0], RDMAMicrobatch)
         if uses_rdma:
             # A wrong column, or a batch read twice or out of order, fails here instead of training.
             # Both counters start at 0 in their own process, and every registered batch trains in order.
