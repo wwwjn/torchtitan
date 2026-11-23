@@ -63,6 +63,49 @@ def paged_varlen_attention_out(
         num_seqs = seqused_k.shape[0]
         cu_seqlens_k = torch.zeros(num_seqs + 1, dtype=torch.int32, device=query.device)
         cu_seqlens_k[1:] = torch.cumsum(seqused_k, dim=0)
+
+    # FA2 reads a KV head's cache once per query head in a decode-only call with the
+    # causal window (-1, 0): it shares one KV read among a KV head's query heads only
+    # when both window bounds are negative. Pack those heads here instead: each
+    # sequence's one query token becomes a query of `group` tokens over the KV heads,
+    # unmasked (a sequence's single query token is the last position of its KV).
+    # Window (-1, -1) alone triggers FA2's own packing, but varlen_attn_out then
+    # leaves `out` unwritten. Qwen3-8B (GQA 4), 256 decode rows, A100: 1595 -> 457 us
+    # per call, bitwise identical. FA3 packs GQA for any varlen query, and FA4
+    # (>= 4.0.0b38) decodes on its SwapAB kernel, which runs a KV head's query heads in
+    # one CTA.
+    if (
+        fa_impl in (None, "FA2")
+        and max_seqlen_q == 1
+        and enable_gqa
+        and not return_lse
+        and tuple(window_size) == (-1, 0)
+    ):
+        num_tokens, num_heads, _ = query.shape
+        num_kv_heads = key_cache.shape[2]
+        group = num_heads // num_kv_heads
+        packed_query = (
+            query.unflatten(1, (num_kv_heads, group)).transpose(1, 2).flatten(0, 1)
+        )
+        with sdpa_kernel([SDPBackend.FLASH_ATTENTION]):
+            packed_out = torch.nn.attention.varlen.varlen_attn(
+                packed_query,
+                key_cache,
+                value_cache,
+                cu_seqlens_q * group,
+                cu_seqlens_k,
+                group,
+                max_seqlen_k,
+                scale=scale,
+                block_table=block_table,
+                seqused_k=seqused_k,
+                num_splits=1,
+            )
+        out.unflatten(1, (num_kv_heads, group)).copy_(
+            packed_out.unflatten(0, (num_tokens, group)).transpose(1, 2)
+        )
+        return out
+
     extra_kwargs: dict[str, Any] = {}
 
     # TODO(pytorch/pytorch#179760): FA2's auto num_splits heuristic
