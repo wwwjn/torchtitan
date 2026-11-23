@@ -74,6 +74,8 @@ def paged_varlen_attention_out(
     # per call, bitwise identical. FA3 packs GQA for any varlen query, and FA4
     # (>= 4.0.0b38) decodes on its SwapAB kernel, which runs a KV head's query heads in
     # one CTA.
+    # TODO(pytorch/pytorch#206313): drop this branch once the PyTorch nightly has it; FA2 then
+    # packs causal decode itself and writes `out`.
     if (
         fa_impl in (None, "FA2")
         and max_seqlen_q == 1
