@@ -275,6 +275,16 @@ class Batcher(Configurable):
         The Monarch actor system uses ibverbs where the host has it, else TCP; a host that lists unusable
         ibverbs devices fails instead. MONARCH_RDMA_DISABLE_IBVERBS=1 forces TCP in every process, weight sync
         included."""
+        trim_microbatch_token_multiple: int | None = None
+        """Trim each step's microbatches to the step's longest packed microbatch, rounded up to
+        this many tokens, instead of padding every microbatch to the trainer's
+        ``num_tokens_per_microbatch_per_dp_rank``. Packing and the number of microbatches are
+        unchanged; the trainer skips the padding the step does not need, so each step has its own
+        microbatch length.
+            None (default): every microbatch has ``num_tokens_per_microbatch_per_dp_rank`` tokens.
+            e.g. 512, capacity 30,720: a step whose longest packed microbatch holds 27,700 tokens
+            trains 28,160-token microbatches.
+        `Controller.Config` checks it against the trainer (it must divide the capacity)."""
         build_mrope_positions: bool = False
         """Give microbatches with images 3D M-RoPE positions (``mrope_positions``), as SFT's
         ``MultiModalCollator.Config.build_mrope_positions`` does: True for models whose image
@@ -292,6 +302,11 @@ class Batcher(Configurable):
                 raise ValueError("per_sample_pad_multiple must be positive")
             if self.max_num_documents is not None and self.max_num_documents <= 0:
                 raise ValueError("max_num_documents must be positive")
+            if (
+                self.trim_microbatch_token_multiple is not None
+                and self.trim_microbatch_token_multiple <= 0
+            ):
+                raise ValueError("trim_microbatch_token_multiple must be positive")
             if (
                 self.rdma_min_tensor_bytes is not None
                 and self.rdma_min_tensor_bytes < 1
@@ -336,6 +351,7 @@ class Batcher(Configurable):
         self._temperature = temperature
         self._per_sample_pad_multiple = config.per_sample_pad_multiple
         self._max_num_documents = config.max_num_documents
+        self._trim_microbatch_token_multiple = config.trim_microbatch_token_multiple
         self._num_mtp_layers = config.num_mtp_layers
         self._build_mrope_positions = config.build_mrope_positions
         self._num_prompts_per_train_step = num_prompts_per_train_step
@@ -521,8 +537,14 @@ class Batcher(Configurable):
         assignments = self._assign_training_samples_to_microbatches(
             training_samples, num_pp_microbatches=self._num_pp_microbatches
         )
+        num_tokens_per_microbatch = self._step_num_tokens_per_microbatch(assignments)
         microbatches = [
-            [self._pack_training_samples(samples) for samples in rank_assignments]
+            [
+                self._pack_training_samples(
+                    samples, num_tokens_per_microbatch=num_tokens_per_microbatch
+                )
+                for samples in rank_assignments
+            ]
             for rank_assignments in assignments
         ]
         global_loss_token_counts: torch.Tensor | None = None
@@ -571,6 +593,7 @@ class Batcher(Configurable):
                     training_samples,
                     num_rollout_groups,
                     num_metric_only_groups,
+                    num_tokens_per_microbatch=num_tokens_per_microbatch,
                 ),
             ],
             group_ids=group_ids,
@@ -886,6 +909,27 @@ class Batcher(Configurable):
 
         bins.extend([] for _ in range(target_num_bins - len(bins)))
 
+    def _step_num_tokens_per_microbatch(
+        self, assignments: list[list[list[TrainingSample]]]
+    ) -> int:
+        """Tokens per microbatch for this step: the capacity, or with
+        ``trim_microbatch_token_multiple`` the longest packed microbatch rounded up to it.
+
+        Example (capacity 30,720, multiple 512, longest packed microbatch 27,700 tokens):
+
+            -> 28,160 (55 x 512)
+        """
+        multiple = self._trim_microbatch_token_multiple
+        if multiple is None:
+            return self._num_tokens_per_microbatch
+        longest = max(
+            sum(self.num_tokens_to_pack(sample) for sample in samples)
+            for rank_assignments in assignments
+            for samples in rank_assignments
+        )
+        # The capacity is a multiple of `multiple`, so this never exceeds it.
+        return max(round_up(longest, multiple), multiple)
+
     def num_tokens_to_pack(self, training_sample: TrainingSample) -> int:
         """Tokens this training_sample contributes to a packed input.
 
@@ -904,9 +948,13 @@ class Batcher(Configurable):
     #   so callers swap logic per modality, and move the image path (`_pack_image_inputs`, the
     #   `images` branches) into an image packer.
     def _pack_training_samples(
-        self, training_samples: list[TrainingSample]
+        self,
+        training_samples: list[TrainingSample],
+        *,
+        num_tokens_per_microbatch: int | None = None,
     ) -> TrainingMicrobatch:
-        """Concatenate samples into one fixed-size local microbatch.
+        """Concatenate samples into one fixed-size local microbatch of
+        ``num_tokens_per_microbatch`` tokens (default: the capacity).
 
         - Labels and logits are shifted
         -`positions` restart at 0 per sample
@@ -946,7 +994,11 @@ class Batcher(Configurable):
             )
             sample_lens.append(sample_len)
 
-        num_tokens_per_rank = self._num_tokens_per_microbatch
+        num_tokens_per_rank = (
+            self._num_tokens_per_microbatch
+            if num_tokens_per_microbatch is None
+            else num_tokens_per_microbatch
+        )
         pad_len = num_tokens_per_rank - sum(sample_lens)
         assert pad_len >= 0
         if pad_len > 0:
@@ -1132,9 +1184,9 @@ class Batcher(Configurable):
         *,
         num_microbatches: int,
         training_samples: list[TrainingSample],
+        num_tokens_per_microbatch: int,
     ) -> float:
-        num_tokens_per_rank = self._num_tokens_per_microbatch
-        total_slots = num_microbatches * self._dp_degree * num_tokens_per_rank
+        total_slots = num_microbatches * self._dp_degree * num_tokens_per_microbatch
         num_real_tokens = sum(len(sample.token_ids) - 1 for sample in training_samples)
         return (total_slots - num_real_tokens) / total_slots
 
@@ -1144,11 +1196,14 @@ class Batcher(Configurable):
         training_samples: list[TrainingSample],
         num_rollout_groups: int,
         num_metric_only_groups: int,
+        *,
+        num_tokens_per_microbatch: int,
     ) -> list[m.Metric]:
         """Per-training-batch packing + count metrics. (policy age is logged at trainer consume time.)"""
         padding_frac = self._padding_fraction(
             num_microbatches=len(assignments),
             training_samples=training_samples,
+            num_tokens_per_microbatch=num_tokens_per_microbatch,
         )
         image_metrics = []
         if self._vision_processor is not None:
@@ -1179,6 +1234,10 @@ class Batcher(Configurable):
             m.Metric(
                 "train_batch/num_microbatches",
                 m.NoReduce(float(len(assignments))),
+            ),
+            m.Metric(
+                "train_batch/num_tokens_per_microbatch",
+                m.NoReduce(float(num_tokens_per_microbatch)),
             ),
             m.Metric(
                 "train_batch/num_rollout_groups", m.NoReduce(float(num_rollout_groups))

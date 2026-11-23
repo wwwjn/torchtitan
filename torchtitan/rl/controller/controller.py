@@ -103,6 +103,7 @@ from typing import Any
 import torch  # noqa: F401
 
 from torchtitan.components.data.multimodal.vision_processor import VisionProcessor
+from torchtitan.components.loss import ChunkedLossWrapper
 from torchtitan.components.renderer import RendererConfig
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import (
@@ -486,6 +487,7 @@ class Controller(Configurable):
                     "async_loop.batcher.rdma_min_tensor_bytes does not support "
                     "trainer pipeline parallelism yet."
                 )
+            self._validate_trim_microbatch_token_multiple()
             generator_model = self.generator.model
             if self.vision_processor is None:
                 if isinstance(generator_model, MultimodalModel.Config):
@@ -549,6 +551,54 @@ class Controller(Configurable):
                         "SP uses reduce-scatter which only supports Ring in NCCL "
                         "and has not been validated for determinism."
                     )
+
+        def _validate_trim_microbatch_token_multiple(self) -> None:
+            """A trimmed microbatch length must meet the trainer's constraints on its capacity."""
+            multiple = self.async_loop.batcher.trim_microbatch_token_multiple
+            if multiple is None:
+                return
+            name = "async_loop.batcher.trim_microbatch_token_multiple"
+            training = self.trainer.training
+            parallelism = self.trainer.parallelism
+            capacity = training.num_tokens_per_microbatch_per_dp_rank
+            if capacity % multiple != 0:
+                raise ValueError(
+                    f"{name} ({multiple}) must divide "
+                    f"trainer.training.num_tokens_per_microbatch_per_dp_rank ({capacity})."
+                )
+            if not training.disable_accelerator_graphs:
+                raise ValueError(
+                    f"{name} requires trainer.training.disable_accelerator_graphs=True: "
+                    "trainer graphs replay one microbatch length."
+                )
+            # TODO: validate trimmed lengths against PP schedules and CP load balancers.
+            if (
+                parallelism.pipeline_parallel_degree > 1
+                or parallelism.context_parallel_degree > 1
+            ):
+                raise ValueError(
+                    f"{name} does not support trainer pipeline or context parallelism yet."
+                )
+            if self.async_loop.batcher.rdma_min_tensor_bytes is not None:
+                raise ValueError(
+                    f"{name} does not support async_loop.batcher.rdma_min_tensor_bytes yet."
+                )
+            num_chunks = (
+                self.trainer.loss.num_chunks
+                if isinstance(self.trainer.loss, ChunkedLossWrapper.Config)
+                else 1
+            )
+            sequence_parallel_degree = (
+                parallelism.tensor_parallel_degree
+                if parallelism.enable_sequence_parallel
+                else 1
+            )
+            if multiple % math.lcm(num_chunks, sequence_parallel_degree) != 0:
+                raise ValueError(
+                    f"{name} ({multiple}) must be a multiple of the chunked loss's "
+                    f"num_chunks ({num_chunks}) and the sequence-parallel degree "
+                    f"({sequence_parallel_degree})."
+                )
 
         @property
         def max_num_seqs_per_generator_dp_rank(self) -> int:

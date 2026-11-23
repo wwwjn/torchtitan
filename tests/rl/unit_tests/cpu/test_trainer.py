@@ -388,8 +388,11 @@ def test_forward_backward_accumulates_microbatch_metrics(rdma: bool) -> None:
         groups = engine.forward_backward.call_args.kwargs["microbatch_groups"]
         assert isinstance(groups, RDMAMicrobatchPrefetcher) == rdma
         assert list(groups) == [[batch], [batch]]
+        # Unread RDMA microbatches count at the capacity, read ones at their length.
         assert trainer._step_num_tokens_per_dp_rank == (
             2 * trainer.config.training.num_tokens_per_microbatch_per_dp_rank
+            if rdma
+            else 2 * batch.labels.numel()
         )
         if rdma:
             assert trainer._num_rdma_batches_read == 1
@@ -501,9 +504,7 @@ def test_forward_backward_without_last_pipeline_stage_returns_no_metrics() -> No
             global_loss_token_counts=torch.tensor([3]),
             global_routing_token_counts=torch.tensor([2]),
         )
-        assert trainer._step_num_tokens_per_dp_rank == (
-            4 * trainer.config.training.num_tokens_per_microbatch_per_dp_rank
-        )
+        assert trainer._step_num_tokens_per_dp_rank == 4
         trainer._reduce_forward_backward_metrics.assert_not_called()
         assert result is None
 
