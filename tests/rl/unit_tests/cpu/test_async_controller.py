@@ -1164,3 +1164,19 @@ def test_validation_config_rejects_bad_sampling() -> None:
         ValidationConfig(num_samples_per_prompt=0)
     with pytest.raises(ValueError, match="greedy"):
         ValidationConfig(temperature=0.0, num_samples_per_prompt=4)
+
+
+def test_generator_max_num_seqs_overrides_the_derived_cap() -> None:
+    from torchtitan_recipes.tests.rl.alphabet_sort import rl_grpo_qwen3_5_debug_varlen
+
+    # 256 rollouts in flight on one generator DP rank derive 2 x 256 -> 512, clamped to the
+    # 128-token budget. An override must be in [128 / 64, 128] = [2, 128].
+    config = rl_grpo_qwen3_5_debug_varlen(seq_len=128)
+    assert config.max_num_seqs_per_generator_dp_rank == 128
+
+    config.generator.max_num_seqs = 3
+    assert config.max_num_seqs_per_generator_dp_rank == 3
+    for out_of_range in (1, 129):
+        config.generator.max_num_seqs = out_of_range
+        with pytest.raises(ValueError, match=r"must be in \[2, 128\]"):
+            config.max_num_seqs_per_generator_dp_rank

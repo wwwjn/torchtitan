@@ -142,6 +142,16 @@ class Generator(Configurable):
         (prefill + decode, summed over the batch). ``None`` (default) leaves the
         engine's own default in place."""
 
+        max_num_seqs: int | None = None
+        """The engine's cap on concurrently scheduled sequences per generator DP rank.
+        ``None`` (default) derives it from the rollouts in flight
+        (``Controller.Config.max_num_seqs_per_generator_dp_rank``). Set it when the derived
+        cap does not fit the GPU: vLLM's startup CUDA graph memory profile allocates one KV
+        page per sequence, and pages hold 256 tokens on GPUs older than SM90 (PyTorch's FA2
+        paged KV requires it). E.g. Qwen3-8B (144 KiB of KV per token) with 1,920 rollouts in
+        flight on 2 generators derives 2048 -> 2048 x 256 tokens = 72 GiB, which OOMs an
+        80 GB A100; 256 needs 9 GiB."""
+
         checkpointer: CheckpointManager.Config | None = None
         """Optional initial-weight loader for the engine's model.
 
